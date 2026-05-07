@@ -1467,7 +1467,9 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
     }
 }
 
-impl<D: SeatHandler + 'static> PointerTarget<D> for X11Surface {
+impl<D: SeatHandler + 'static + crate::wayland::pointer_constraints::PointerConstraintsHandler>
+    PointerTarget<D> for X11Surface
+{
     fn enter(&self, seat: &Seat<D>, data: &mut D, event: &MotionEvent) {
         if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
             PointerTarget::enter(surface, seat, data, event);

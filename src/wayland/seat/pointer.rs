@@ -235,7 +235,7 @@ impl WlPointerHandle {
 
 impl<D> PointerTarget<D> for WlSurface
 where
-    D: SeatHandler + 'static,
+    D: SeatHandler + crate::wayland::pointer_constraints::PointerConstraintsHandler + 'static,
 {
     fn enter(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
         if let Some(pointer) = seat.get_pointer() {
@@ -243,12 +243,12 @@ where
         }
     }
 
-    fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial, time: u32) {
+    fn leave(&self, seat: &Seat<D>, data: &mut D, serial: Serial, time: u32) {
         if let Some(pointer) = seat.get_pointer() {
             pointer.wp_pointer_gestures.leave::<D>(self, serial, time);
             pointer.wl_pointer.leave(self, serial, time);
 
-            with_pointer_constraint(self, &pointer, |constraint| {
+            with_pointer_constraint(data, self, &pointer, |constraint| {
                 if let Some(constraint) = constraint {
                     constraint.deactivate();
                 }
