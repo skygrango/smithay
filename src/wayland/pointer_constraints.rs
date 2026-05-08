@@ -344,12 +344,23 @@ fn add_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     }
 }
 
-fn remove_constraint<D: SeatHandler + 'static>(surface: &WlSurface, pointer: &PointerHandle<D>) {
-    with_constraint_data::<D, _, _>(surface, |data| {
+fn remove_constraint<D: SeatHandler + 'static>(
+    state: &mut D,
+    surface: &WlSurface,
+    pointer: &PointerHandle<D>,
+) {
+    let was_active = with_constraint_data::<D, _, _>(surface, |data| {
         if let Some(data) = data {
-            data.constraints.remove(pointer);
+            if let Some(constraint) = data.constraints.remove(pointer) {
+                return constraint.is_active();
+            }
         }
+        false
     });
+
+    if was_active {
+        state.remove_constraint(surface, pointer);
+    }
 }
 
 impl<D> Dispatch2<ZwpPointerConstraintsV1, D> for GlobalData
@@ -493,7 +504,7 @@ where
 
     fn destroyed(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpConfinedPointerV1,
     ) {
@@ -501,7 +512,7 @@ where
             return;
         };
 
-        remove_constraint(&self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer);
     }
 }
 
@@ -545,7 +556,7 @@ where
 
     fn destroyed(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpLockedPointerV1,
     ) {
@@ -553,6 +564,6 @@ where
             return;
         };
 
-        remove_constraint(&self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer);
     }
 }
