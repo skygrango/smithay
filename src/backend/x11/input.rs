@@ -9,7 +9,21 @@ use crate::{
     },
     utils::{Logical, Size},
 };
-use std::sync::Weak;
+use std::sync::{
+    Weak,
+    atomic::{AtomicU64, Ordering},
+};
+
+static LAST_X11_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+fn make_monotonic_time(time_ms: u32) -> u64 {
+    let us = time_ms as u64 * 1000;
+    LAST_X11_TIMESTAMP
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(last.max(us).saturating_add(1))
+        })
+        .unwrap_or(us)
+}
 
 /// Marker used to define the `InputBackend` types for the X11 backend.
 #[derive(Debug)]
@@ -65,7 +79,7 @@ impl X11KeyboardInputEvent {
 
 impl input::Event<X11Input> for X11KeyboardInputEvent {
     fn time(&self) -> u64 {
-        self.time as u64 * 1000
+        make_monotonic_time(self.time)
     }
 
     fn device(&self) -> X11VirtualDevice {
@@ -107,7 +121,7 @@ impl X11MouseWheelEvent {
 
 impl input::Event<X11Input> for X11MouseWheelEvent {
     fn time(&self) -> u64 {
-        self.time as u64 * 1000
+        make_monotonic_time(self.time)
     }
 
     fn device(&self) -> X11VirtualDevice {
@@ -161,7 +175,7 @@ impl X11MouseInputEvent {
 
 impl input::Event<X11Input> for X11MouseInputEvent {
     fn time(&self) -> u64 {
-        self.time as u64 * 1000
+        make_monotonic_time(self.time)
     }
 
     fn device(&self) -> X11VirtualDevice {
@@ -200,7 +214,7 @@ impl X11MouseMovedEvent {
 
 impl input::Event<X11Input> for X11MouseMovedEvent {
     fn time(&self) -> u64 {
-        self.time as u64 * 1000
+        make_monotonic_time(self.time)
     }
 
     fn device(&self) -> X11VirtualDevice {
