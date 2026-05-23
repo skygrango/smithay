@@ -125,7 +125,6 @@ use std::{
 };
 
 use tracing::{info_span, instrument};
-use wayland_server::protocol::wl_surface::WlSurface;
 use xkbcommon::xkb::ContextFlags;
 
 use self::touch::TouchTarget;
@@ -164,9 +163,6 @@ pub trait SeatHandler: Sized {
 
     /// Callback that will be notified whenever the keyboard led state changes.
     fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: LedState) {}
-
-    /// Callback that will be notified whenever constraint was deactived
-    fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 }
 /// Delegate type for all [Seat] globals.
 ///
