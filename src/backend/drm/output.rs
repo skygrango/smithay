@@ -730,8 +730,8 @@ where
     /// Prepare a submission for the current queued frame.
     ///
     /// see [`DrmCompositor::prepare_submission`] for more information.
-    pub fn prepare_submission(&mut self) -> Result<Option<super::compositor::DrmSubmission>, FrameResult<(), A, F>> {
-        self.with_compositor(|compositor| compositor.prepare_submission().map_err(Err))
+    pub fn prepare_submission(&mut self, user_data: U) -> Result<Option<super::compositor::DrmSubmission>, FrameResult<(), A, F>> {
+        self.with_compositor(|compositor| compositor.prepare_submission(user_data).map_err(Err))
     }
 
     /// Submit the current queued frame with a pre-calculated result.

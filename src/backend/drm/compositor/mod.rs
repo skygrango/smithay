@@ -834,6 +834,7 @@ type FrameErrorType<A, F> = FrameError<
     <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Error,
 >;
 
+/// Result for a frame operation
 pub type FrameResult<T, A, F> = Result<T, FrameErrorType<A, F>>;
 
 pub(crate) type RenderFrameErrorType<A, F, R> = RenderFrameError<
@@ -1069,7 +1070,22 @@ impl DrmSubmission {
     }
 }
 
-#[derive(Debug)]
+impl<A, F, U, G> std::fmt::Debug for DrmCompositor<A, F, U, G>
+where
+    A: Allocator,
+    F: ExportFramebuffer<A::Buffer>,
+    <F as ExportFramebuffer<A::Buffer>>::Framebuffer: std::fmt::Debug + Send + Sync + 'static,
+    G: AsFd + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DrmCompositor")
+            .field("surface", &self.surface)
+            .field("supports_fencing", &self.supports_fencing)
+            .field("reset_pending", &self.reset_pending)
+            .finish()
+    }
+}
+
 pub struct DrmCompositor<A, F, U, G>
 where
     A: Allocator,
@@ -2561,22 +2577,43 @@ where
     ///
     /// After the submission has been executed, [`DrmCompositor::submit_with_result`] should be called
     /// with the result of the submission.
-    pub fn prepare_submission(&mut self) -> Result<Option<DrmSubmission>, FrameErrorType<A, F>> {
-        if self.queued_frame.is_none() {
-            return Ok(None);
+    pub fn prepare_submission(&mut self, user_data: U) -> Result<Option<DrmSubmission>, FrameErrorType<A, F>> {
+        if !self.surface.is_active() {
+            return Err(FrameErrorType::<A, F>::DrmError(DrmError::DeviceInactive));
         }
 
-        let queued = self.queued_frame.as_mut().unwrap();
-        let allow_partial_update = queued.prepared_frame.kind == PreparedFrameKind::Partial;
+        let mut prepared_frame = self.next_frame.take().ok_or(FrameErrorType::<A, F>::EmptyFrame)?;
+        if prepared_frame.is_empty() {
+            return Err(FrameErrorType::<A, F>::EmptyFrame);
+        }
+
+        if let Some(plane_state) = prepared_frame.frame.plane_state(self.surface.plane()) {
+            if !plane_state.skip {
+                let slot = plane_state.buffer().and_then(|config| match &config.buffer {
+                    ScanoutBuffer::Swapchain(slot) => Some(slot),
+                    _ => None,
+                });
+
+                if let Some(slot) = slot {
+                    self.swapchain.submitted(slot);
+                }
+            }
+        }
+
+        let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
         let is_modeset = self.surface.commit_pending();
 
-        let planes = queued
-            .prepared_frame
+        let planes = prepared_frame
             .frame
             .build_planes(&self.surface, self.supports_fencing, allow_partial_update)
             .into_iter()
             .map(|p| p.into_owned())
             .collect::<Vec<_>>();
+
+        self.queued_frame = Some(QueuedFrame {
+            prepared_frame,
+            user_data,
+        });
 
         Ok(Some(DrmSubmission {
             surface: self.surface.clone(),
