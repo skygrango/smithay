@@ -727,6 +727,23 @@ where
         self.with_compositor(|compositor| compositor.queue_frame(user_data))
     }
 
+    /// Prepare a submission for the current queued frame.
+    ///
+    /// see [`DrmCompositor::prepare_submission`] for more information.
+    pub fn prepare_submission(&mut self) -> Result<Option<super::compositor::DrmSubmission>, FrameResult<(), A, F>> {
+        self.with_compositor(|compositor| compositor.prepare_submission().map_err(Err))
+    }
+
+    /// Submit the current queued frame with a pre-calculated result.
+    ///
+    /// see [`DrmCompositor::submit_with_result`] for more information.
+    pub fn submit_with_result(
+        &mut self,
+        result: Result<(), crate::backend::drm::error::Error>,
+    ) -> FrameResult<(), A, F> {
+        self.with_compositor(|compositor| compositor.submit_with_result(result))
+    }
+
     /// Commits the current frame for scan-out.
     ///
     /// If `render_frame` has not been called prior to this function or returned no damage

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fmt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, AsFd};
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -1269,7 +1269,7 @@ impl<'a> AtomicRequest<'a> {
                 }
             }
             if self.mapping.plane_prop_handle(handle, "IN_FENCE_FD").is_ok() {
-                if let Some(fence) = config.fence.as_ref().map(|f| f.as_raw_fd()) {
+                if let Some(fence) = config.fence.as_ref().map(|f| f.as_fd().as_raw_fd()) {
                     plane_props.insert("IN_FENCE_FD", property::Value::SignedRange(fence as i64));
                 } else {
                     plane_props.insert("IN_FENCE_FD", property::Value::SignedRange(-1));
@@ -1518,7 +1518,7 @@ impl<'a> AtomicRequest<'a> {
                 }
             }
             if let Ok(prop) = self.mapping.plane_prop_handle(handle, "IN_FENCE_FD") {
-                if let Some(fence) = config.fence.as_ref().map(|f| f.as_raw_fd()) {
+                if let Some(fence) = config.fence.as_ref().map(|f| f.as_fd().as_raw_fd()) {
                     self.request
                         .add_property(handle, prop, property::Value::SignedRange(fence as i64));
                 } else {

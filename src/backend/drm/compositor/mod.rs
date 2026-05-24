@@ -818,8 +818,9 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                     fence: config
                         .sync
                         .as_ref()
-                        .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd())),
-                }),
+                        .and_then(|(_, fence)| fence.as_ref().map(|f| super::surface::DrmFence::Owned(f.clone()))),
+                    }),
+
             })
     }
 }
@@ -833,7 +834,7 @@ type FrameErrorType<A, F> = FrameError<
     <F as ExportFramebuffer<<A as Allocator>::Buffer>>::Error,
 >;
 
-pub(crate) type FrameResult<T, A, F> = Result<T, FrameErrorType<A, F>>;
+pub type FrameResult<T, A, F> = Result<T, FrameErrorType<A, F>>;
 
 pub(crate) type RenderFrameErrorType<A, F, R> = RenderFrameError<
     <A as Allocator>::Error,
@@ -1044,6 +1045,30 @@ bitflags::bitflags! {
 /// Composite an output using a combination of planes and rendering
 ///
 /// see the [`module docs`](crate::backend::drm::compositor) for more information
+#[derive(Debug)]
+/// A submission for a DRM surface
+pub struct DrmSubmission {
+    /// Surface to commit to
+    pub surface: Arc<DrmSurface>,
+    /// Planes to commit
+    pub planes: Vec<super::surface::PlaneState<'static>>,
+    /// Whether to request a vblank event
+    pub event: bool,
+    /// Whether this is a modeset commit
+    pub is_modeset: bool,
+}
+
+impl DrmSubmission {
+    /// Execute the submission
+    pub fn execute(self) -> Result<(), crate::backend::drm::error::Error> {
+        if self.is_modeset {
+            self.surface.commit(self.planes, self.event)
+        } else {
+            self.surface.page_flip(self.planes, self.event)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DrmCompositor<A, F, U, G>
 where
@@ -2529,6 +2554,53 @@ where
     }
 
     #[profiling::function]
+    /// Prepare a submission for the current queued frame.
+    ///
+    /// This will calculate the plane states and return a [`DrmSubmission`] that can be
+    /// executed on a different thread.
+    ///
+    /// After the submission has been executed, [`DrmCompositor::submit_with_result`] should be called
+    /// with the result of the submission.
+    pub fn prepare_submission(&mut self) -> Result<Option<DrmSubmission>, FrameErrorType<A, F>> {
+        if self.queued_frame.is_none() {
+            return Ok(None);
+        }
+
+        let queued = self.queued_frame.as_mut().unwrap();
+        let allow_partial_update = queued.prepared_frame.kind == PreparedFrameKind::Partial;
+        let is_modeset = self.surface.commit_pending();
+
+        let planes = queued
+            .prepared_frame
+            .frame
+            .build_planes(&self.surface, self.supports_fencing, allow_partial_update)
+            .into_iter()
+            .map(|p| p.into_owned())
+            .collect::<Vec<_>>();
+
+        Ok(Some(DrmSubmission {
+            surface: self.surface.clone(),
+            planes,
+            event: true,
+            is_modeset,
+        }))
+    }
+
+    /// Submit the current queued frame with a pre-calculated result.
+    ///
+    /// This should be called after a [`DrmSubmission`] returned by [`DrmCompositor::prepare_submission`]
+    /// has been executed.
+    pub fn submit_with_result(
+        &mut self,
+        result: Result<(), crate::backend::drm::error::Error>,
+    ) -> FrameResult<(), A, F> {
+        let QueuedFrame {
+            prepared_frame,
+            user_data,
+        } = self.queued_frame.take().expect("No queued frame to submit");
+        self.handle_flip(prepared_frame, Some(user_data), result)
+    }
+
     fn submit(&mut self) -> FrameResult<(), A, F> {
         let QueuedFrame {
             mut prepared_frame,

@@ -384,7 +384,7 @@ where
                 alpha: 1.0,
                 damage_clips: damage_clips.as_ref().map(|d| d.blob()),
                 fb: *handle.as_ref(),
-                fence: fence.as_ref().map(|fence| fence.as_fd()),
+                fence: fence.as_ref().map(|fence| super::DrmFence::Borrowed(fence.as_fd())),
             }),
         };
 

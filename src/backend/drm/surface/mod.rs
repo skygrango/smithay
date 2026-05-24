@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{AsFd, BorrowedFd};
+use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -57,7 +57,7 @@ pub struct PlaneDamageClips {
 
 impl PlaneDamageClips {
     /// Returns the underlying blob
-    pub fn blob(&self) -> drm::control::property::Value<'_> {
+    pub fn blob(&self) -> drm::control::property::Value<'static> {
         self.inner.blob.unwrap()
     }
 }
@@ -127,6 +127,36 @@ impl Clone for PlaneDamageClips {
     }
 }
 
+/// A fence for a DRM plane
+#[derive(Debug, Clone)]
+pub enum DrmFence<'a> {
+    /// A borrowed fence fd
+    Borrowed(BorrowedFd<'a>),
+    /// An owned fence fd
+    Owned(Arc<OwnedFd>),
+}
+
+impl<'a> AsFd for DrmFence<'a> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            DrmFence::Borrowed(fd) => fd.as_fd(),
+            DrmFence::Owned(fd) => fd.as_fd(),
+        }
+    }
+}
+
+impl<'a> DrmFence<'a> {
+    /// Convert this fence into an owned version
+    pub fn into_owned(self) -> DrmFence<'static> {
+        match self {
+            DrmFence::Borrowed(fd) => DrmFence::Owned(Arc::new(
+                fd.try_clone_to_owned().expect("Failed to clone fence fd"),
+            )),
+            DrmFence::Owned(fd) => DrmFence::Owned(fd),
+        }
+    }
+}
+
 /// State of a single plane
 #[derive(Debug, Clone)]
 pub struct PlaneState<'a> {
@@ -136,6 +166,16 @@ pub struct PlaneState<'a> {
     ///
     /// Can be `None` if nothing is attached
     pub config: Option<PlaneConfig<'a>>,
+}
+
+impl<'a> PlaneState<'a> {
+    /// Convert this state into an owned version
+    pub fn into_owned(self) -> PlaneState<'static> {
+        PlaneState {
+            handle: self.handle,
+            config: self.config.map(|c| c.into_owned()),
+        }
+    }
 }
 
 /// Configuration for a single plane
@@ -150,11 +190,26 @@ pub struct PlaneConfig<'a> {
     /// Alpha value for the plane
     pub alpha: f32,
     /// Damage clips of the attached framebuffer
-    pub damage_clips: Option<drm::control::property::Value<'a>>,
+    pub damage_clips: Option<drm::control::property::Value<'static>>,
     /// Framebuffer handle
     pub fb: framebuffer::Handle,
     /// Optional fence
-    pub fence: Option<BorrowedFd<'a>>,
+    pub fence: Option<DrmFence<'a>>,
+}
+
+impl<'a> PlaneConfig<'a> {
+    /// Convert this configuration into an owned version
+    pub fn into_owned(self) -> PlaneConfig<'static> {
+        PlaneConfig {
+            src: self.src,
+            dst: self.dst,
+            transform: self.transform,
+            alpha: self.alpha,
+            damage_clips: self.damage_clips,
+            fb: self.fb,
+            fence: self.fence.map(|f| f.into_owned()),
+        }
+    }
 }
 
 /// VRR support state
