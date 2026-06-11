@@ -75,19 +75,24 @@ where
             wl_compositor::Request::CreateSurface { id } => {
                 trace!(id = ?id, "Creating a new wl_surface");
 
+                let tx_sender = state.compositor_state().tx_sender.clone();
+                //let ping = state.compositor_state().ping.clone();
                 let surface = data_init.init(
                     id,
                     SurfaceUserData {
                         inner: PrivateSurfaceData::new(),
                         alive_tracker: Default::default(),
                         user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
+                        tx_sender: tx_sender.clone(),
+                        //ping: ping.clone(),
                     },
                 );
 
-                state.compositor_state().surfaces.push(surface.clone());
+                state.compositor_state().surfaces.push(surface.downgrade());
 
                 PrivateSurfaceData::init(&surface);
-                state.new_surface(&surface);
+                let _ = tx_sender.send(super::CompositorEvent::NewSurface(surface));
+                //let _ = ping.ping();
             }
             wl_compositor::Request::CreateRegion { id } => {
                 trace!(id = ?id, "Creating a new wl_region");
@@ -154,6 +159,8 @@ pub struct SurfaceUserData {
     pub(crate) inner: Mutex<PrivateSurfaceData>,
     alive_tracker: AliveTracker,
     pub(super) user_state_type: (std::any::TypeId, &'static str),
+    pub(crate) tx_sender: calloop::channel::Sender<super::CompositorEvent>,
+    //pub(crate) ping: calloop::ping::Ping,
 }
 
 impl<D> Dispatch2<WlSurface, D> for SurfaceUserData
@@ -344,13 +351,13 @@ where
         // We let the destruction hooks run first and then tell the compositor handler the surface was
         // destroyed.
         self.alive_tracker.destroy_notify();
-        state.destroyed(surface);
+        let _ = self.tx_sender.send(super::CompositorEvent::Destroyed(surface.clone()));
 
         // Remove the surface after the callback is invoked.
         state
             .compositor_state()
             .surfaces
-            .retain(|s| s.id() != surface.id());
+            .retain(|s| s.upgrade().map(|s| s.id() != surface.id()).unwrap_or(false));
         PrivateSurfaceData::cleanup(state, self, surface);
     }
 }
@@ -469,7 +476,12 @@ where
                     states.data_map.insert_if_missing_threadsafe(SubsurfaceState::new)
                 });
 
-                state.new_subsurface(&surface, &parent);
+                if let Some(user_data) = surface.data::<SurfaceUserData>() {
+                    let _ = user_data.tx_sender.send(super::CompositorEvent::NewSubsurface {
+                        surface: surface.clone(),
+                        parent: parent.clone(),
+                    });
+                }
             }
             wl_subcompositor::Request::Destroy => {}
             _ => unreachable!(),
