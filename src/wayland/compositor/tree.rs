@@ -329,7 +329,7 @@ impl PrivateSurfaceData {
             std::mem::drop(queue_guard);
             // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
             for transaction in transactions {
-                transaction.apply(dh, state)
+                transaction.apply(dh)
             }
         }
     }
