@@ -639,7 +639,7 @@ pub struct CompositorState {
     subcompositor: GlobalId,
     surfaces: Vec<Weak<WlSurface>>,
     pub(crate) tx_sender: calloop::channel::Sender<CompositorEvent>,
-    pub(crate) ping: calloop::ping::Ping,
+    //pub(crate) ping: calloop::ping::Ping,
 }
 
 /// Per-client state of a compositor
@@ -719,11 +719,11 @@ impl CompositorState {
     ///
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
-    pub fn new<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>, ping: calloop::ping::Ping) -> Self
+    pub fn new<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
-        Self::new_with_version::<D>(display, 5, tx_sender, ping)
+        Self::new_with_version::<D>(display, 5, tx_sender)
     }
 
     /// The same as [`new`], but binds at least version 6 of [`wl_compositor`].
@@ -733,14 +733,14 @@ impl CompositorState {
     ///
     /// [`new`]: Self::new
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
-    pub fn new_v6<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>, ping: calloop::ping::Ping) -> Self
+    pub fn new_v6<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
-        Self::new_with_version::<D>(display, 6, tx_sender, ping)
+        Self::new_with_version::<D>(display, 6, tx_sender)
     }
 
-    fn new_with_version<D>(display: &DisplayHandle, version: u32, tx_sender: calloop::channel::Sender<CompositorEvent>, ping: calloop::ping::Ping) -> Self
+    fn new_with_version<D>(display: &DisplayHandle, version: u32, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
@@ -752,7 +752,7 @@ impl CompositorState {
             subcompositor,
             surfaces: Vec::new(),
             tx_sender,
-            ping,
+            //ping,
         }
     }
 
