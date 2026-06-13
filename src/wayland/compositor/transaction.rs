@@ -271,7 +271,7 @@ impl Transaction {
             tracing::trace!("Emitting CompositorEvent::Commit for wl_surface");
             if let Some(user_data) = surface.data::<super::SurfaceUserData>() {
                 let _ = user_data.tx_sender.send(super::CompositorEvent::Commit(surface.clone()));
-                let _ = user_data.ping.ping();
+                //let _ = user_data.ping.ping();
             }
         }
     }

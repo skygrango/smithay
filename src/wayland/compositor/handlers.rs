@@ -76,7 +76,7 @@ where
                 trace!(id = ?id, "Creating a new wl_surface");
 
                 let tx_sender = state.compositor_state().tx_sender.clone();
-                let ping = state.compositor_state().ping.clone();
+                //let ping = state.compositor_state().ping.clone();
                 let surface = data_init.init(
                     id,
                     SurfaceUserData {
@@ -84,7 +84,7 @@ where
                         alive_tracker: Default::default(),
                         user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
                         tx_sender: tx_sender.clone(),
-                        ping: ping.clone(),
+                        //ping: ping.clone(),
                     },
                 );
 
@@ -92,7 +92,7 @@ where
 
                 PrivateSurfaceData::init(&surface);
                 let _ = tx_sender.send(super::CompositorEvent::NewSurface(surface));
-                let _ = ping.ping();
+                //let _ = ping.ping();
             }
             wl_compositor::Request::CreateRegion { id } => {
                 trace!(id = ?id, "Creating a new wl_region");
@@ -160,7 +160,7 @@ pub struct SurfaceUserData {
     alive_tracker: AliveTracker,
     pub(super) user_state_type: (std::any::TypeId, &'static str),
     pub(crate) tx_sender: calloop::channel::Sender<super::CompositorEvent>,
-    pub(crate) ping: calloop::ping::Ping,
+    //pub(crate) ping: calloop::ping::Ping,
 }
 
 impl<D> Dispatch2<WlSurface, D> for SurfaceUserData
