@@ -228,7 +228,7 @@ where
                                 barrier_state.lock().unwrap().register(timestamp)
                             });
 
-                            add_blocker(surface, barrier);
+                            //add_blocker(surface, barrier);
                         }
                     });
                 }
