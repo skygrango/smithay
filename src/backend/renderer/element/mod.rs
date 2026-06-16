@@ -177,6 +177,14 @@ impl Id {
         }
     }
 
+    /// This makes it easier to retrieve resources of the relevant surface from the render result
+    pub fn extract_objectid(&self) -> Option<ObjectId> {
+        match &self.inner {
+            InnerId::WaylandResource(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
     /// Create a new unique id
     ///
     /// Note: The id will be re-used once all instances of this [`Id`]
