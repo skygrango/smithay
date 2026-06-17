@@ -784,7 +784,6 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             &self.display_handle,
             None,
             std::iter::empty::<(String, String)>(),
-            std::iter::empty::<String>(),
             true,
             Stdio::null(),
             Stdio::null(),
