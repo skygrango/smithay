@@ -672,7 +672,13 @@ impl CompositorClientState {
         };
 
         for transaction in transactions {
-            transaction.apply(dh)
+            //transaction.apply(dh)
+            let committed = transaction.apply(dh);
+            for surface in committed {
+                if let Some(user_data) = surface.data::<SurfaceUserData>() {
+                    let _ = user_data.tx_sender.send(CompositorEvent::Commit(surface.clone()));
+                }
+            }
         }
     }
 
