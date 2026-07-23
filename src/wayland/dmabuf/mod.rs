@@ -187,7 +187,7 @@ mod dispatch;
 
 use std::{
     collections::HashMap,
-    ops::{RangeInclusive, Sub},
+    ops::Sub,
     os::unix::io::AsFd,
     sync::{
         Arc, Mutex,
@@ -232,7 +232,6 @@ struct DmabufFeedbackTranche {
     target_device: libc::dev_t,
     flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags,
     indices: IndexSet<usize>,
-    version_range: RangeInclusive<u32>,
 }
 
 #[derive(Debug)]
@@ -323,7 +322,6 @@ impl DmabufFeedbackBuilder {
             flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
             indices: format_indices,
             target_device: main_device,
-            version_range: 3u32..=6,
         };
 
         Self {
@@ -348,13 +346,11 @@ impl DmabufFeedbackBuilder {
         target_device: libc::dev_t,
         flags: zwp_linux_dmabuf_feedback_v1::TrancheFlags,
         formats: impl IntoIterator<Item = Format>,
-        version: impl Into<RangeInclusive<u32>>,
     ) -> Self {
         let mut tranche = DmabufFeedbackTranche {
             target_device,
             flags,
             indices: Default::default(),
-            version_range: version.into(),
         };
 
         for format in formats {
@@ -460,12 +456,7 @@ impl DmabufFeedback {
             self.0.format_table.file.size() as u32,
         );
 
-        for tranche in self
-            .0
-            .tranches
-            .iter()
-            .filter(|tranche| tranche.version_range.contains(&feedback.version()))
-        {
+        for tranche in self.0.tranches.iter() {
             feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
             let mut flags = tranche.flags;
             if feedback.version() <= 5 {
@@ -490,9 +481,7 @@ impl DmabufFeedback {
             .tranches
             .iter()
             .filter(|tranche| {
-                tranche.target_device == self.0.main_device
-                    && tranche.flags == TrancheFlags::Sampling
-                    && tranche.version_range.contains(&3)
+                tranche.target_device == self.0.main_device && tranche.flags == TrancheFlags::Sampling
             })
             .map(|tranche| tranche.indices.clone())
             .reduce(|mut acc, item| {
