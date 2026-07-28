@@ -18,6 +18,7 @@ use crate::{
         compositor::{self, CompositorHandler, RectangleKind, RegionAttributes, SurfaceAttributes},
         seat::{WaylandFocus, keyboard::enter_internal},
     },
+    xwayland::xwm::MwmHints,
 };
 #[cfg(feature = "desktop")]
 use crate::{
@@ -92,10 +93,6 @@ pub enum PingError {
     Connection(#[from] ConnectionError),
 }
 
-const MWM_HINTS_FLAGS_FIELD: usize = 0;
-const MWM_HINTS_DECORATIONS_FIELD: usize = 2;
-const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
-
 const DEFAULT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 // From http://fishsoup.net/misc/wm-spec-synchronization.html
 //   "If the client is continually redrawing, then the last seen value may be out of date when the
@@ -162,7 +159,7 @@ pub(crate) struct SharedSurfaceState {
     normal_hints: Option<WmSizeHints>,
     transient_for: Option<X11Window>,
     pub(super) net_state: HashSet<Atom>,
-    motif_hints: Vec<u32>,
+    motif_hints: MwmHints,
     window_type: Vec<Atom>,
     pub(crate) opacity: Option<u32>,
     opaque_region: Option<RegionAttributes>,
@@ -367,7 +364,7 @@ impl X11Surface {
                 normal_hints: None,
                 transient_for: None,
                 net_state: HashSet::new(),
-                motif_hints: vec![0; 5],
+                motif_hints: MwmHints::default(),
                 window_type: Vec::new(),
                 opacity: None,
                 opaque_region: None,
@@ -1287,10 +1284,17 @@ impl X11Surface {
     /// Returns true if the window is client-side decorated
     pub fn is_decorated(&self) -> bool {
         let state = self.state.lock().unwrap();
-        if (state.motif_hints[MWM_HINTS_FLAGS_FIELD] & MWM_HINTS_DECORATIONS) != 0 {
-            return state.motif_hints[MWM_HINTS_DECORATIONS_FIELD] == 0;
-        }
-        false
+        state
+            .motif_hints
+            .decorations
+            .as_ref()
+            .is_some_and(|decorations| decorations.is_empty())
+    }
+
+    /// Returns the Motif WM hints set on the window.
+    pub fn motif_hints(&self) -> MwmHints {
+        let state = self.state.lock().unwrap();
+        state.motif_hints.clone()
     }
 
     /// Sets the window as maximized or not.
@@ -1667,12 +1671,10 @@ impl X11Surface {
             return Ok(());
         };
 
-        if hints.len() < 5 {
-            return Ok(());
+        if let Some(hints) = MwmHints::parse(&hints) {
+            let mut state = self.state.lock().unwrap();
+            state.motif_hints = hints;
         }
-
-        let mut state = self.state.lock().unwrap();
-        state.motif_hints = hints;
         Ok(())
     }
 
