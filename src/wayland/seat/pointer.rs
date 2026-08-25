@@ -277,11 +277,12 @@ where
             pointer.wp_pointer_gestures.leave::<D>(self, serial, time);
             pointer.wl_pointer.leave(self, serial, time);
 
-            with_pointer_constraint(self, &pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    constraint.deactivate(data, self, &pointer);
-                }
+            let deactivated = with_pointer_constraint(self, &pointer, |constraint| {
+                constraint.and_then(|c| c.deactivate(&pointer))
             });
+            if let Some(constraint) = deactivated {
+                data.remove_constraint(self, &pointer, Some(&constraint));
+            }
         }
 
         compositor::with_states(self, |states| {

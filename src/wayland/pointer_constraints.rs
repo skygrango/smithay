@@ -3,13 +3,14 @@
 //! This provides a way for the client to request that the pointer is confined to a region or
 //! locked in place.
 use std::{
-    collections::{HashMap, hash_map},
     ops,
     sync::{
-        Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+use papaya::{HashMap as LockfreeHashMap, Operation};
 
 use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},
@@ -38,8 +39,6 @@ pub trait PointerConstraintsHandler: SeatHandler {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
     /// Pointer constraint removed for `pointer` on `surface`
-    ///
-    /// Don't use [`with_pointer_constraint`] to access the constraint
     fn remove_constraint(
         &mut self,
         _surface: &WlSurface,
@@ -63,13 +62,13 @@ pub trait PointerConstraintsHandler: SeatHandler {
 }
 
 /// Constraint confining pointer to a region of the surface
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConfinedPointer {
     handle: zwp_confined_pointer_v1::ZwpConfinedPointerV1,
     region: Option<RegionAttributes>,
     pending_region: Option<RegionAttributes>,
     lifetime: WEnum<Lifetime>,
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
 }
 
 impl ConfinedPointer {
@@ -80,7 +79,7 @@ impl ConfinedPointer {
 }
 
 /// Constraint locking pointer in place
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LockedPointer {
     handle: zwp_locked_pointer_v1::ZwpLockedPointerV1,
     region: Option<RegionAttributes>,
@@ -88,7 +87,7 @@ pub struct LockedPointer {
     lifetime: WEnum<Lifetime>,
     cursor_position_hint: Option<Point<f64, Logical>>,
     pending_cursor_position_hint: Option<Point<f64, Logical>>,
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
 }
 
 impl LockedPointer {
@@ -104,7 +103,7 @@ impl LockedPointer {
 }
 
 /// A constraint imposed on the pointer instance
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PointerConstraint {
     /// Pointer is confined to a region of the surface
     Confined(ConfinedPointer),
@@ -117,14 +116,15 @@ pub enum PointerConstraint {
 /// The derefs to `[PointerConstraint]`.
 #[derive(Debug)]
 pub struct PointerConstraintRef<'a, D: SeatHandler + 'static> {
-    entry: hash_map::OccupiedEntry<'a, PointerHandle<D>, PointerConstraint>,
+    constraint: &'a PointerConstraint,
+    constraints: &'a LockfreeHashMap<PointerHandle<D>, PointerConstraint>,
 }
 
 impl<D: SeatHandler + 'static> ops::Deref for PointerConstraintRef<'_, D> {
     type Target = PointerConstraint;
 
     fn deref(&self) -> &Self::Target {
-        self.entry.get()
+        self.constraint
     }
 }
 
@@ -134,7 +134,7 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
     /// This is not sent automatically since compositors may have different
     /// policies about when to allow and activate constraints.
     pub fn activate(&self) {
-        match self.entry.get() {
+        match self.constraint {
             PointerConstraint::Confined(confined) => {
                 if !confined.active.swap(true, Ordering::SeqCst) {
                     confined.handle.confined();
@@ -154,8 +154,13 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
     ///
     /// This is sent automatically when the surface loses pointer focus, but
     /// may also be invoked while the surface is focused.
-    pub fn deactivate(self, state: &mut D, surface: &WlSurface, pointer: &PointerHandle<D>) {
-        let deactivated = match self.entry.get() {
+    ///
+    /// Returns the deactivated constraint if deactivation occurred.
+    /// The caller is responsible for invoking
+    /// [`PointerConstraintsHandler::remove_constraint`] outside of the
+    /// [`with_pointer_constraint`] closure to avoid deadlocks.
+    pub fn deactivate(self, pointer: &PointerHandle<D>) -> Option<PointerConstraint> {
+        let deactivated = match self.constraint {
             PointerConstraint::Confined(confined) => {
                 if confined.active.swap(false, Ordering::SeqCst) {
                     confined.handle.unconfined();
@@ -175,12 +180,12 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
         };
 
         if deactivated {
-            let constraint = self.entry.get();
-            state.remove_constraint(surface, pointer, Some(constraint));
-        }
-
-        if deactivated && self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
-            self.entry.remove_entry();
+            if self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
+                self.constraints.pin().remove(pointer);
+            }
+            Some(self.constraint.clone())
+        } else {
+            None
         }
     }
 }
@@ -263,7 +268,7 @@ pub struct PointerConstraintUserData<D: SeatHandler> {
 }
 
 struct PointerConstraintData<D: SeatHandler + 'static> {
-    constraints: HashMap<PointerHandle<D>, PointerConstraint>,
+    constraints: LockfreeHashMap<PointerHandle<D>, PointerConstraint>,
 }
 
 // TODO Public method to get current constraints for surface/seat
@@ -277,13 +282,37 @@ pub fn with_pointer_constraint<
     pointer: &PointerHandle<D>,
     f: F,
 ) -> T {
-    with_constraint_data::<D, _, _>(surface, |data| {
-        let constraint = data.and_then(|data| match data.constraints.entry(pointer.clone()) {
-            hash_map::Entry::Occupied(entry) => Some(PointerConstraintRef { entry }),
-            hash_map::Entry::Vacant(_) => None,
-        });
-        f(constraint)
+    with_constraint_data::<D, _, _>(surface, |data| match data {
+        Some(data) => {
+            let map = data.constraints.pin();
+            let constraint = map.get(pointer).map(|constraint| PointerConstraintRef {
+                constraint,
+                constraints: &data.constraints,
+            });
+            f(constraint)
+        }
+        None => f(None),
     })
+}
+
+fn update_constraint<D: SeatHandler + 'static>(
+    surface: &WlSurface,
+    pointer: &PointerHandle<D>,
+    mut f: impl FnMut(&mut PointerConstraint),
+) {
+    with_constraint_data::<D, _, _>(surface, |data| {
+        if let Some(data) = data {
+            data.constraints.pin().compute(pointer.clone(), |entry| {
+                if let Some((_key, constraint)) = entry {
+                    let mut constraint = constraint.clone();
+                    f(&mut constraint);
+                    Operation::Insert(constraint)
+                } else {
+                    Operation::Abort(())
+                }
+            });
+        }
+    });
 }
 
 fn commit_hook<D: SeatHandler + PointerConstraintsHandler + 'static>(
@@ -291,18 +320,29 @@ fn commit_hook<D: SeatHandler + PointerConstraintsHandler + 'static>(
     _dh: &DisplayHandle,
     surface: &WlSurface,
 ) {
-    // `with_constraint_data` locks the pointer constraints,
-    // so we collect the hints first into a Vec, then release the mutex
-    // and only once the mutex is released, we call the handler method.
-    //
-    // This is to avoid deadlocks when the handler method might try to access the constraints again.
-    // It's not a hypothetical, it bit me while implementing the position hint functionality.
     let position_hints = with_constraint_data::<D, _, _>(surface, |data| {
-        let data = data.unwrap();
-        data.constraints
-            .iter_mut()
-            .filter_map(|(pointer, constraint)| constraint.commit().map(|hint| (pointer.clone(), hint)))
-            .collect::<Vec<_>>()
+        let Some(data) = data else { return Vec::new() };
+        let map = data.constraints.pin();
+        let mut position_hints = Vec::new();
+
+        let keys: Vec<_> = map.keys().cloned().collect();
+        for pointer in keys {
+            let mut hint = None;
+            map.compute(pointer.clone(), |entry| {
+                if let Some((_key, constraint)) = entry {
+                    let mut constraint = constraint.clone();
+                    hint = constraint.commit();
+                    Operation::Insert(constraint)
+                } else {
+                    Operation::Abort(())
+                }
+            });
+            if let Some(hint) = hint {
+                position_hints.push((pointer, hint));
+            }
+        }
+
+        position_hints
     });
 
     for (pointer, hint) in position_hints {
@@ -311,21 +351,13 @@ fn commit_hook<D: SeatHandler + PointerConstraintsHandler + 'static>(
 }
 
 /// Get `PointerConstraintData` associated with a surface, if any.
-fn with_constraint_data<
-    D: SeatHandler + 'static,
-    T,
-    F: FnOnce(Option<&mut PointerConstraintData<D>>) -> T,
->(
+fn with_constraint_data<D: SeatHandler + 'static, T, F: FnOnce(Option<&PointerConstraintData<D>>) -> T>(
     surface: &WlSurface,
     f: F,
 ) -> T {
     compositor::with_states(surface, |states| {
-        let data = states.data_map.get::<Mutex<PointerConstraintData<D>>>();
-        if let Some(data) = data {
-            f(Some(&mut data.lock().unwrap()))
-        } else {
-            f(None)
-        }
+        let data = states.data_map.get::<PointerConstraintData<D>>();
+        f(data)
     })
 }
 
@@ -338,21 +370,21 @@ fn add_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
 ) {
     let mut added = false;
     compositor::with_states(surface, |states| {
-        added = states.data_map.insert_if_missing_threadsafe(|| {
-            Mutex::new(PointerConstraintData::<D> {
-                constraints: HashMap::new(),
-            })
-        });
-        let data = states.data_map.get::<Mutex<PointerConstraintData<D>>>().unwrap();
-        let mut data = data.lock().unwrap();
+        added = states
+            .data_map
+            .insert_if_missing_threadsafe(|| PointerConstraintData::<D> {
+                constraints: LockfreeHashMap::new(),
+            });
+        let data = states.data_map.get::<PointerConstraintData<D>>().unwrap();
+        let map = data.constraints.pin();
 
-        if data.constraints.contains_key(pointer) {
+        if map.contains_key(pointer) {
             pointer_constraints.post_error(
                 zwp_pointer_constraints_v1::Error::AlreadyConstrained,
                 "pointer constraint already exists for surface and seat",
             );
         } else {
-            data.constraints.insert(pointer.clone(), constraint);
+            map.insert(pointer.clone(), constraint);
         }
     });
 
@@ -366,20 +398,19 @@ fn remove_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     surface: &WlSurface,
     pointer: &PointerHandle<D>,
 ) {
-    let (is_removed, constraint) = with_constraint_data::<D, _, _>(surface, |data| {
-        if let Some(data) = data {
-            if let Some(constraint) = data.constraints.remove(pointer) {
-                return (true, Some(constraint));
-            }
-        }
-        (false, None)
-    });
-
-    if is_removed {
-        if let Some(constraint) = constraint {
-            state.remove_constraint(surface, pointer, Some(&constraint));
-        }
+    let constraint = remove_constraint_from_surface::<D>(surface, pointer);
+    if let Some(constraint) = constraint {
+        state.remove_constraint(surface, pointer, Some(&constraint));
     }
+}
+
+fn remove_constraint_from_surface<D: SeatHandler + 'static>(
+    surface: &WlSurface,
+    pointer: &PointerHandle<D>,
+) -> Option<PointerConstraint> {
+    with_constraint_data::<D, _, _>(surface, |data| {
+        data.and_then(|data| data.constraints.pin().remove(pointer).cloned())
+    })
 }
 
 impl<D> Dispatch2<ZwpPointerConstraintsV1, D> for GlobalData
@@ -428,7 +459,7 @@ where
                             lifetime,
                             cursor_position_hint: None,
                             pending_cursor_position_hint: None,
-                            active: AtomicBool::new(false),
+                            active: Arc::new(AtomicBool::new(false)),
                         }),
                     );
                     state.new_constraint(&surface, &pointer);
@@ -460,7 +491,7 @@ where
                             region: region.clone(),
                             pending_region: region,
                             lifetime,
-                            active: AtomicBool::new(false),
+                            active: Arc::new(AtomicBool::new(false)),
                         }),
                     );
                     state.new_constraint(&surface, &pointer);
@@ -509,10 +540,8 @@ where
 
         match request {
             zwp_confined_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Confined(confined)) =
-                        constraint.map(|x| x.entry.into_mut())
-                    {
+                update_constraint(&self.surface, pointer, |constraint| {
+                    if let PointerConstraint::Confined(confined) = constraint {
                         confined.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
                 });
@@ -557,15 +586,15 @@ where
 
         match request {
             zwp_locked_pointer_v1::Request::SetCursorPositionHint { surface_x, surface_y } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
+                update_constraint(&self.surface, pointer, |constraint| {
+                    if let PointerConstraint::Locked(locked) = constraint {
                         locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
                     }
                 });
             }
             zwp_locked_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
+                update_constraint(&self.surface, pointer, |constraint| {
+                    if let PointerConstraint::Locked(locked) = constraint {
                         locked.pending_region = region.as_ref().map(compositor::get_region_attributes);
                     }
                 });
