@@ -27,7 +27,7 @@ use crate::{
     utils::{Client as ClientCoords, Point, Serial, iter::new_locked_obj_iter_from_vec},
     wayland::{
         Dispatch2, compositor,
-        pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint},
+        pointer_constraints::{PointerConstraintsHandler, PointerDeactivated, with_pointer_constraint},
     },
 };
 
@@ -269,6 +269,14 @@ where
     fn enter(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
         if let Some(pointer) = seat.get_pointer() {
             pointer.wl_pointer.enter::<D>(self, event);
+
+            with_pointer_constraint(self, &pointer, |constraint| {
+                if let Some(constraint) = constraint
+                    && !constraint.is_active()
+                {
+                    constraint.activate();
+                }
+            });
         }
     }
 
@@ -277,11 +285,18 @@ where
             pointer.wp_pointer_gestures.leave::<D>(self, serial, time);
             pointer.wl_pointer.leave(self, serial, time);
 
-            with_pointer_constraint(self, &pointer, |constraint| {
-                if let Some(constraint) = constraint {
-                    constraint.deactivate(data, self, &pointer);
-                }
+            let deactivate = with_pointer_constraint(self, &pointer, |constraint| {
+                constraint.and_then(|c| c.deactivate())
             });
+
+            if let Some(deactivated) = deactivate {
+                match deactivated {
+                    PointerDeactivated::Oneshot(constraint) => {
+                        data.remove_constraint(self, &pointer, Some(&constraint))
+                    }
+                    PointerDeactivated::Persistent => data.remove_constraint(self, &pointer, None),
+                }
+            }
         }
 
         compositor::with_states(self, |states| {

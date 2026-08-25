@@ -38,8 +38,6 @@ pub trait PointerConstraintsHandler: SeatHandler {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
     /// Pointer constraint removed for `pointer` on `surface`
-    ///
-    /// Don't use [`with_pointer_constraint`] to access the constraint
     fn remove_constraint(
         &mut self,
         _surface: &WlSurface,
@@ -103,6 +101,18 @@ impl LockedPointer {
     }
 }
 
+/// return value of [`PointerConstraintRef::deactivate`]
+/// DO NOT call [`PointerConstraintsHandler::remove_constraint`] in [`with_pointer_constraint`]
+#[derive(Debug)]
+pub enum PointerDeactivated {
+    /// Pointer Constraint is Lifetime::Oneshot
+    /// compositor must apply the `cursor_position_hint` if it exists
+    Oneshot(PointerConstraint),
+    /// Pointer Constraint is Lifetime::Persistent
+    /// Whether to apply `cursor_position_hint` is determined by the compositor's policy
+    Persistent,
+}
+
 /// A constraint imposed on the pointer instance
 #[derive(Debug)]
 pub enum PointerConstraint {
@@ -154,7 +164,12 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
     ///
     /// This is sent automatically when the surface loses pointer focus, but
     /// may also be invoked while the surface is focused.
-    pub fn deactivate(self, state: &mut D, surface: &WlSurface, pointer: &PointerHandle<D>) {
+    ///
+    /// Returns information about the deactivated constraint if deactivation occurred.
+    /// The caller is responsible for invoking
+    /// [`PointerConstraintsHandler::remove_constraint`] outside of the
+    /// [`with_pointer_constraint`] closure to avoid deadlocks.
+    pub fn deactivate(self) -> Option<PointerDeactivated> {
         let deactivated = match self.entry.get() {
             PointerConstraint::Confined(confined) => {
                 if confined.active.swap(false, Ordering::SeqCst) {
@@ -175,12 +190,15 @@ impl<D: SeatHandler + PointerConstraintsHandler + 'static> PointerConstraintRef<
         };
 
         if deactivated {
-            let constraint = self.entry.get();
-            state.remove_constraint(surface, pointer, Some(constraint));
-        }
-
-        if deactivated && self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
-            self.entry.remove_entry();
+            if self.lifetime() == WEnum::Value(Lifetime::Oneshot) {
+                let constraint = self.entry.remove_entry().1;
+                Some(PointerDeactivated::Oneshot(constraint))
+            } else {
+                // TODO: Find a good way to provide `PointerConstraint`
+                Some(PointerDeactivated::Persistent)
+            }
+        } else {
+            None
         }
     }
 }
