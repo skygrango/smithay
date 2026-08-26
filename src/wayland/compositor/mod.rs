@@ -132,6 +132,14 @@ use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::{wl_buffer, wl_callback, wl_output, wl_region, wl_surface::WlSurface};
 use wayland_server::{Client, DisplayHandle, GlobalDispatch, Resource};
+use calloop::LoopHandle;
+
+/// Compositor events emitted via channel
+#[derive(Debug, Clone)]
+pub enum CompositorEvent {
+    /// A surface was committed (after blockers cleared)
+    Commit(WlSurface),
+}
 
 /// The role of a subsurface surface.
 pub const SUBSURFACE_ROLE: &str = "subsurface";
@@ -542,6 +550,14 @@ pub fn remove_destruction_hook(surface: &WlSurface, hook_id: &HookId) {
     PrivateSurfaceData::remove_destruction_hook(surface, hook_id)
 }
 
+/// Invoke post-commit hooks
+///
+/// This is meant to be called by the compositor when handling `CompositorEvent::Commit`
+/// to run any previously registered hooks.
+pub fn invoke_post_commit_hooks<D: 'static>(state: &mut D, dh: &DisplayHandle, surface: &WlSurface) {
+    PrivateSurfaceData::invoke_post_commit_hooks(state, dh, surface)
+}
+
 /// Adds a blocker for the currently queued up state changes of the given surface.
 ///
 /// Blockers will delay the pending state to be applied on the next commit until
@@ -614,6 +630,9 @@ pub struct CompositorState {
     compositor: GlobalId,
     subcompositor: GlobalId,
     surfaces: Vec<WlSurface>,
+    pub(crate) tx_sender: calloop::channel::Sender<CompositorEvent>,
+    /// The display handle, stored for use in the commit channel handler.
+    pub display_handle: DisplayHandle,
 }
 
 /// Per-client state of a compositor
@@ -638,7 +657,7 @@ impl CompositorClientState {
     /// To be called, when a previously added blocker (via [`add_blocker`])
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
-    pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
+    pub fn blocker_cleared(&self, dh: &DisplayHandle) {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
@@ -646,7 +665,12 @@ impl CompositorClientState {
         };
 
         for transaction in transactions {
-            transaction.apply(dh, state)
+            let committed = transaction.apply(dh);
+            for surface in committed {
+                if let Some(user_data) = surface.data::<SurfaceUserData>() {
+                    let _ = user_data.tx_sender.send(CompositorEvent::Commit(surface.clone()));
+                }
+            }
         }
     }
 
@@ -691,13 +715,20 @@ impl CompositorState {
     /// It returns the two global handles, in case you wish to remove these globals from
     /// the event loop in the future.
     ///
+    /// The provided `loop_handle` is used to automatically register a channel source that
+    /// dispatches [`CompositorEvent::Commit`] — invoking post-commit hooks and calling
+    /// [`CompositorHandler::commit`] — so callers do not need to wire this up manually.
+    ///
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
-    pub fn new<D>(display: &DisplayHandle) -> Self
+    pub fn new<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + CompositorHandler
+            + 'static,
     {
-        Self::new_with_version::<D>(display, 5)
+        Self::new_with_version::<D>(display, 5, loop_handle)
     }
 
     /// The same as [`new`], but binds at least version 6 of [`wl_compositor`].
@@ -707,17 +738,39 @@ impl CompositorState {
     ///
     /// [`new`]: Self::new
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
-    pub fn new_v6<D>(display: &DisplayHandle) -> Self
+    pub fn new_v6<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + CompositorHandler
+            + 'static,
     {
-        Self::new_with_version::<D>(display, 6)
+        Self::new_with_version::<D>(display, 6, loop_handle)
     }
 
-    fn new_with_version<D>(display: &DisplayHandle, version: u32) -> Self
+    fn new_with_version<D>(display: &DisplayHandle, version: u32, loop_handle: &LoopHandle<'static, D>) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + CompositorHandler
+            + 'static,
     {
+        let (tx_sender, rx_receiver) = calloop::channel::channel::<CompositorEvent>();
+
+        loop_handle
+            .insert_source(rx_receiver, |event, _, state: &mut D| {
+                if let calloop::channel::Event::Msg(msg) = event {
+                    match msg {
+                        CompositorEvent::Commit(surface) => {
+                            let dh = state.compositor_state().display_handle.clone();
+                            invoke_post_commit_hooks(state, &dh, &surface);
+                            state.commit(&surface);
+                        }
+                    }
+                }
+            })
+            .expect("Failed to insert CompositorEvent source into event loop");
+
         let compositor = display.create_global::<D, WlCompositor, _>(version, GlobalData);
         let subcompositor = display.create_global::<D, WlSubcompositor, _>(1, GlobalData);
 
@@ -725,6 +778,8 @@ impl CompositorState {
             compositor,
             subcompositor,
             surfaces: Vec::new(),
+            tx_sender,
+            display_handle: display.clone(),
         }
     }
 

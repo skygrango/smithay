@@ -74,6 +74,7 @@ where
         match request {
             wl_compositor::Request::CreateSurface { id } => {
                 trace!(id = ?id, "Creating a new wl_surface");
+                let tx_sender = state.compositor_state().tx_sender.clone();
 
                 let surface = data_init.init(
                     id,
@@ -81,6 +82,7 @@ where
                         inner: PrivateSurfaceData::new(),
                         alive_tracker: Default::default(),
                         user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
+                        tx_sender: tx_sender.clone(),
                     },
                 );
 
@@ -154,6 +156,7 @@ pub struct SurfaceUserData {
     pub(crate) inner: Mutex<PrivateSurfaceData>,
     alive_tracker: AliveTracker,
     pub(super) user_state_type: (std::any::TypeId, &'static str),
+    pub(crate) tx_sender: calloop::channel::Sender<super::CompositorEvent>,
 }
 
 impl<D> Dispatch2<WlSurface, D> for SurfaceUserData
