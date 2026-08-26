@@ -258,7 +258,8 @@ impl Transaction {
             })
     }
 
-    pub(crate) fn apply<C: CompositorHandler + 'static>(self, dh: &DisplayHandle, state: &mut C) {
+    pub(crate) fn apply(self, dh: &DisplayHandle) -> Vec<WlSurface> {
+        let mut committed = Vec::new();
         for (surface, id) in self.surfaces {
             let Ok(surface) = surface.upgrade() else {
                 continue;
@@ -268,12 +269,9 @@ impl Transaction {
                 states.cached_state.apply_state(id, dh);
             });
 
-            PrivateSurfaceData::invoke_post_commit_hooks::<C>(state, dh, &surface);
-
-            tracing::trace!("Calling user implementation for wl_surface.commit");
-
-            state.commit(&surface);
+            committed.push(surface);
         }
+        committed
     }
 }
 

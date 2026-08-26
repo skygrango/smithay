@@ -128,10 +128,20 @@ use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
 use crate::wayland::GlobalData;
 use portable_atomic::AtomicF64;
 use wayland_server::backend::GlobalId;
+use wayland_server::Weak;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::{wl_buffer, wl_callback, wl_output, wl_region, wl_surface::WlSurface};
 use wayland_server::{Client, DisplayHandle, GlobalDispatch, Resource};
+
+/// Compositor events emitted via channel
+#[derive(Debug, Clone)]
+pub enum CompositorEvent {
+    NewSurface(WlSurface),
+    NewSubsurface { surface: WlSurface, parent: WlSurface },
+    Commit(WlSurface),
+    Destroyed(WlSurface),
+}
 
 /// The role of a subsurface surface.
 pub const SUBSURFACE_ROLE: &str = "subsurface";
@@ -542,6 +552,14 @@ pub fn remove_destruction_hook(surface: &WlSurface, hook_id: &HookId) {
     PrivateSurfaceData::remove_destruction_hook(surface, hook_id)
 }
 
+/// Invoke post-commit hooks
+///
+/// This is meant to be called by the compositor when handling `CompositorEvent::Commit`
+/// to run any previously registered hooks.
+pub fn invoke_post_commit_hooks<D: 'static>(state: &mut D, dh: &DisplayHandle, surface: &WlSurface) {
+    PrivateSurfaceData::invoke_post_commit_hooks(state, dh, surface)
+}
+
 /// Adds a blocker for the currently queued up state changes of the given surface.
 ///
 /// Blockers will delay the pending state to be applied on the next commit until
@@ -613,7 +631,8 @@ pub trait CompositorHandler {
 pub struct CompositorState {
     compositor: GlobalId,
     subcompositor: GlobalId,
-    surfaces: Vec<WlSurface>,
+    surfaces: Vec<Weak<WlSurface>>,
+    pub(crate) tx_sender: calloop::channel::Sender<CompositorEvent>,
 }
 
 /// Per-client state of a compositor
@@ -638,7 +657,7 @@ impl CompositorClientState {
     /// To be called, when a previously added blocker (via [`add_blocker`])
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
-    pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
+    pub fn blocker_cleared(&self, dh: &DisplayHandle) {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
@@ -646,7 +665,12 @@ impl CompositorClientState {
         };
 
         for transaction in transactions {
-            transaction.apply(dh, state)
+            let committed = transaction.apply(dh);
+            for surface in committed {
+                if let Some(user_data) = surface.data::<SurfaceUserData>() {
+                    let _ = user_data.tx_sender.send(CompositorEvent::Commit(surface.clone()));
+                }
+            }
         }
     }
 
@@ -693,11 +717,11 @@ impl CompositorState {
     ///
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
-    pub fn new<D>(display: &DisplayHandle) -> Self
+    pub fn new<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
-        Self::new_with_version::<D>(display, 5)
+        Self::new_with_version::<D>(display, 5, tx_sender)
     }
 
     /// The same as [`new`], but binds at least version 6 of [`wl_compositor`].
@@ -707,14 +731,14 @@ impl CompositorState {
     ///
     /// [`new`]: Self::new
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
-    pub fn new_v6<D>(display: &DisplayHandle) -> Self
+    pub fn new_v6<D>(display: &DisplayHandle, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
-        Self::new_with_version::<D>(display, 6)
+        Self::new_with_version::<D>(display, 6, tx_sender)
     }
 
-    fn new_with_version<D>(display: &DisplayHandle, version: u32) -> Self
+    fn new_with_version<D>(display: &DisplayHandle, version: u32, tx_sender: calloop::channel::Sender<CompositorEvent>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
@@ -725,6 +749,7 @@ impl CompositorState {
             compositor,
             subcompositor,
             surfaces: Vec::new(),
+            tx_sender,
         }
     }
 
