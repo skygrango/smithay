@@ -48,7 +48,7 @@ use wayland_server::{DisplayHandle, Resource, Weak, protocol::wl_surface::WlSurf
 
 use crate::utils::Serial;
 
-use super::{CompositorHandler, tree::PrivateSurfaceData};
+use super::tree::PrivateSurfaceData;
 
 /// Types potentially blocking state changes
 pub trait Blocker {

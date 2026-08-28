@@ -128,7 +128,6 @@ use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
 use crate::wayland::GlobalData;
 use portable_atomic::AtomicF64;
 use wayland_server::backend::GlobalId;
-use wayland_server::Weak;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::{wl_buffer, wl_callback, wl_output, wl_region, wl_surface::WlSurface};
@@ -137,10 +136,8 @@ use wayland_server::{Client, DisplayHandle, GlobalDispatch, Resource};
 /// Compositor events emitted via channel
 #[derive(Debug, Clone)]
 pub enum CompositorEvent {
-    NewSurface(WlSurface),
-    NewSubsurface { surface: WlSurface, parent: WlSurface },
+    /// A surface was committed (after blockers cleared)
     Commit(WlSurface),
-    Destroyed(WlSurface),
 }
 
 /// The role of a subsurface surface.
@@ -631,7 +628,7 @@ pub trait CompositorHandler {
 pub struct CompositorState {
     compositor: GlobalId,
     subcompositor: GlobalId,
-    surfaces: Vec<Weak<WlSurface>>,
+    surfaces: Vec<WlSurface>,
     pub(crate) tx_sender: calloop::channel::Sender<CompositorEvent>,
 }
 

@@ -86,7 +86,7 @@ where
                     },
                 );
 
-                state.compositor_state().surfaces.push(surface.downgrade());
+                state.compositor_state().surfaces.push(surface.clone());
 
                 PrivateSurfaceData::init(&surface);
                 state.new_surface(&surface);
@@ -347,14 +347,13 @@ where
         // We let the destruction hooks run first and then tell the compositor handler the surface was
         // destroyed.
         self.alive_tracker.destroy_notify();
-        // state.destroyed(surface);
-        let _ = self.tx_sender.send(super::CompositorEvent::Destroyed(surface.clone()));
+        state.destroyed(surface);
 
         // Remove the surface after the callback is invoked.
         state
             .compositor_state()
             .surfaces
-            .retain(|s| s.upgrade().map(|s| s.id() != surface.id()).unwrap_or(false));
+            .retain(|s| s.id() != surface.id());
         PrivateSurfaceData::cleanup(state, self, surface);
     }
 }
@@ -473,12 +472,7 @@ where
                     states.data_map.insert_if_missing_threadsafe(SubsurfaceState::new)
                 });
 
-                if let Some(user_data) = surface.data::<SurfaceUserData>() {
-                    let _ = user_data.tx_sender.send(super::CompositorEvent::NewSubsurface {
-                        surface: surface.clone(),
-                        parent: parent.clone(),
-                    });
-                }
+                state.new_subsurface(&surface, &parent);
             }
             wl_subcompositor::Request::Destroy => {}
             _ => unreachable!(),
