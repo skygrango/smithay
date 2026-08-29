@@ -82,7 +82,7 @@ where
                         inner: PrivateSurfaceData::new(),
                         alive_tracker: Default::default(),
                         user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
-                        tx_sender: tx_sender.clone(),
+                        tx_sender,
                     },
                 );
 
@@ -156,7 +156,7 @@ pub struct SurfaceUserData {
     pub(crate) inner: Mutex<PrivateSurfaceData>,
     alive_tracker: AliveTracker,
     pub(super) user_state_type: (std::any::TypeId, &'static str),
-    pub(crate) tx_sender: calloop::channel::Sender<super::CompositorEvent>,
+    pub(crate) tx_sender: Option<calloop::channel::Sender<super::CompositorEvent>>,
 }
 
 impl<D> Dispatch2<WlSurface, D> for SurfaceUserData

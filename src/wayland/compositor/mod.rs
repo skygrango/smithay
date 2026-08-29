@@ -630,7 +630,7 @@ pub struct CompositorState {
     compositor: GlobalId,
     subcompositor: GlobalId,
     surfaces: Vec<WlSurface>,
-    pub(crate) tx_sender: calloop::channel::Sender<CompositorEvent>,
+    pub(crate) tx_sender: Option<calloop::channel::Sender<CompositorEvent>>,
     /// The display handle, stored for use in the commit channel handler.
     pub display_handle: DisplayHandle,
 }
@@ -657,7 +657,49 @@ impl CompositorClientState {
     /// To be called, when a previously added blocker (via [`add_blocker`])
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
-    pub fn blocker_cleared(&self, dh: &DisplayHandle) {
+    ///
+    /// Post-commit hooks and [`CompositorHandler::commit`] are called inline,
+    /// within this method.  Use this when the [`CompositorState`] was created
+    /// **without** a calloop `loop_handle` (i.e. via [`CompositorState::new`] /
+    /// [`CompositorState::new_v6`]).
+    ///
+    /// If you created the [`CompositorState`] with [`CompositorState::new_with_loop`],
+    /// use [`blocker_cleared_async`] instead so that commits are dispatched through
+    /// the registered calloop channel.
+    ///
+    /// [`blocker_cleared_async`]: CompositorClientState::blocker_cleared_async
+    pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
+        let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
+            queue.take_ready()
+        } else {
+            Vec::new()
+        };
+
+        for transaction in transactions {
+            let committed = transaction.apply(dh);
+            for surface in committed {
+                invoke_post_commit_hooks(state, dh, &surface);
+                tracing::trace!("Calling user implementation for wl_surface.commit");
+                state.commit(&surface);
+            }
+        }
+    }
+
+    /// Async variant of [`blocker_cleared`] — requires a calloop loop handle.
+    ///
+    /// Use this when the [`CompositorState`] was created with
+    /// [`CompositorState::new_with_loop`] / [`CompositorState::new_v6_with_loop`].
+    /// Committed surfaces are sent through the registered calloop channel, where
+    /// post-commit hooks and [`CompositorHandler::commit`] will be invoked on the
+    /// next event-loop iteration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the [`CompositorState`] was **not** created with a loop handle.
+    /// In that case use [`blocker_cleared`] instead.
+    ///
+    /// [`blocker_cleared`]: CompositorClientState::blocker_cleared
+    pub fn blocker_cleared_async(&self, dh: &DisplayHandle) {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
@@ -668,7 +710,12 @@ impl CompositorClientState {
             let committed = transaction.apply(dh);
             for surface in committed {
                 if let Some(user_data) = surface.data::<SurfaceUserData>() {
-                    let _ = user_data.tx_sender.send(CompositorEvent::Commit(surface.clone()));
+                    let sender = user_data
+                        .tx_sender
+                        .as_ref()
+                        .expect("blocker_cleared_async called but CompositorState has no async loop handle; \
+                                 use blocker_cleared instead");
+                    let _ = sender.send(CompositorEvent::Commit(surface.clone()));
                 }
             }
         }
@@ -715,20 +762,21 @@ impl CompositorState {
     /// It returns the two global handles, in case you wish to remove these globals from
     /// the event loop in the future.
     ///
-    /// The provided `loop_handle` is used to automatically register a channel source that
-    /// dispatches [`CompositorEvent::Commit`] — invoking post-commit hooks and calling
-    /// [`CompositorHandler::commit`] — so callers do not need to wire this up manually.
+    /// When a blocker is cleared, callers must use
+    /// [`CompositorClientState::blocker_cleared_sync`] to dispatch pending commits
+    /// synchronously.  If you want commits to be dispatched asynchronously via a
+    /// calloop channel, use [`new_with_loop`] instead.
     ///
+    /// [`new_with_loop`]: Self::new_with_loop
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
-    pub fn new<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
+    pub fn new<D>(display: &DisplayHandle) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData>
             + GlobalDispatch<WlSubcompositor, GlobalData>
-            + CompositorHandler
             + 'static,
     {
-        Self::new_with_version::<D>(display, 5, loop_handle)
+        Self::new_with_version_inner::<D>(display, 5, None)
     }
 
     /// The same as [`new`], but binds at least version 6 of [`wl_compositor`].
@@ -738,7 +786,38 @@ impl CompositorState {
     ///
     /// [`new`]: Self::new
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
-    pub fn new_v6<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
+    pub fn new_v6<D>(display: &DisplayHandle) -> Self
+    where
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + 'static,
+    {
+        Self::new_with_version_inner::<D>(display, 6, None)
+    }
+
+    /// Like [`new`], but registers a calloop channel source on the provided `loop_handle`.
+    ///
+    /// The channel source automatically invokes post-commit hooks and
+    /// [`CompositorHandler::commit`] when a blocker is cleared via
+    /// [`CompositorClientState::blocker_cleared`].  Callers do not need to call
+    /// [`blocker_cleared_sync`] manually in this mode.
+    ///
+    /// [`new`]: Self::new
+    /// [`blocker_cleared_sync`]: CompositorClientState::blocker_cleared_sync
+    pub fn new_with_loop<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
+    where
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + CompositorHandler
+            + 'static,
+    {
+        Self::new_with_version::<D>(display, 5, loop_handle)
+    }
+
+    /// Like [`new_v6`], but registers a calloop channel source on the provided `loop_handle`.
+    ///
+    /// [`new_v6`]: Self::new_v6
+    pub fn new_v6_with_loop<D>(display: &DisplayHandle, loop_handle: &LoopHandle<'static, D>) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData>
             + GlobalDispatch<WlSubcompositor, GlobalData>
@@ -771,6 +850,19 @@ impl CompositorState {
             })
             .expect("Failed to insert CompositorEvent source into event loop");
 
+        Self::new_with_version_inner::<D>(display, version, Some(tx_sender))
+    }
+
+    fn new_with_version_inner<D>(
+        display: &DisplayHandle,
+        version: u32,
+        tx_sender: Option<calloop::channel::Sender<CompositorEvent>>,
+    ) -> Self
+    where
+        D: GlobalDispatch<WlCompositor, GlobalData>
+            + GlobalDispatch<WlSubcompositor, GlobalData>
+            + 'static,
+    {
         let compositor = display.create_global::<D, WlCompositor, _>(version, GlobalData);
         let subcompositor = display.create_global::<D, WlSubcompositor, _>(1, GlobalData);
 
