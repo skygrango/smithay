@@ -139,6 +139,19 @@ use calloop::LoopHandle;
 pub enum CompositorEvent {
     /// A surface was committed (after blockers cleared)
     Commit(WlSurface),
+    /// A surface's commit was placed in the pending transaction queue because at least one
+    /// [`Blocker`] is still [`BlockerState::Pending`].
+    ///
+    /// The compositor should use this event to schedule when to call
+    /// [`CompositorClientState::blocker_cleared`] or [`CompositorClientState::blocker_cleared_async`]
+    /// (e.g. after signalling barriers at the next vblank deadline).
+    BlockerAdded {
+        /// The surface whose commit is now waiting for blockers to be resolved.
+        surface: WlSurface,
+        /// The client whose [`TransactionQueue`](self::transaction::TransactionQueue) now
+        /// contains at least one pending transaction.
+        client: Client,
+    },
 }
 
 /// The role of a subsurface surface.
@@ -614,6 +627,25 @@ pub trait CompositorHandler {
     /// using a pre-commit hook (see [`add_pre_commit_hook`]).
     fn commit(&mut self, surface: &WlSurface);
 
+    /// A surface commit was deferred because at least one [`Blocker`] is still pending.
+    ///
+    /// This is called when a non-synchronized surface is committed but its transaction
+    /// cannot be applied immediately — i.e. `take_ready()` returned nothing after the
+    /// transaction was enqueued.
+    ///
+    /// The compositor should use this callback to schedule the appropriate moment to
+    /// call [`CompositorClientState::blocker_cleared`] (sync path) or
+    /// [`CompositorClientState::blocker_cleared_async`] (async/loop path), for example
+    /// after signalling commit-timer barriers at the next vblank deadline.
+    ///
+    /// When using [`CompositorState::new_with_loop`], this callback is invoked from the
+    /// calloop event source (i.e. on the next event-loop iteration after the channel
+    /// message is processed).  When using [`CompositorState::new`] (sync path) it is
+    /// called inline during the client's `wl_surface.commit` request handling.
+    ///
+    /// The default implementation does nothing.
+    fn blocker_added(&mut self, _surface: &WlSurface, _client: &Client) {}
+
     /// The surface was destroyed.
     ///
     /// This allows the compositor to clean up any uses of the surface.
@@ -844,6 +876,9 @@ impl CompositorState {
                             let dh = state.compositor_state().display_handle.clone();
                             invoke_post_commit_hooks(state, &dh, &surface);
                             state.commit(&surface);
+                        }
+                        CompositorEvent::BlockerAdded { surface, client } => {
+                            state.blocker_added(&surface, &client);
                         }
                     }
                 }

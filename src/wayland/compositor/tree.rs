@@ -328,11 +328,25 @@ impl PrivateSurfaceData {
             // release the queue lock
             std::mem::drop(queue_guard);
             // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
-            for transaction in transactions {
-                let committed = transaction.apply(dh);
-                for surface in committed {
-                    PrivateSurfaceData::invoke_post_commit_hooks(state, dh, &surface);
-                    state.commit(&surface);
+            if transactions.is_empty() {
+                // The transaction was enqueued but could not be applied immediately because at
+                // least one blocker is still pending.  Notify the compositor so it can schedule
+                // the right moment to call blocker_cleared / blocker_cleared_async.
+                if let Some(tx_sender) = state.compositor_state().tx_sender.as_ref() {
+                    let _ = tx_sender.send(super::CompositorEvent::BlockerAdded {
+                        surface: surface.clone(),
+                        client,
+                    });
+                } else {
+                    state.blocker_added(surface, &client);
+                }
+            } else {
+                for transaction in transactions {
+                    let committed = transaction.apply(dh);
+                    for surface in committed {
+                        PrivateSurfaceData::invoke_post_commit_hooks(state, dh, &surface);
+                        state.commit(&surface);
+                    }
                 }
             }
         }
