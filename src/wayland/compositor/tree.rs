@@ -1,13 +1,10 @@
-use crate::{
-    utils::{
-        Serial,
-        hook::{Hook, HookId},
-    },
-    wayland::compositor::SUBSURFACE_ROLE,
+use crate::utils::{
+    Serial,
+    hook::{Hook, HookId},
 };
 
 use super::{
-    BufferAssignment, CompositorHandler, SurfaceAttributes, SurfaceData,
+    BufferAssignment, CompositorHandler, SUBSURFACE_ROLE, SurfaceAttributes, SurfaceData,
     cache::MultiCache,
     handlers::{SurfaceUserData, is_effectively_sync},
     transaction::{Blocker, PendingTransaction, TransactionQueue},
@@ -281,12 +278,13 @@ impl PrivateSurfaceData {
     pub fn commit<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
         let is_sync = is_effectively_sync(surface);
         let children = PrivateSurfaceData::get_children(surface);
+
         let mut my_data = Self::lock_user_data(surface);
         // commit our state
         let current_txid = my_data.current_txid;
         my_data.public_data.cached_state.commit(Some(current_txid), dh);
         // take all our children state into our pending transaction
-        for child in children {
+        for child in &children {
             // if the child is effectively sync, take its state
             // this is the case if either we are effectively sync, or the child is explicitly sync
             let mut child_data = Self::lock_user_data(&child);
@@ -327,20 +325,10 @@ impl PrivateSurfaceData {
             let transactions = queue.take_ready();
             // release the queue lock
             std::mem::drop(queue_guard);
-            // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
+
             if transactions.is_empty() {
-                // The transaction was enqueued but could not be applied immediately because at
-                // least one blocker is still pending.  Notify the compositor so it can schedule
-                // the right moment to call blocker_cleared / blocker_cleared_async.
-                if let Some(tx_sender) = state.compositor_state().tx_sender.as_ref() {
-                    let _ = tx_sender.send(super::CompositorEvent::BlockerAdded {
-                        surface: surface.clone(),
-                        client,
-                    });
-                } else {
-                    state.blocker_added(surface, &client);
-                }
-            } else {
+                state.blocker_added(surface, &client);
+            }else{
                 for transaction in transactions {
                     let committed = transaction.apply(dh);
                     for surface in committed {
@@ -350,6 +338,33 @@ impl PrivateSurfaceData {
                 }
             }
         }
+
+        // let mut has_commit_timing = false;
+        // let check_commit_timing = |surface: &WlSurface| {
+        //     with_states(surface, |states| {
+        //         states.data_map.get::<CommitTimerBarrierStateUserData>().is_some()
+        //     })
+        // };
+
+        // for wlsurface in &children {
+        //     if check_commit_timing(wlsurface) {
+        //         has_commit_timing = true;
+        //         break;
+        //     }
+        // }
+
+        // let mut root = surface.clone();
+
+        // while let Some(parent) = PrivateSurfaceData::get_parent(&root) {
+        //     if !has_commit_timing && check_commit_timing(&parent) {
+        //         has_commit_timing = true;
+        //     }
+        //     root = parent;
+        // };
+
+        // if has_commit_timing && let Some(client) = root.client() {
+        //     state.blocker_added(surface, &client);
+        // }
     }
 
     /// Checks if the first surface is an ancestor of the second

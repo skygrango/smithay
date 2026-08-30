@@ -126,32 +126,19 @@ use crate::utils::Transform;
 pub use crate::utils::hook::HookId;
 use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
 use crate::wayland::GlobalData;
+use calloop::LoopHandle;
 use portable_atomic::AtomicF64;
 use wayland_server::backend::GlobalId;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::{wl_buffer, wl_callback, wl_output, wl_region, wl_surface::WlSurface};
 use wayland_server::{Client, DisplayHandle, GlobalDispatch, Resource};
-use calloop::LoopHandle;
 
 /// Compositor events emitted via channel
 #[derive(Debug, Clone)]
 pub enum CompositorEvent {
     /// A surface was committed (after blockers cleared)
     Commit(WlSurface),
-    /// A surface's commit was placed in the pending transaction queue because at least one
-    /// [`Blocker`] is still [`BlockerState::Pending`].
-    ///
-    /// The compositor should use this event to schedule when to call
-    /// [`CompositorClientState::blocker_cleared`] or [`CompositorClientState::blocker_cleared_async`]
-    /// (e.g. after signalling barriers at the next vblank deadline).
-    BlockerAdded {
-        /// The surface whose commit is now waiting for blockers to be resolved.
-        surface: WlSurface,
-        /// The client whose [`TransactionQueue`](self::transaction::TransactionQueue) now
-        /// contains at least one pending transaction.
-        client: Client,
-    },
 }
 
 /// The role of a subsurface surface.
@@ -742,11 +729,10 @@ impl CompositorClientState {
             let committed = transaction.apply(dh);
             for surface in committed {
                 if let Some(user_data) = surface.data::<SurfaceUserData>() {
-                    let sender = user_data
-                        .tx_sender
-                        .as_ref()
-                        .expect("blocker_cleared_async called but CompositorState has no async loop handle; \
-                                 use blocker_cleared instead");
+                    let sender = user_data.tx_sender.as_ref().expect(
+                        "blocker_cleared_async called but CompositorState has no async loop handle; \
+                                 use blocker_cleared instead",
+                    );
                     let _ = sender.send(CompositorEvent::Commit(surface.clone()));
                 }
             }
@@ -804,9 +790,7 @@ impl CompositorState {
     /// [`wl_subcompositor`]: wayland_server::protocol::wl_subcompositor
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData>
-            + GlobalDispatch<WlSubcompositor, GlobalData>
-            + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
         Self::new_with_version_inner::<D>(display, 5, None)
     }
@@ -820,9 +804,7 @@ impl CompositorState {
     /// [`wl_compositor`]: wayland_server::protocol::wl_compositor
     pub fn new_v6<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData>
-            + GlobalDispatch<WlSubcompositor, GlobalData>
-            + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
         Self::new_with_version_inner::<D>(display, 6, None)
     }
@@ -859,7 +841,11 @@ impl CompositorState {
         Self::new_with_version::<D>(display, 6, loop_handle)
     }
 
-    fn new_with_version<D>(display: &DisplayHandle, version: u32, loop_handle: &LoopHandle<'static, D>) -> Self
+    fn new_with_version<D>(
+        display: &DisplayHandle,
+        version: u32,
+        loop_handle: &LoopHandle<'static, D>,
+    ) -> Self
     where
         D: GlobalDispatch<WlCompositor, GlobalData>
             + GlobalDispatch<WlSubcompositor, GlobalData>
@@ -877,9 +863,6 @@ impl CompositorState {
                             invoke_post_commit_hooks(state, &dh, &surface);
                             state.commit(&surface);
                         }
-                        CompositorEvent::BlockerAdded { surface, client } => {
-                            state.blocker_added(&surface, &client);
-                        }
                     }
                 }
             })
@@ -894,9 +877,7 @@ impl CompositorState {
         tx_sender: Option<calloop::channel::Sender<CompositorEvent>>,
     ) -> Self
     where
-        D: GlobalDispatch<WlCompositor, GlobalData>
-            + GlobalDispatch<WlSubcompositor, GlobalData>
-            + 'static,
+        D: GlobalDispatch<WlCompositor, GlobalData> + GlobalDispatch<WlSubcompositor, GlobalData> + 'static,
     {
         let compositor = display.create_global::<D, WlCompositor, _>(version, GlobalData);
         let subcompositor = display.create_global::<D, WlSubcompositor, _>(1, GlobalData);
