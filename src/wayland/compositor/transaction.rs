@@ -39,7 +39,6 @@
 // but will be once proper transaction & blockers support is
 // added to smithay
 use std::{
-    collections::HashSet,
     fmt,
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
@@ -248,18 +247,24 @@ impl Transaction {
             return BlockerState::Cancelled;
         }
 
-        use BlockerState::*;
-        self.blockers
-            .iter()
-            .fold(Released, |acc, blocker| match (acc, blocker.state()) {
-                (Cancelled, _) | (_, Cancelled) => Cancelled,
-                (Pending, _) | (_, Pending) => Pending,
-                (Released, Released) => Released,
-            })
+        let mut has_pending = false;
+        for blocker in &self.blockers {
+            match blocker.state() {
+                BlockerState::Cancelled => return BlockerState::Cancelled,
+                BlockerState::Pending => has_pending = true,
+                BlockerState::Released => {}
+            }
+        }
+
+        if has_pending {
+            BlockerState::Pending
+        } else {
+            BlockerState::Released
+        }
     }
 
     pub(crate) fn apply(self, dh: &DisplayHandle) -> Vec<WlSurface> {
-        let mut committed = Vec::new();
+        let mut committed = Vec::with_capacity(self.surfaces.len());
         for (surface, id) in self.surfaces {
             let Ok(surface) = surface.upgrade() else {
                 continue;
@@ -279,71 +284,87 @@ impl Transaction {
 #[derive(Debug, Default)]
 pub(crate) struct TransactionQueue {
     transactions: Vec<Transaction>,
-    // we keep the hashset around to reuse allocations
-    seen_surfaces: HashSet<u32>,
+    scratch: Vec<Transaction>,
+    seen_surfaces: smallvec::SmallVec<[u32; 8]>,
 }
 
 impl TransactionQueue {
+    #[inline]
     pub(crate) fn append(&mut self, t: Transaction) {
         self.transactions.push(t);
     }
 
-    pub(crate) fn take_ready(&mut self) -> Vec<Transaction> {
-        // FIXME: Get rid of this allocation here
-        let mut ready_transactions = Vec::new();
-        // this is a very non-optimized implementation
-        // we just iterate over the queue of transactions, keeping track of which
-        // surface we have seen as they encode transaction dependencies
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    #[inline]
+    fn mark_surfaces_seen(
+        seen_surfaces: &mut smallvec::SmallVec<[u32; 8]>,
+        surfaces: &[(Weak<WlSurface>, Serial)],
+    ) {
+        for (s, _) in surfaces {
+            if s.is_alive() {
+                let id = s.id().protocol_id();
+                if !seen_surfaces.contains(&id) {
+                    seen_surfaces.push(id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn take_ready_into(&mut self, ready_transactions: &mut Vec<Transaction>) -> u32 {
+        let mut pending_transaction_count = 0;
         self.seen_surfaces.clear();
-        // manually iterate as we're going to modify the Vec while iterating on it
-        let mut i = 0;
-        // the loop will terminate, as at every iteration either i is incremented by 1
-        // or the length of self.transactions is reduced by 1.
-        while i < self.transactions.len() {
-            let mut skip = false;
-            // does the transaction have any active blocker?
-            match self.transactions[i].state() {
+        self.scratch.clear();
+        std::mem::swap(&mut self.transactions, &mut self.scratch);
+
+        ready_transactions.reserve(self.scratch.len());
+
+        for tx in self.scratch.drain(..) {
+            match tx.state() {
                 BlockerState::Cancelled => {
-                    // this transaction is cancelled, remove it without further processing
-                    self.transactions.remove(i);
-                    continue;
+                    // This transaction is cancelled, drop it without further processing.
                 }
                 BlockerState::Pending => {
-                    skip = true;
+                    // Transaction has pending blockers: skip and record its surfaces.
+                    Self::mark_surfaces_seen(&mut self.seen_surfaces, &tx.surfaces);
+                    pending_transaction_count += 1;
+                    self.transactions.push(tx);
                 }
-                BlockerState::Released => {}
-            }
-            // if not, does this transaction depend on any previous transaction?
-            if !skip {
-                for (s, _) in &self.transactions[i].surfaces {
-                    // TODO: is this alive check still needed?
-                    if !s.is_alive() {
-                        continue;
-                    }
-                    if self.seen_surfaces.contains(&s.id().protocol_id()) {
-                        skip = true;
-                        break;
-                    }
-                }
-            }
+                BlockerState::Released => {
+                    // Check if this transaction depends on an earlier unready transaction.
+                    let is_blocked = !self.seen_surfaces.is_empty()
+                        && tx
+                            .surfaces
+                            .iter()
+                            .any(|(s, _)| s.is_alive() && self.seen_surfaces.contains(&s.id().protocol_id()));
 
-            if skip {
-                // this transaction is not yet ready and should be skipped, add its surfaces to our
-                // seen list
-                for (s, _) in &self.transactions[i].surfaces {
-                    // TODO: is this alive check still needed?
-                    if !s.is_alive() {
-                        continue;
+                    if is_blocked {
+                        Self::mark_surfaces_seen(&mut self.seen_surfaces, &tx.surfaces);
+                        self.transactions.push(tx);
+                    } else {
+                        ready_transactions.push(tx);
                     }
-                    self.seen_surfaces.insert(s.id().protocol_id());
                 }
-                i += 1;
-            } else {
-                // this transaction is to be applied, yay!
-                ready_transactions.push(self.transactions.remove(i));
             }
         }
 
-        ready_transactions
+        pending_transaction_count
+    }
+
+    pub(crate) fn take_ready(&mut self) -> (Vec<Transaction>, u32) {
+        if self.transactions.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let mut ready_transactions = Vec::with_capacity(self.transactions.len());
+        let pending_count = self.take_ready_into(&mut ready_transactions);
+        (ready_transactions, pending_count)
     }
 }

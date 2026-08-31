@@ -631,7 +631,7 @@ pub trait CompositorHandler {
     /// called inline during the client's `wl_surface.commit` request handling.
     ///
     /// The default implementation does nothing.
-    fn blocker_added(&mut self, _surface: &WlSurface, _client: &Client) {}
+    fn schedule_barrier(&mut self, _surface: &WlSurface, _client: &Client) {}
 
     /// The surface was destroyed.
     ///
@@ -689,7 +689,7 @@ impl CompositorClientState {
     /// [`blocker_cleared_async`]: CompositorClientState::blocker_cleared_async
     pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
-            queue.take_ready()
+            queue.take_ready().0
         } else {
             Vec::new()
         };
@@ -720,7 +720,7 @@ impl CompositorClientState {
     /// [`blocker_cleared`]: CompositorClientState::blocker_cleared
     pub fn blocker_cleared_async(&self, dh: &DisplayHandle) {
         let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
-            queue.take_ready()
+            queue.take_ready().0
         } else {
             Vec::new()
         };

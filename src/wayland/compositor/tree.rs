@@ -322,20 +322,20 @@ impl PrivateSurfaceData {
             // release the mutex, as applying the transaction will try to lock it
             std::mem::drop(my_data);
             // trigger the queue
-            let transactions = queue.take_ready();
+            let (transactions, pending_count) = queue.take_ready();
             // release the queue lock
             std::mem::drop(queue_guard);
 
-            if transactions.is_empty() {
-                state.blocker_added(surface, &client);
-            }else{
-                for transaction in transactions {
-                    let committed = transaction.apply(dh);
-                    for surface in committed {
-                        PrivateSurfaceData::invoke_post_commit_hooks(state, dh, &surface);
-                        state.commit(&surface);
-                    }
+            for transaction in transactions {
+                let committed = transaction.apply(dh);
+                for surface in committed {
+                    PrivateSurfaceData::invoke_post_commit_hooks(state, dh, &surface);
+                    state.commit(&surface);
                 }
+            }
+
+            if pending_count > 0 {
+                state.schedule_barrier(surface, &client);
             }
         }
 
