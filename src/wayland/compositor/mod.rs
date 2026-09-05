@@ -110,13 +110,15 @@ mod handlers;
 mod transaction;
 mod tree;
 
+use std::any::Any;
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::{any::Any, sync::Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 pub use self::cache::{Cacheable, CachedState, MultiCache};
-pub use self::handlers::{RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData};
+pub use self::handlers::{
+    RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData, is_effectively_sync,
+};
 use self::transaction::TransactionQueue;
 pub use self::transaction::{Barrier, Blocker, BlockerState};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
@@ -555,6 +557,27 @@ pub fn add_blocker(surface: &WlSurface, blocker: impl Blocker + Send + 'static) 
     PrivateSurfaceData::add_blocker(surface, blocker)
 }
 
+/// Trigger ready transactions specifically for the given surface's timeline queue.
+pub fn surface_blocker_cleared<D: CompositorHandler + 'static>(
+    surface: &WlSurface,
+    state: &mut D,
+    dh: &DisplayHandle,
+) {
+    let queue = PrivateSurfaceData::timeline_queue(surface);
+    let transactions = {
+        let mut queue_guard = queue.lock().unwrap();
+        queue_guard.take_ready()
+    };
+
+    for tx in transactions {
+        let had_barriers = !tx.completion_barriers.is_empty();
+        tx.apply(dh, state);
+        if had_barriers {
+            PrivateSurfaceData::drain_surface_tree(surface, dh, state);
+        }
+    }
+}
+
 /// Handler trait for compositor
 pub trait CompositorHandler {
     /// [CompositorState] getter
@@ -619,7 +642,7 @@ pub struct CompositorState {
 /// Per-client state of a compositor
 #[derive(Debug)]
 pub struct CompositorClientState {
-    queue: Mutex<Option<TransactionQueue>>,
+    pub(crate) active_queues: Mutex<Vec<Weak<Mutex<TransactionQueue>>>>,
     scale_override: Arc<AtomicF64>,
     last_touch_frame: Mutex<Option<FrameMarker>>,
 }
@@ -627,7 +650,7 @@ pub struct CompositorClientState {
 impl Default for CompositorClientState {
     fn default() -> Self {
         CompositorClientState {
-            queue: Mutex::new(None),
+            active_queues: Mutex::new(Vec::new()),
             scale_override: Arc::new(AtomicF64::new(1.)),
             last_touch_frame: Mutex::new(None),
         }
@@ -635,19 +658,59 @@ impl Default for CompositorClientState {
 }
 
 impl CompositorClientState {
+    pub(crate) fn register_queue(&self, queue: &Arc<Mutex<TransactionQueue>>) {
+        let mut guard = self.active_queues.lock().unwrap();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(Arc::downgrade(queue));
+    }
+
     /// To be called, when a previously added blocker (via [`add_blocker`])
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
     pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
-        let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
-            queue.take_ready()
-        } else {
-            Vec::new()
-        };
+        loop {
+            let mut queues: Vec<Arc<Mutex<TransactionQueue>>> = Vec::new();
+            {
+                let mut guard = self.active_queues.lock().unwrap();
+                guard.retain(|weak| {
+                    if let Some(arc) = weak.upgrade() {
+                        if !queues.iter().any(|q| Arc::ptr_eq(q, &arc)) {
+                            queues.push(arc);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
 
-        for transaction in transactions {
-            transaction.apply(dh, state)
+            let mut transactions = Vec::new();
+            for queue in queues {
+                transactions.extend(queue.lock().unwrap().take_ready());
+            }
+
+            if transactions.is_empty() {
+                break;
+            }
+
+            for transaction in transactions {
+                transaction.apply(dh, state);
+            }
         }
+    }
+
+    /// To be called, when a previously added blocker (via [`add_blocker`])
+    /// got `Released` or `Cancelled` from being `Pending` for a specific surface.
+    ///
+    /// This directly triggers the surface's timeline queue with O(1) performance
+    /// and zero cross-window lock contention.
+    pub fn surface_blocker_cleared<D: CompositorHandler + 'static>(
+        &self,
+        surface: &WlSurface,
+        state: &mut D,
+        dh: &DisplayHandle,
+    ) {
+        surface_blocker_cleared(surface, state, dh);
     }
 
     /// Set an additionally mapping between smithay's `Logical` coordinate space
