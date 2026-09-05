@@ -87,6 +87,8 @@ where
                 state.compositor_state().surfaces.push(surface.clone());
 
                 PrivateSurfaceData::init(&surface);
+                let queue = PrivateSurfaceData::timeline_queue(&surface);
+                state.client_compositor_state(_client).register_queue(&queue);
                 state.new_surface(&surface);
             }
             wl_compositor::Request::CreateRegion { id } => {
@@ -563,7 +565,7 @@ where
         client: &wayland_server::Client,
         subsurface: &WlSubsurface,
         request: wl_subsurface::Request,
-        _dh: &DisplayHandle,
+        dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
         match request {
@@ -596,22 +598,29 @@ where
                     )
                 }
             }
-            wl_subsurface::Request::SetSync => PrivateSurfaceData::with_states(&self.surface, |state| {
-                state
-                    .data_map
-                    .get::<SubsurfaceState>()
-                    .unwrap()
-                    .sync
-                    .store(true, Ordering::Release);
-            }),
-            wl_subsurface::Request::SetDesync => PrivateSurfaceData::with_states(&self.surface, |state| {
-                state
-                    .data_map
-                    .get::<SubsurfaceState>()
-                    .unwrap()
-                    .sync
-                    .store(false, Ordering::Release);
-            }),
+            wl_subsurface::Request::SetSync => {
+                PrivateSurfaceData::with_states(&self.surface, |state| {
+                    state
+                        .data_map
+                        .get::<SubsurfaceState>()
+                        .unwrap()
+                        .sync
+                        .store(true, Ordering::Release);
+                });
+                PrivateSurfaceData::sync_subsurface_queue(&self.surface);
+            }
+            wl_subsurface::Request::SetDesync => {
+                PrivateSurfaceData::with_states(&self.surface, |state| {
+                    state
+                        .data_map
+                        .get::<SubsurfaceState>()
+                        .unwrap()
+                        .sync
+                        .store(false, Ordering::Release);
+                });
+                let new_queue = PrivateSurfaceData::desync_subsurface_queue(&self.surface, dh, state);
+                state.client_compositor_state(client).register_queue(&new_queue);
+            }
             wl_subsurface::Request::Destroy => {
                 // Our destructor already handles it
             }
@@ -621,11 +630,15 @@ where
 
     fn destroyed(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client_id: wayland_server::backend::ClientId,
         _object: &WlSubsurface,
     ) {
-        PrivateSurfaceData::unset_parent(&self.surface);
+        if let Some(new_queue) = PrivateSurfaceData::unset_parent(&self.surface) {
+            if let Some(client) = self.surface.client() {
+                state.client_compositor_state(&client).register_queue(&new_queue);
+            }
+        }
         PrivateSurfaceData::with_states(&self.surface, |state| {
             state
                 .data_map
