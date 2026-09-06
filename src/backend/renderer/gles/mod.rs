@@ -37,6 +37,22 @@ pub use shaders::*;
 pub use texture::*;
 pub use uniform::*;
 
+#[cfg(feature = "wayland_frontend")]
+use crate::wayland::color::management::ImageDescription;
+
+#[cfg(feature = "wayland_frontend")]
+pub mod hdr;
+#[cfg(feature = "wayland_frontend")]
+pub use hdr::{
+    HdrOutputConfig, decode_sdr, sdr_color_to_hdr, sdr_color_to_pq, srgb_color_to_pq,
+    update_hdr_surface_uniforms,
+};
+
+/// Hook to adjust texture shader uniforms per surface based on the surface's color description.
+#[cfg(feature = "wayland_frontend")]
+pub type SurfaceTexUniformsHook =
+    Arc<dyn Fn(Option<&ImageDescription>, &mut [Uniform<'static>]) + Send + Sync>;
+
 use crate::{backend::renderer::FrameContext, gpu_span_location};
 use profiler::SpanLocation;
 
@@ -391,6 +407,16 @@ pub struct GlesRenderer {
     // shaders
     tex_program: GlesTexProgram,
     solid_program: GlesSolidProgram,
+    #[cfg(feature = "wayland_frontend")]
+    hdr_tex_program: Option<GlesTexProgram>,
+    #[cfg(feature = "wayland_frontend")]
+    hdr_output_config: Option<HdrOutputConfig>,
+
+    // Defaults inherited by frames, primarily for compositor-wide color transforms.
+    default_tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    #[cfg(feature = "wayland_frontend")]
+    surface_tex_uniforms_hook: Option<SurfaceTexUniformsHook>,
+    solid_color_transform: Option<Box<dyn Fn(Color32F) -> Color32F>>,
 
     // caches
     buffers: Vec<GlesBuffer>,
@@ -425,6 +451,10 @@ pub struct GlesFrame<'frame, 'buffer> {
     transform: Transform,
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    #[cfg(feature = "wayland_frontend")]
+    surface_tex_uniforms_hook: Option<SurfaceTexUniformsHook>,
+    #[cfg(feature = "wayland_frontend")]
+    active_color_description: Option<ImageDescription>,
     finished: AtomicBool,
 
     span: EnteredSpan,
@@ -730,6 +760,14 @@ impl GlesRenderer {
 
             tex_program,
             solid_program,
+            #[cfg(feature = "wayland_frontend")]
+            hdr_tex_program: None,
+            #[cfg(feature = "wayland_frontend")]
+            hdr_output_config: None,
+            default_tex_program_override: None,
+            #[cfg(feature = "wayland_frontend")]
+            surface_tex_uniforms_hook: None,
+            solid_color_transform: None,
             vbos,
             min_filter: TextureFilter::Linear,
             max_filter: TextureFilter::Linear,
@@ -2158,6 +2196,115 @@ impl GlesRenderer {
             )
         }
     }
+
+    /// Sets the texture-program override inherited by subsequently created frames.
+    pub fn set_default_tex_program_override(
+        &mut self,
+        program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    ) {
+        self.default_tex_program_override = program_override;
+    }
+
+    /// Sets a hook to adjust texture shader uniforms per surface based on the surface's color description.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn set_surface_tex_uniforms_hook(&mut self, hook: Option<SurfaceTexUniformsHook>) {
+        self.surface_tex_uniforms_hook = hook;
+    }
+
+    /// Sets a transform applied to clear colors and solid-color render elements.
+    pub fn set_solid_color_transform(&mut self, transform: Option<Box<dyn Fn(Color32F) -> Color32F>>) {
+        self.solid_color_transform = transform;
+    }
+
+    /// Configures the renderer for HDR output.
+    ///
+    /// When `Some(config)` is passed:
+    /// - Enables the built-in HDR texture shader with per-surface color management (PQ, HLG, scRGB, SDR gamut/gamma mapping).
+    /// - Automatically configures solid colors and clear colors to match target HDR reference white.
+    ///
+    /// When `None` is passed:
+    /// - Reverts to standard SDR rendering.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn set_hdr_output(&mut self, config: Option<HdrOutputConfig>) -> Result<(), GlesError> {
+        if self.hdr_output_config == config {
+            return Ok(());
+        }
+        self.hdr_output_config = config;
+
+        if let Some(config) = config {
+            let program = if let Some(prog) = &self.hdr_tex_program {
+                prog.clone()
+            } else {
+                let additional_uniforms = [
+                    UniformName::new("hdr_reference_white", UniformType::_1f),
+                    UniformName::new("hdr_sdr_gamma", UniformType::_1f),
+                    UniformName::new("hdr_gamut_stretch", UniformType::_1f),
+                    UniformName::new("hdr_input_pq", UniformType::_1f),
+                    UniformName::new("hdr_input_hlg", UniformType::_1f),
+                    UniformName::new("hdr_input_primaries", UniformType::_1f),
+                    UniformName::new("hdr_content_reference", UniformType::_1f),
+                    UniformName::new("hdr_max_content_luminance", UniformType::_1f),
+                    UniformName::new("hdr_max_destination_luminance", UniformType::_1f),
+                    UniformName::new("hdr_hardware_offload", UniformType::_1f),
+                    UniformName::new("hdr_target_is_sdr", UniformType::_1f),
+                ];
+                let prog = unsafe {
+                    self.egl.make_current()?;
+                    texture_program(
+                        &self.gl,
+                        shaders::FRAGMENT_SHADER_HDR,
+                        &additional_uniforms,
+                        self.gles_cleanup().sender.clone(),
+                    )?
+                };
+                self.hdr_tex_program = Some(prog.clone());
+                prog
+            };
+
+            let default_uniforms = vec![
+                Uniform::new("hdr_reference_white", config.reference_white),
+                Uniform::new("hdr_sdr_gamma", config.sdr_gamma),
+                Uniform::new("hdr_gamut_stretch", config.gamut_stretch),
+                Uniform::new("hdr_input_pq", 0.0_f32),
+                Uniform::new("hdr_input_hlg", 0.0_f32),
+                Uniform::new("hdr_input_primaries", 0.0_f32),
+                Uniform::new("hdr_content_reference", 203.0_f32),
+                Uniform::new("hdr_max_content_luminance", config.max_luminance),
+                Uniform::new("hdr_max_destination_luminance", config.max_luminance),
+                Uniform::new(
+                    "hdr_hardware_offload",
+                    if config.hardware_offload { 1.0_f32 } else { 0.0_f32 },
+                ),
+                Uniform::new("hdr_target_is_sdr", if config.is_sdr { 1.0_f32 } else { 0.0_f32 }),
+            ];
+
+            self.set_default_tex_program_override(Some((program, default_uniforms)));
+            self.set_surface_tex_uniforms_hook(Some(Arc::new(move |desc, uniforms| {
+                hdr::update_hdr_surface_uniforms(desc, uniforms, &config);
+            })));
+            self.set_solid_color_transform(Some(Box::new(move |color| {
+                hdr::sdr_color_to_hdr(
+                    color,
+                    config.reference_white,
+                    config.sdr_gamma,
+                    config.gamut_stretch,
+                    config.hardware_offload,
+                    config.is_sdr,
+                )
+            })));
+        } else {
+            self.set_default_tex_program_override(None);
+            self.set_surface_tex_uniforms_hook(None);
+            self.set_solid_color_transform(None);
+        }
+        Ok(())
+    }
+
+    /// Returns the currently active HDR output configuration, if any.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn hdr_output(&self) -> Option<HdrOutputConfig> {
+        self.hdr_output_config
+    }
 }
 
 impl GlesFrame<'_, '_> {
@@ -2291,6 +2438,9 @@ impl Renderer for GlesRenderer {
         let current_projection = (flip180 * transform.matrix() * renderer).into();
         let span = span!(parent: &self.span, Level::DEBUG, "renderer_gles2_frame", current_projection = ?current_projection, size = ?output_size, transform = ?transform).entered();
 
+        let tex_program_override = self.default_tex_program_override.clone();
+        #[cfg(feature = "wayland_frontend")]
+        let surface_tex_uniforms_hook = self.surface_tex_uniforms_hook.clone();
         Ok(GlesFrame {
             renderer: self,
             target,
@@ -2298,7 +2448,11 @@ impl Renderer for GlesRenderer {
             current_projection,
             transform,
             size: output_size,
-            tex_program_override: None,
+            tex_program_override,
+            #[cfg(feature = "wayland_frontend")]
+            surface_tex_uniforms_hook,
+            #[cfg(feature = "wayland_frontend")]
+            active_color_description: None,
             finished: AtomicBool::new(false),
 
             span,
@@ -2522,6 +2676,11 @@ impl Frame for GlesFrame<'_, '_> {
         self.size
     }
 
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(&mut self, desc: Option<&ImageDescription>) {
+        self.active_color_description = desc.cloned();
+    }
+
     #[profiling::function]
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         self.renderer.wait(sync)
@@ -2605,6 +2764,25 @@ impl GlesFrame<'_, '_> {
         self.tex_program_override = None;
     }
 
+    /// Takes the texture-program override and leaves the default shader active.
+    pub fn take_tex_program_override(&mut self) -> Option<(GlesTexProgram, Vec<Uniform<'static>>)> {
+        self.tex_program_override.take()
+    }
+
+    /// Restores or clears a previously saved texture-program override.
+    pub fn set_tex_program_override(
+        &mut self,
+        program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    ) {
+        self.tex_program_override = program_override;
+    }
+
+    /// Sets a hook to adjust texture shader uniforms per surface based on the surface's color description.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn set_surface_tex_uniforms_hook(&mut self, hook: Option<SurfaceTexUniformsHook>) {
+        self.surface_tex_uniforms_hook = hook;
+    }
+
     /// Draw a solid color to the current target at the specified destination with the specified color.
     #[instrument(level = "trace", skip(self), parent = &self.span)]
     #[profiling::function]
@@ -2617,6 +2795,11 @@ impl GlesFrame<'_, '_> {
         if damage.is_empty() {
             return Ok(());
         }
+
+        let color = match &self.renderer.solid_color_transform {
+            Some(transform) => transform(color),
+            None => color,
+        };
 
         let mut mat = Mat3::IDENTITY;
         mat = self.current_projection * mat;
@@ -2946,10 +3129,28 @@ impl GlesFrame<'_, '_> {
         } else {
             ffi::TEXTURE_2D
         };
-        let (tex_program, additional_uniforms) = program
-            .map(|p| (p, additional_uniforms))
-            .or_else(|| self.tex_program_override.as_ref().map(|(p, a)| (p, &**a)))
-            .unwrap_or((&self.renderer.tex_program, &[]));
+        #[cfg(feature = "wayland_frontend")]
+        let mut overridden_uniforms;
+        let (tex_program, additional_uniforms) = if let Some(p) = program {
+            (p, additional_uniforms)
+        } else if let Some((ref p, ref a)) = self.tex_program_override {
+            #[cfg(feature = "wayland_frontend")]
+            if let Some(ref hook) = self.surface_tex_uniforms_hook {
+                if self.active_color_description.is_some() {
+                    overridden_uniforms = a.clone();
+                    hook(self.active_color_description.as_ref(), &mut overridden_uniforms);
+                    (p, &*overridden_uniforms)
+                } else {
+                    (p, &**a)
+                }
+            } else {
+                (p, &**a)
+            }
+            #[cfg(not(feature = "wayland_frontend"))]
+            (p, &**a)
+        } else {
+            (&self.renderer.tex_program, &[][..])
+        };
         let program_variant = tex_program.variant_for_format(
             if !tex.0.is_external { tex.0.format } else { None },
             tex.0.has_alpha,

@@ -81,6 +81,7 @@ use crate::{
     },
     wayland::{
         alpha_modifier::AlphaModifierSurfaceCachedState,
+        color::management::{ImageDescription, RenderIntent},
         compositor::{self, SurfaceData, TraversalAction},
     },
 };
@@ -241,6 +242,8 @@ pub struct WaylandSurfaceRenderElement<R: Renderer> {
     damage: DamageSnapshot<i32, BufferCoords>,
     opaque_regions: OpaqueRegions<i32, Logical>,
     texture: WaylandSurfaceTexture<R>,
+    color_description: Option<ImageDescription>,
+    render_intent: RenderIntent,
 }
 
 impl<R: Renderer> fmt::Debug for WaylandSurfaceRenderElement<R> {
@@ -320,6 +323,8 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
                 .map(OpaqueRegions::from_slice)
                 .unwrap_or_default(),
             texture,
+            color_description: data.color_description,
+            render_intent: data.render_intent,
         })
     }
 
@@ -348,6 +353,28 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
     /// Get the buffer
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// Get the committed color description of the surface
+    pub fn color_description(&self) -> Option<ImageDescription> {
+        self.color_description
+    }
+
+    /// Get the committed render intent of the surface
+    pub fn render_intent(&self) -> RenderIntent {
+        self.render_intent
+    }
+
+    /// Whether this surface denotes HDR content
+    pub fn is_hdr(&self) -> bool {
+        self.color_description.as_ref().is_some_and(|desc| desc.is_hdr())
+    }
+
+    /// Whether this surface is PQ BT.2020
+    pub fn is_pq_bt2020(&self) -> bool {
+        self.color_description
+            .as_ref()
+            .is_some_and(|desc| desc.is_pq_bt2020())
     }
 }
 
@@ -464,7 +491,8 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        match self.texture {
+        frame.set_surface_color_description(self.color_description.as_ref());
+        let res = match self.texture {
             WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
                 texture,
                 src,
@@ -475,6 +503,8 @@ where
                 self.alpha,
             ),
             WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, color * self.alpha),
-        }
+        };
+        frame.set_surface_color_description(None);
+        res
     }
 }

@@ -129,6 +129,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
+    ops::RangeInclusive,
     os::unix::io::{AsFd, OwnedFd},
     str::FromStr,
     sync::Arc,
@@ -178,6 +179,7 @@ use crate::{
 
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+    color::{Colorspace, ConnectorColorState, CrtcColorState},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -2921,6 +2923,106 @@ where
     /// used without a modeset on the attached connectors.
     pub fn use_vrr(&mut self, vrr: bool) -> FrameResult<(), A, F> {
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the colorspaces supported by the given connector's `Colorspace` property.
+    ///
+    /// See [`DrmSurface::supported_colorspaces`] for more details.
+    pub fn supported_colorspaces(&self, conn: connector::Handle) -> FrameResult<Vec<Colorspace>, A, F> {
+        self.surface
+            .supported_colorspaces(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the given connector supports the `HDR_OUTPUT_METADATA` property.
+    ///
+    /// See [`DrmSurface::hdr_metadata_supported`] for more details.
+    pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
+        self.surface
+            .hdr_metadata_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns the valid range of the given connector's `max bpc` property, if any.
+    ///
+    /// See [`DrmSurface::max_bpc_range`] for more details.
+    pub fn max_bpc_range(&self, conn: connector::Handle) -> FrameResult<Option<RangeInclusive<u32>>, A, F> {
+        self.surface.max_bpc_range(conn).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the [`ConnectorColorState`] to be used after the next commit.
+    pub fn pending_color_state(&self) -> ConnectorColorState {
+        self.surface.pending_color_state()
+    }
+
+    /// Returns the currently active [`ConnectorColorState`].
+    pub fn current_color_state(&self) -> ConnectorColorState {
+        self.surface.current_color_state()
+    }
+
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// with the next queued frame.
+    ///
+    /// A changed color state upgrades the next frame submission to a full atomic modeset
+    /// commit, so the connector color properties are applied in a *single* atomic commit
+    /// together with the mode, CRTC and plane state.
+    ///
+    /// See [`DrmSurface::use_color_state`] for more details.
+    pub fn use_color_state(&mut self, state: ConnectorColorState) -> FrameResult<(), A, F> {
+        let changed = self.surface.pending_color_state() != state;
+        self.surface
+            .use_color_state(state)
+            .map_err(FrameError::DrmError)?;
+        if changed {
+            self.damage_tracker = OutputDamageTracker::from_mode_source(self.output_mode_source.clone());
+        }
+        Ok(())
+    }
+
+    /// Stages a new [`CrtcColorState`] (hardware GAMMA_LUT and CTM) to be applied on the
+    /// next frame submission.
+    ///
+    /// See [`DrmSurface::use_crtc_color_state`] for more details.
+    pub fn use_crtc_color_state(&mut self, state: CrtcColorState) -> FrameResult<(), A, F> {
+        let changed = self.surface.pending_crtc_color_state() != state;
+        self.surface
+            .use_crtc_color_state(state)
+            .map_err(FrameError::DrmError)?;
+        if changed {
+            self.damage_tracker = OutputDamageTracker::from_mode_source(self.output_mode_source.clone());
+        }
+        Ok(())
+    }
+
+    /// Queries the size of the CRTC's hardware `GAMMA_LUT` if supported.
+    pub fn crtc_gamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_gamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the CRTC supports hardware color transformation matrix (`CTM`).
+    pub fn crtc_has_ctm(&self) -> bool {
+        self.surface.crtc_has_ctm()
+    }
+
+    /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
+    pub fn crtc_degamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_degamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is staged for the next commit.
+    pub fn pending_hdr_hardware_offload(&self) -> bool {
+        self.surface.pending_hdr_hardware_offload()
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is currently active on the CRTC.
+    pub fn current_hdr_hardware_offload(&self) -> bool {
+        self.surface.current_hdr_hardware_offload()
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is staged for the next commit.
+    #[inline]
+    pub fn hdr_hardware_offload(&self) -> bool {
+        self.surface.hdr_hardware_offload()
     }
 
     /// Set the [`DebugFlags`] to use
