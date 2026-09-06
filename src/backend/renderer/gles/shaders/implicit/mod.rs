@@ -7,6 +7,9 @@ pub(in super::super) const FRAGMENT_SHADER: &str = include_str!("./texture.frag"
 pub(in super::super) const VERTEX_SHADER_SOLID: &str = include_str!("./solid.vert");
 pub(in super::super) const FRAGMENT_SHADER_SOLID: &str = include_str!("./solid.frag");
 
+#[cfg(feature = "wayland_frontend")]
+pub(in super::super) const FRAGMENT_SHADER_HDR: &str = include_str!("./hdr_texture.frag");
+
 #[derive(Debug)]
 pub(in super::super) struct GlesTexProgramInternal {
     pub(in super::super) program: ffi::types::GLuint,
