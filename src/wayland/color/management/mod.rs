@@ -1112,14 +1112,34 @@ where
                     resource.post_error(Error::AlreadySet, "transfer function already set");
                     return;
                 }
-                match tf
-                    .into_result()
-                    .ok()
-                    .filter(|tf| state.color_management_state().supported_tfs.contains(tf))
-                    // Only names advertised to this client are allowed; deprecated/newer
-                    // entries were filtered out at bind time.
-                    .filter(|tf| tf_visible(*tf, resource.version()))
-                {
+                let supported_tfs = &state.color_management_state().supported_tfs;
+                let resolved_tf = match tf.into_result().ok() {
+                    Some(TransferFunction::Srgb) if resource.version() >= 2 => {
+                        // Protocol v2 deprecated Srgb in favor of CompoundPower24.
+                        // For backwards compatibility with clients (e.g. Firefox) that still request Srgb,
+                        // map to CompoundPower24 if supported, or keep Srgb if explicitly supported.
+                        if supported_tfs.contains(&TransferFunction::CompoundPower24) {
+                            Some(TransferFunction::CompoundPower24)
+                        } else if supported_tfs.contains(&TransferFunction::Srgb) {
+                            Some(TransferFunction::Srgb)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(TransferFunction::CompoundPower24) if resource.version() < 2 => {
+                        // If a v1 client requests CompoundPower24, map to Srgb if supported.
+                        if supported_tfs.contains(&TransferFunction::Srgb) {
+                            Some(TransferFunction::Srgb)
+                        } else if supported_tfs.contains(&TransferFunction::CompoundPower24) {
+                            Some(TransferFunction::CompoundPower24)
+                        } else {
+                            None
+                        }
+                    }
+                    Some(tf) if supported_tfs.contains(&tf) && tf_visible(tf, resource.version()) => Some(tf),
+                    _ => None,
+                };
+                match resolved_tf {
                     Some(tf) => params.transfer = Some(tf),
                     None => resource.post_error(Error::InvalidTf, "unsupported transfer function"),
                 }
