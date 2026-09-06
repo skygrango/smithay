@@ -75,6 +75,7 @@ portable-atomic = { version = "1", features = ["float"] }
 sha2 = "0.10.9"
 tracy-client = { version = "0.18.4", default-features = false, optional = true }
 reis = { version = "0.7.0", features = ["calloop"] }
+wayland-scanner = "0.31.0"
 glam = { version = "0.33.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -112,7 +113,7 @@ renderer_test = []
 tracy_gpu_profiling = ["renderer_gl", "tracy-client"]
 use_system_lib = ["wayland_frontend", "wayland-backend/server_system", "wayland-sys", "gbm?/import-wayland"]
 use_bindgen = ["drm-ffi/use_bindgen", "gbm/use_bindgen", "input/use_bindgen"]
-wayland_frontend = ["wayland-server", "wayland-protocols", "wayland-protocols-wlr", "wayland-protocols-misc", "tempfile"]
+wayland_frontend = ["wayland-server", "wayland-protocols", "wayland-protocols-wlr", "wayland-protocols-misc", "wayland-backend", "tempfile"]
 x11rb_event_source = ["x11rb"]
 xwayland = ["encoding_rs", "wayland_frontend", "x11rb/composite", "x11rb/xfixes", "x11rb/randr", "x11rb_event_source", "scopeguard"]
 test_all_features = ["default", "use_system_lib", "renderer_glow", "renderer_test"]

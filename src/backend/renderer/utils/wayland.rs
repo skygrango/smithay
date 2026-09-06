@@ -26,6 +26,8 @@ use super::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, SurfaceView};
 use tracing::{error, instrument, warn};
 use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 
+use crate::wayland::color::management::{ColorManagementSurfaceCachedState, ImageDescription, RenderIntent};
+
 /// Type stored in WlSurface states data_map
 ///
 /// ```rs
@@ -36,7 +38,7 @@ use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 pub type RendererSurfaceStateUserData = Mutex<RendererSurfaceState>;
 
 /// Surface state for rendering related data
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct RendererSurfaceState {
     pub(crate) buffer_dimensions: Option<Size<i32, BufferCoord>>,
     pub(crate) buffer_scale: i32,
@@ -48,6 +50,27 @@ pub struct RendererSurfaceState {
     pub(crate) textures: HashMap<ErasedContextId, Box<dyn Any>>,
     pub(crate) surface_view: Option<SurfaceView>,
     pub(crate) opaque_regions: Vec<Rectangle<i32, Logical>>,
+    pub(crate) color_description: Option<ImageDescription>,
+    pub(crate) render_intent: RenderIntent,
+}
+
+impl Default for RendererSurfaceState {
+    fn default() -> Self {
+        Self {
+            buffer_dimensions: None,
+            buffer_scale: 1,
+            buffer_transform: Transform::Normal,
+            buffer_has_alpha: None,
+            buffer: None,
+            damage: DamageBag::default(),
+            renderer_seen: HashMap::default(),
+            textures: HashMap::default(),
+            surface_view: None,
+            opaque_regions: Vec::default(),
+            color_description: None,
+            render_intent: RenderIntent::Perceptual,
+        }
+    }
 }
 
 /// SAFETY: Only thing unsafe here is the `Box<dyn Any>`, which are the textures.
@@ -143,6 +166,8 @@ impl PartialEq<WlBuffer> for &Buffer {
 impl RendererSurfaceState {
     #[profiling::function]
     pub(crate) fn update_buffer(&mut self, states: &SurfaceData) {
+        self.update_color_state(states);
+
         #[cfg(feature = "backend_drm")]
         let mut guard = states.cached_state.get::<DrmSyncobjCachedState>();
         #[cfg(feature = "backend_drm")]
@@ -345,6 +370,36 @@ impl RendererSurfaceState {
         self.surface_view
     }
 
+    /// Returns the committed color description of the surface, if any.
+    pub fn color_description(&self) -> Option<ImageDescription> {
+        self.color_description
+    }
+
+    /// Returns the committed rendering intent of the surface.
+    pub fn render_intent(&self) -> RenderIntent {
+        self.render_intent
+    }
+
+    /// Returns whether this surface denotes HDR content.
+    pub fn is_hdr(&self) -> bool {
+        self.color_description.as_ref().is_some_and(|desc| desc.is_hdr())
+    }
+
+    /// Returns whether this surface has a PQ/BT.2020 image description.
+    pub fn is_pq_bt2020(&self) -> bool {
+        self.color_description
+            .as_ref()
+            .is_some_and(|desc| desc.is_pq_bt2020())
+    }
+
+    /// Updates color state from surface cached state.
+    pub fn update_color_state(&mut self, states: &SurfaceData) {
+        let mut color_guard = states.cached_state.get::<ColorManagementSurfaceCachedState>();
+        let color_state = *color_guard.current();
+        self.color_description = color_state.description;
+        self.render_intent = color_state.render_intent;
+    }
+
     fn reset(&mut self) {
         self.buffer_dimensions = None;
         self.buffer = None;
@@ -353,6 +408,8 @@ impl RendererSurfaceState {
         self.surface_view = None;
         self.buffer_has_alpha = None;
         self.opaque_regions.clear();
+        self.color_description = None;
+        self.render_intent = RenderIntent::Perceptual;
     }
 }
 

@@ -302,6 +302,14 @@ pub trait Frame {
         color: Color32F,
     ) -> Result<(), Self::Error>;
 
+    /// Sets the color description of the surface currently being drawn.
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(
+        &mut self,
+        _desc: Option<&crate::wayland::color::management::ImageDescription>,
+    ) {
+    }
+
     /// Render a texture to the current target as a flat 2d-plane at a given
     /// position and applying the given transformation with the given alpha value.
     /// (Meaning `src_transform` should match the orientation of surface being rendered).

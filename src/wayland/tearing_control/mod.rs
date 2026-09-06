@@ -92,6 +92,15 @@ impl TearingControlSurfaceCachedState {
     pub fn presentation_hint(&self) -> &wp_tearing_control_v1::PresentationHint {
         &self.presentation_hint
     }
+
+    /// Whether the client prefers tearing (async) presentation for this
+    /// surface. `false` is the protocol's `vsync` hint and the default.
+    pub fn prefer_async(&self) -> bool {
+        matches!(
+            self.presentation_hint,
+            wp_tearing_control_v1::PresentationHint::Async
+        )
+    }
 }
 
 impl Default for TearingControlSurfaceCachedState {
@@ -110,6 +119,17 @@ impl Cacheable for TearingControlSurfaceCachedState {
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
         *into = self;
     }
+}
+
+/// Reads the committed tearing preference from already borrowed surface
+/// state, e.g. inside surface-tree traversal callbacks where locking the
+/// surface again would deadlock.
+pub fn prefer_async_from_states(states: &super::compositor::SurfaceData) -> bool {
+    states
+        .cached_state
+        .get::<TearingControlSurfaceCachedState>()
+        .current()
+        .prefer_async()
 }
 
 #[derive(Debug)]

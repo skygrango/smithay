@@ -2131,6 +2131,16 @@ where
     fn finish(mut self) -> Result<sync::SyncPoint, Self::Error> {
         self.finish_internal()
     }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(
+        &mut self,
+        desc: Option<&crate::wayland::color::management::ImageDescription>,
+    ) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_surface_color_description(desc);
+        }
+    }
 }
 
 #[cfg(feature = "wayland_frontend")]
