@@ -88,7 +88,10 @@ mod surface;
 use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
-pub use color::{Colorspace, ConnectorColorState, CtaCoordinate, Eotf, HdrOutputMetadata};
+pub use color::{
+    Colorspace, ConnectorColorState, CrtcColorState, CtaCoordinate, DrmColorCtm, DrmColorLut, Eotf,
+    HdrOutputMetadata,
+};
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime, WeakDrmDeviceFd,

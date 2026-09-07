@@ -847,6 +847,54 @@ impl AtomicDrmSurface {
         Ok(VrrSupport::NotSupported)
     }
 
+    /// Queries the size of the CRTC's hardware `GAMMA_LUT` if supported.
+    pub fn crtc_gamma_lut_size(&self) -> Result<Option<u64>, Error> {
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let prop_handle = match prop_mapping.crtc_prop_handle(self.crtc, "GAMMA_LUT_SIZE") {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+        for (prop, value) in self.fd.get_properties(self.crtc).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to query CRTC properties",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })? {
+            if prop == prop_handle {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns whether the CRTC supports hardware color transformation matrix (`CTM`).
+    pub fn crtc_has_ctm(&self) -> bool {
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        prop_mapping.crtc_prop_handle(self.crtc, "CTM").is_ok()
+    }
+
+    /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
+    pub fn crtc_degamma_lut_size(&self) -> Result<Option<u64>, Error> {
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let prop_handle = match prop_mapping.crtc_prop_handle(self.crtc, "DEGAMMA_LUT_SIZE") {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+        for (prop, value) in self.fd.get_properties(self.crtc).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to query CRTC properties",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })? {
+            if prop == prop_handle {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn vrr_enabled(&self) -> bool {
         self.pending.read().unwrap().vrr
     }

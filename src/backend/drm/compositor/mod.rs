@@ -2972,6 +2972,21 @@ where
         self.surface.use_color_state(state).map_err(FrameError::DrmError)
     }
 
+    /// Queries the size of the CRTC's hardware `GAMMA_LUT` if supported.
+    pub fn crtc_gamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_gamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the CRTC supports hardware color transformation matrix (`CTM`).
+    pub fn crtc_has_ctm(&self) -> bool {
+        self.surface.crtc_has_ctm()
+    }
+
+    /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
+    pub fn crtc_degamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_degamma_lut_size().map_err(FrameError::DrmError)
+    }
+
     /// Set the [`DebugFlags`] to use
     ///
     /// Note: This will reset the primary plane swapchain if

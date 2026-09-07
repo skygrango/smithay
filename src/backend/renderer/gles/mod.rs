@@ -2240,6 +2240,8 @@ impl GlesRenderer {
                     UniformName::new("hdr_input_hlg", UniformType::_1f),
                     UniformName::new("hdr_input_primaries", UniformType::_1f),
                     UniformName::new("hdr_content_reference", UniformType::_1f),
+                    UniformName::new("hdr_max_content_luminance", UniformType::_1f),
+                    UniformName::new("hdr_max_destination_luminance", UniformType::_1f),
                 ];
                 let prog = unsafe {
                     self.egl.make_current()?;
@@ -2262,6 +2264,8 @@ impl GlesRenderer {
                 Uniform::new("hdr_input_hlg", 0.0_f32),
                 Uniform::new("hdr_input_primaries", 0.0_f32),
                 Uniform::new("hdr_content_reference", 203.0_f32),
+                Uniform::new("hdr_max_content_luminance", config.max_luminance),
+                Uniform::new("hdr_max_destination_luminance", config.max_luminance),
             ];
 
             self.set_default_tex_program_override(Some((program, default_uniforms)));
@@ -2269,7 +2273,12 @@ impl GlesRenderer {
                 hdr::update_hdr_surface_uniforms(desc, uniforms, &config);
             })));
             self.set_solid_color_transform(Some(Box::new(move |color| {
-                hdr::sdr_color_to_pq(color, config.reference_white, config.sdr_gamma, config.gamut_stretch)
+                hdr::sdr_color_to_pq(
+                    color,
+                    config.reference_white,
+                    config.sdr_gamma,
+                    config.gamut_stretch,
+                )
             })));
         } else {
             self.set_default_tex_program_override(None);

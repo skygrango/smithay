@@ -428,6 +428,30 @@ impl DrmSurface {
         }
     }
 
+    /// Queries the size of the CRTC's hardware `GAMMA_LUT` if supported.
+    pub fn crtc_gamma_lut_size(&self) -> Result<Option<u64>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.crtc_gamma_lut_size(),
+            DrmSurfaceInternal::Legacy(_) => Ok(None),
+        }
+    }
+
+    /// Returns whether the CRTC supports hardware color transformation matrix (`CTM`).
+    pub fn crtc_has_ctm(&self) -> bool {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.crtc_has_ctm(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        }
+    }
+
+    /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
+    pub fn crtc_degamma_lut_size(&self) -> Result<Option<u64>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.crtc_degamma_lut_size(),
+            DrmSurfaceInternal::Legacy(_) => Ok(None),
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying

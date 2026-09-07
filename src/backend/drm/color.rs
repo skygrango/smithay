@@ -198,6 +198,141 @@ pub struct ConnectorColorState {
     pub max_bpc: Option<u32>,
 }
 
+/// Entry of a DRM CRTC hardware lookup table (`struct drm_color_lut`).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct DrmColorLut {
+    /// Red component value (0..65535).
+    pub red: u16,
+    /// Green component value (0..65535).
+    pub green: u16,
+    /// Blue component value (0..65535).
+    pub blue: u16,
+    /// Reserved field required by the kernel UAPI struct alignment.
+    pub reserved: u16,
+}
+
+impl DrmColorLut {
+    /// Creates a LUT entry from normalized [0.0, 1.0] RGB values.
+    pub fn from_rgb(r: f32, g: f32, b: f32) -> Self {
+        let to_u16 = |v: f32| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        Self {
+            red: to_u16(r),
+            green: to_u16(g),
+            blue: to_u16(b),
+            reserved: 0,
+        }
+    }
+
+    /// Generates a ST 2084 (PQ) hardware gamma LUT of the given size.
+    /// Maps input linear radiance [0.0, 1.0] (where 1.0 = reference_white)
+    /// to output PQ code values [0.0, 1.0] (where 1.0 = 10,000 cd/m²).
+    pub fn create_pq_lut(size: usize, reference_white: f32) -> Vec<Self> {
+        let mut lut = Vec::with_capacity(size);
+        let scale = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let input = (i as f32) / denom;
+            let val = crate::backend::renderer::gles::hdr::encode_pq(input * scale);
+            lut.push(Self::from_rgb(val, val, val));
+        }
+        lut
+    }
+
+    /// Generates a linear identity hardware LUT.
+    pub fn create_identity_lut(size: usize) -> Vec<Self> {
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let val = (i as f32) / denom;
+            lut.push(Self::from_rgb(val, val, val));
+        }
+        lut
+    }
+}
+
+/// A 3x3 color transformation matrix for the DRM CRTC `CTM` property (`struct drm_color_ctm`).
+///
+/// Matrix coefficients are in S31.32 sign-magnitude format (bit 63 is sign,
+/// bits 62..32 are integer, bits 31..0 are fractional part).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct DrmColorCtm {
+    /// 3x3 row-major matrix entries.
+    pub matrix: [u64; 9],
+}
+
+impl Default for DrmColorCtm {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl DrmColorCtm {
+    /// Converts a floating-point value to DRM S31.32 sign-magnitude fixed-point format.
+    pub fn to_s31_32(val: f64) -> u64 {
+        let sign = if val < 0.0 { 1u64 << 63 } else { 0 };
+        let abs_val = val.abs();
+        let integer = (abs_val.floor() as u64) & 0x7fff_ffff;
+        let fraction = ((abs_val.fract() * ((1u64 << 32) as f64)).round() as u64) & 0xffff_ffff;
+        sign | (integer << 32) | fraction
+    }
+
+    /// Converts a DRM S31.32 sign-magnitude fixed-point value back to floating-point.
+    pub fn from_s31_32(val: u64) -> f64 {
+        let is_negative = (val & (1u64 << 63)) != 0;
+        let integer = ((val >> 32) & 0x7fff_ffff) as f64;
+        let fraction = (val & 0xffff_ffff) as f64 / ((1u64 << 32) as f64);
+        let mag = integer + fraction;
+        if is_negative { -mag } else { mag }
+    }
+
+    /// Creates an identity color transformation matrix.
+    pub fn identity() -> Self {
+        let one = Self::to_s31_32(1.0);
+        Self {
+            matrix: [one, 0, 0, 0, one, 0, 0, 0, one],
+        }
+    }
+
+    /// Creates a CTM from a 3x3 row-major floating point array.
+    pub fn from_3x3(m: [[f64; 3]; 3]) -> Self {
+        Self {
+            matrix: [
+                Self::to_s31_32(m[0][0]),
+                Self::to_s31_32(m[0][1]),
+                Self::to_s31_32(m[0][2]),
+                Self::to_s31_32(m[1][0]),
+                Self::to_s31_32(m[1][1]),
+                Self::to_s31_32(m[1][2]),
+                Self::to_s31_32(m[2][0]),
+                Self::to_s31_32(m[2][1]),
+                Self::to_s31_32(m[2][2]),
+            ],
+        }
+    }
+
+    /// Linear Rec.709 to BT.2020 color gamut matrix (row-major).
+    pub fn rec709_to_bt2020() -> Self {
+        Self::from_3x3([
+            [0.6274040, 0.3292820, 0.0433136],
+            [0.0690970, 0.9195400, 0.0113612],
+            [0.0163916, 0.0880132, 0.8955950],
+        ])
+    }
+}
+
+/// CRTC hardware color management pipeline configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrtcColorState {
+    /// Post-blending gamma lookup table (GAMMA_LUT).
+    pub gamma_lut: Option<Vec<DrmColorLut>>,
+    /// Post-blending color transformation matrix (CTM).
+    pub ctm: Option<DrmColorCtm>,
+    /// Pre-blending degamma lookup table (DEGAMMA_LUT).
+    pub degamma_lut: Option<Vec<DrmColorLut>>,
+}
+
 pub(super) mod ffi {
     //! Binary layout of the kernel's `HDR_OUTPUT_METADATA` blob
     //! (`struct hdr_output_metadata` in `include/uapi/drm/drm_mode.h`).
@@ -367,5 +502,56 @@ mod tests {
             assert_eq!(Colorspace::from_kernel_name(cs.kernel_name().unwrap()), Some(cs));
         }
         assert_eq!(Colorspace::Unknown.kernel_name(), None);
+    }
+
+    #[test]
+    fn drm_color_lut_layout_and_generation() {
+        assert_eq!(std::mem::size_of::<DrmColorLut>(), 8);
+        assert_eq!(std::mem::size_of::<DrmColorCtm>(), 72);
+
+        let lut = DrmColorLut::create_pq_lut(1024, 203.0);
+        assert_eq!(lut.len(), 1024);
+        assert_eq!(
+            lut[0],
+            DrmColorLut {
+                red: 0,
+                green: 0,
+                blue: 0,
+                reserved: 0
+            }
+        );
+
+        // Diffuse white (203 nits) at top of input range corresponds to ~0.5807 in PQ code
+        // 0.58068 * 65535 = 38055
+        let white_val = lut[1023].red;
+        assert!((white_val as i32 - 38055).abs() < 50, "white_val={white_val}");
+    }
+
+    #[test]
+    fn drm_color_ctm_s31_32_conversion() {
+        assert_eq!(DrmColorCtm::to_s31_32(1.0), 1u64 << 32);
+        assert_eq!(DrmColorCtm::to_s31_32(-1.0), (1u64 << 63) | (1u64 << 32));
+        assert_eq!(DrmColorCtm::to_s31_32(0.5), 1u64 << 31);
+        assert_eq!(DrmColorCtm::to_s31_32(-0.5), (1u64 << 63) | (1u64 << 31));
+
+        for val in [0.0, 1.0, -1.0, 0.5, -0.5, 0.627404, -0.0163916] {
+            let encoded = DrmColorCtm::to_s31_32(val);
+            let decoded = DrmColorCtm::from_s31_32(encoded);
+            assert!((decoded - val).abs() < 1e-9, "val={val} decoded={decoded}");
+        }
+
+        let ctm = DrmColorCtm::rec709_to_bt2020();
+        let r0 = DrmColorCtm::from_s31_32(ctm.matrix[0])
+            + DrmColorCtm::from_s31_32(ctm.matrix[1])
+            + DrmColorCtm::from_s31_32(ctm.matrix[2]);
+        let r1 = DrmColorCtm::from_s31_32(ctm.matrix[3])
+            + DrmColorCtm::from_s31_32(ctm.matrix[4])
+            + DrmColorCtm::from_s31_32(ctm.matrix[5]);
+        let r2 = DrmColorCtm::from_s31_32(ctm.matrix[6])
+            + DrmColorCtm::from_s31_32(ctm.matrix[7])
+            + DrmColorCtm::from_s31_32(ctm.matrix[8]);
+        assert!((r0 - 1.0).abs() < 2e-6);
+        assert!((r1 - 1.0).abs() < 2e-6);
+        assert!((r2 - 1.0).abs() < 2e-6);
     }
 }

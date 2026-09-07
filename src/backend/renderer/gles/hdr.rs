@@ -14,6 +14,8 @@ pub struct HdrOutputConfig {
     pub sdr_gamma: f32,
     /// Gamut stretch factor (0.0 = accurate colorimetric BT.709->BT.2020, 1.0 = native vivid gamut).
     pub gamut_stretch: f32,
+    /// Maximum output destination peak luminance in cd/m².
+    pub max_luminance: f32,
 }
 
 impl Default for HdrOutputConfig {
@@ -22,19 +24,34 @@ impl Default for HdrOutputConfig {
             reference_white: 203.0,
             sdr_gamma: 2.2,
             gamut_stretch: 0.0,
+            max_luminance: 1000.0,
         }
     }
 }
 
 impl HdrOutputConfig {
     /// Create a new HDR output configuration.
-    pub fn new(reference_white: f32, sdr_gamma: f32, gamut_stretch: f32) -> Self {
+    pub fn new(reference_white: f32, sdr_gamma: f32, gamut_stretch: f32, max_luminance: f32) -> Self {
         Self {
             reference_white,
             sdr_gamma,
             gamut_stretch,
+            max_luminance,
         }
     }
+}
+
+/// Modified Reinhard tone-mapping curve on luminance in cd/m² (mirroring KWin's ICtCp tonemapping).
+pub fn tonemap_reinhard(luminance: f32, reference_white: f32, max_content: f32, max_destination: f32) -> f32 {
+    if max_content <= max_destination * 1.01 {
+        return luminance.clamp(0.0, max_destination);
+    }
+    let rel_lum = (luminance / reference_white).max(0.0);
+    let input_range = max_content / reference_white;
+    let output_range = max_destination / reference_white;
+    let v = (output_range * (1.0 + input_range) - input_range) / (input_range * input_range);
+    let mapped_rel = rel_lum * (1.0 + rel_lum * v) / (1.0 + rel_lum);
+    (mapped_rel * reference_white).clamp(0.0, max_destination)
 }
 
 /// CPU mirror of `decode_sdr` in the HDR shaders: `gamma == 0.0` is the
@@ -50,6 +67,49 @@ pub fn decode_sdr(value: f32, gamma: f32) -> f32 {
 }
 
 /// Transforms an sRGB / SDR solid color to PQ / BT.2020 matching the HDR output target.
+/// Encodes normalized absolute luminance (0.0 to 1.0, where 1.0 = 10,000 cd/m²) to a ST 2084 (PQ) code value.
+pub fn encode_pq(value: f32) -> f32 {
+    const M1: f32 = 0.159_301_76;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.851_563;
+    const C3: f32 = 18.6875;
+    let p = value.max(0.0).powf(M1);
+    ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
+}
+
+/// Decodes a ST 2084 (PQ) code value to normalized absolute luminance (0.0 to 1.0, where 1.0 = 10,000 cd/m²).
+pub fn decode_pq(code: f32) -> f32 {
+    const M1_INV: f32 = 1.0 / 0.159_301_76;
+    const M2_INV: f32 = 1.0 / 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.851_563;
+    const C3: f32 = 18.6875;
+    let p = code.clamp(0.0, 1.0).powf(M2_INV);
+    ((p - C1).max(0.0) / (C2 - C3 * p)).powf(M1_INV)
+}
+
+/// Computes the optical alpha compensation in PQ space.
+///
+/// In ST 2084 (PQ), the perceptual curve is non-linear and steep near black.
+/// Blending linear PQ codes directly causes a severe luminance drop (dark rims) on
+/// semi-transparent pixels (e.g. 50% alpha white over black produces ~5 nits instead of 101.5 nits).
+/// Optical alpha ensures that the physical luminance on screen matches the linear coverage alpha.
+pub fn optical_alpha_pq(alpha: f32, reference_white: f32) -> f32 {
+    let a = alpha.clamp(0.0, 1.0);
+    if a <= 0.0 {
+        return 0.0;
+    }
+    if a >= 1.0 {
+        return 1.0;
+    }
+    let white_norm = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
+    let pq_white = encode_pq(white_norm);
+    let pq_lum = encode_pq(white_norm * a);
+    (pq_lum / pq_white.max(0.001)).clamp(0.0, 1.0)
+}
+
+/// Transforms an SDR color to PQ space with optical alpha compensation.
 pub fn sdr_color_to_pq(
     color: Color32F,
     reference_white: f32,
@@ -59,15 +119,6 @@ pub fn sdr_color_to_pq(
     let alpha = color.a();
     let unpremultiply = |value: f32| if alpha > 0.00001 { value / alpha } else { 0.0 };
     let decode = |value: f32| decode_sdr(value, sdr_gamma);
-    let pq = |value: f32| {
-        const M1: f32 = 0.159_301_76;
-        const M2: f32 = 78.84375;
-        const C1: f32 = 0.8359375;
-        const C2: f32 = 18.851_563;
-        const C3: f32 = 18.6875;
-        let p = value.max(0.0).powf(M1);
-        ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
-    };
 
     let r = decode(unpremultiply(color.r()));
     let g = decode(unpremultiply(color.g()));
@@ -75,11 +126,12 @@ pub fn sdr_color_to_pq(
     let stretch = gamut_stretch.clamp(0.0, 1.0);
     let mix = |converted: f32, native: f32| converted + (native - converted) * stretch;
     let scale = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
+    let eff_alpha = optical_alpha_pq(alpha, reference_white);
     Color32F::new(
-        pq(mix(0.627404 * r + 0.329282 * g + 0.043314 * b, r) * scale) * alpha,
-        pq(mix(0.069097 * r + 0.919540 * g + 0.011362 * b, g) * scale) * alpha,
-        pq(mix(0.016392 * r + 0.088013 * g + 0.895595 * b, b) * scale) * alpha,
-        alpha,
+        encode_pq(mix(0.627404 * r + 0.329282 * g + 0.043314 * b, r) * scale) * eff_alpha,
+        encode_pq(mix(0.069097 * r + 0.919540 * g + 0.011362 * b, g) * scale) * eff_alpha,
+        encode_pq(mix(0.016392 * r + 0.088013 * g + 0.895595 * b, b) * scale) * eff_alpha,
+        eff_alpha,
     )
 }
 
@@ -100,6 +152,12 @@ pub fn update_hdr_surface_uniforms(
                 .luminances
                 .map(|(_min, _max, reference)| reference.max(80) as f32)
                 .unwrap_or(203.0);
+            let max_content = desc
+                .luminances
+                .map(|(_min, max, _)| max as f32)
+                .or_else(|| desc.max_cll.map(|v| v as f32))
+                .or_else(|| desc.mastering_luminance.map(|(_, max)| max as f32))
+                .unwrap_or(1000.0);
             for uniform in uniforms.iter_mut() {
                 match uniform.name.as_ref() {
                     "hdr_reference_white" => uniform.value = UniformValue::_1f(config.reference_white),
@@ -109,6 +167,10 @@ pub fn update_hdr_surface_uniforms(
                     "hdr_input_hlg" => uniform.value = UniformValue::_1f(1.0),
                     "hdr_input_primaries" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_content_reference" => uniform.value = UniformValue::_1f(content_reference),
+                    "hdr_max_content_luminance" => uniform.value = UniformValue::_1f(max_content),
+                    "hdr_max_destination_luminance" => {
+                        uniform.value = UniformValue::_1f(config.max_luminance)
+                    }
                     _ => {}
                 }
             }
@@ -117,6 +179,12 @@ pub fn update_hdr_surface_uniforms(
                 .luminances
                 .map(|(_min, _max, reference)| reference.max(80) as f32)
                 .unwrap_or(203.0);
+            let max_content = desc
+                .luminances
+                .map(|(_min, max, _)| max as f32)
+                .or_else(|| desc.max_cll.map(|v| v as f32))
+                .or_else(|| desc.mastering_luminance.map(|(_, max)| max as f32))
+                .unwrap_or(1000.0);
             for uniform in uniforms.iter_mut() {
                 match uniform.name.as_ref() {
                     "hdr_reference_white" => uniform.value = UniformValue::_1f(config.reference_white),
@@ -126,6 +194,10 @@ pub fn update_hdr_surface_uniforms(
                     "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_input_primaries" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_content_reference" => uniform.value = UniformValue::_1f(content_reference),
+                    "hdr_max_content_luminance" => uniform.value = UniformValue::_1f(max_content),
+                    "hdr_max_destination_luminance" => {
+                        uniform.value = UniformValue::_1f(config.max_luminance)
+                    }
                     _ => {}
                 }
             }
@@ -139,6 +211,10 @@ pub fn update_hdr_surface_uniforms(
                     "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_input_primaries" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_content_reference" => uniform.value = UniformValue::_1f(203.0),
+                    "hdr_max_content_luminance" => uniform.value = UniformValue::_1f(config.max_luminance),
+                    "hdr_max_destination_luminance" => {
+                        uniform.value = UniformValue::_1f(config.max_luminance)
+                    }
                     _ => {}
                 }
             }
@@ -168,6 +244,10 @@ pub fn update_hdr_surface_uniforms(
                     "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
                     "hdr_input_primaries" => uniform.value = UniformValue::_1f(primaries_mode),
                     "hdr_content_reference" => uniform.value = UniformValue::_1f(203.0),
+                    "hdr_max_content_luminance" => uniform.value = UniformValue::_1f(config.reference_white),
+                    "hdr_max_destination_luminance" => {
+                        uniform.value = UniformValue::_1f(config.max_luminance)
+                    }
                     _ => {}
                 }
             }
@@ -183,6 +263,8 @@ pub fn update_hdr_surface_uniforms(
                 "hdr_input_hlg" => uniform.value = UniformValue::_1f(0.0),
                 "hdr_input_primaries" => uniform.value = UniformValue::_1f(0.0),
                 "hdr_content_reference" => uniform.value = UniformValue::_1f(203.0),
+                "hdr_max_content_luminance" => uniform.value = UniformValue::_1f(config.reference_white),
+                "hdr_max_destination_luminance" => uniform.value = UniformValue::_1f(config.max_luminance),
                 _ => {}
             }
         }
@@ -265,6 +347,33 @@ mod tests {
         assert!((st2084_encode(10_000.0) - 1.0).abs() < 1e-12);
     }
 
+    #[test]
+    fn optical_alpha_preserves_perceptual_luminance() {
+        let ref_white = 203.0;
+        let white_norm = ref_white / 10_000.0;
+        let pq_white = encode_pq(white_norm);
+
+        // 50% opacity
+        let alpha = 0.5;
+        let eff_alpha = optical_alpha_pq(alpha, ref_white);
+        let blended_code = pq_white * eff_alpha;
+        let luminance = decode_pq(blended_code) * 10_000.0;
+
+        // With optical alpha, 50% opacity of 203 cd/m² produces ~101.5 cd/m² (half luminance).
+        assert!(
+            (luminance - 101.5).abs() < 1.0,
+            "Expected ~101.5 nits, got {luminance}"
+        );
+
+        // Without optical alpha (linear code blending), 50% opacity produces only ~5.4 cd/m²!
+        let uncompensated_code = pq_white * alpha;
+        let uncompensated_lum = decode_pq(uncompensated_code) * 10_000.0;
+        assert!(
+            uncompensated_lum < 10.0,
+            "Uncompensated luminance={uncompensated_lum}"
+        );
+    }
+
     fn st2084_decode(code: f64) -> f64 {
         let m1 = 0.1593017578125;
         let m2 = 78.84375;
@@ -343,5 +452,27 @@ mod tests {
     fn display_p3_to_bt2020_preserves_neutral_white() {
         let white = p3_to_bt2020([1.0, 1.0, 1.0]);
         assert!(white.into_iter().all(|c| (c - 1.0).abs() < 2e-6));
+    }
+
+    #[test]
+    fn reinhard_tonemapping_scales_peak_to_target_smoothly() {
+        let ref_white = 203.0;
+        let dest_max = 600.0;
+        let content_max = 2000.0;
+
+        assert_eq!(tonemap_reinhard(0.0, ref_white, content_max, dest_max), 0.0);
+
+        let mapped_ref = tonemap_reinhard(ref_white, ref_white, content_max, dest_max);
+        assert!(mapped_ref > 100.0 && mapped_ref < ref_white);
+
+        let mapped_dest_max = tonemap_reinhard(dest_max, ref_white, content_max, dest_max);
+        assert!(mapped_dest_max < dest_max);
+
+        let mapped_peak = tonemap_reinhard(content_max, ref_white, content_max, dest_max);
+        assert!((mapped_peak - dest_max).abs() < 1e-4);
+
+        // Within range without excess peak -> identity/clamp
+        let no_excess = tonemap_reinhard(500.0, ref_white, 600.0, 600.0);
+        assert_eq!(no_excess, 500.0);
     }
 }

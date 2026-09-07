@@ -93,6 +93,72 @@ vec3 sdr_to_pq(vec3 rgb) {
 uniform float hdr_input_pq;          // 1.0 = buffer holds PQ code values
 uniform float hdr_input_hlg;         // 1.0 = buffer holds HLG code values (BT.2100)
 uniform float hdr_content_reference; // content reference white in cd/m²
+uniform float hdr_max_content_luminance;
+uniform float hdr_max_destination_luminance;
+
+// ITU-R BT.2100 / SMPTE RP 2092 ICtCp color space matrices.
+// Column-major in GLSL.
+const mat3 to_ictcp = mat3(
+    0.5,  1.613769531250,   4.378173828125,
+    0.5, -3.323486328125, -4.245605468750,
+    0.0,  1.709716796875, -0.132568359375
+);
+
+const mat3 from_ictcp = mat3(
+    1.0,               1.0,               1.0,
+    0.00860903703793, -0.00860903703793,  0.56003133571068,
+    0.11102962500303, -0.11102962500303, -0.32062717498732
+);
+
+// BT.2020 linear RGB to Dolby LMS (for ICtCp).
+const mat3 bt2020_to_lms = mat3(
+    0.412109375, 0.166748046875, 0.024169921875,
+    0.52392578125, 0.720458984375, 0.075439453125,
+    0.06396484375, 0.11279296875, 0.900390625
+);
+
+const mat3 lms_to_bt2020 = mat3(
+    3.43660669, -0.79132956, -0.02594990,
+    -2.50645212, 1.98360045, -0.09891371,
+    0.06984542, -0.19227090, 1.12486361
+);
+
+// Performs Reinhard tonemapping on the Intensity channel in ICtCp space,
+// preserving hue and saturation (following KWin's color management pipeline).
+vec3 tonemap_ictcp(vec3 linear_rgb) {
+    if (hdr_max_content_luminance <= hdr_max_destination_luminance * 1.01) {
+        return clamp(linear_rgb, vec3(0.0), vec3(hdr_max_destination_luminance / 10000.0));
+    }
+
+    vec3 lms = bt2020_to_lms * linear_rgb;
+    vec3 lms_pq = vec3(
+        encode_pq(lms.r),
+        encode_pq(lms.g),
+        encode_pq(lms.b)
+    );
+    vec3 ictcp = to_ictcp * lms_pq;
+
+    // Luminance in nits
+    float lum = pq_to_linear(ictcp.r) * 10000.0;
+
+    // Modified Reinhard roll-off
+    float rel_lum = max(lum / hdr_reference_white, 0.0);
+    float in_range = hdr_max_content_luminance / hdr_reference_white;
+    float out_range = hdr_max_destination_luminance / hdr_reference_white;
+    float v = (out_range * (1.0 + in_range) - in_range) / (in_range * in_range);
+    rel_lum = rel_lum * (1.0 + rel_lum * v) / (1.0 + rel_lum);
+    lum = rel_lum * hdr_reference_white;
+
+    ictcp.r = encode_pq(lum / 10000.0);
+    vec3 mapped_lms_pq = from_ictcp * ictcp;
+    vec3 mapped_lms = vec3(
+        pq_to_linear(mapped_lms_pq.r),
+        pq_to_linear(mapped_lms_pq.g),
+        pq_to_linear(mapped_lms_pq.b)
+    );
+    vec3 mapped_rgb = lms_to_bt2020 * mapped_lms;
+    return clamp(mapped_rgb, vec3(0.0), vec3(hdr_max_destination_luminance / 10000.0));
+}
 
 // ST 2084 EOTF: PQ code value to luminance in the normalized 10000 cd/m^2 domain.
 float pq_to_linear(float code) {
@@ -108,15 +174,13 @@ float pq_to_linear(float code) {
 vec3 pq_rescale(vec3 code) {
     float ref_scale = clamp(hdr_reference_white, 80.0, 10000.0)
         / max(hdr_content_reference, 80.0);
-    if (abs(ref_scale - 1.0) < 0.001) {
-        return code;
-    }
     vec3 linear_rgb = vec3(
         pq_to_linear(code.r),
         pq_to_linear(code.g),
         pq_to_linear(code.b)
     );
     linear_rgb *= ref_scale;
+    linear_rgb = tonemap_ictcp(linear_rgb);
     return vec3(
         encode_pq(linear_rgb.r),
         encode_pq(linear_rgb.g),
@@ -149,11 +213,22 @@ vec3 hlg_to_pq(vec3 hlg) {
     float ref_scale = clamp(hdr_reference_white, 80.0, 10000.0)
         / max(hdr_content_reference, 80.0);
     vec3 display = scene * (gain * ref_scale);
+    display = tonemap_ictcp(display);
     return vec3(
         encode_pq(display.r),
         encode_pq(display.g),
         encode_pq(display.b)
     );
+}
+
+// Computes optical alpha in PQ space to prevent dark rims on semi-transparent edges.
+float optical_alpha_pq(float a) {
+    if (a <= 0.0) return 0.0;
+    if (a >= 1.0) return 1.0;
+    float white_norm = clamp(hdr_reference_white, 80.0, 10000.0) / 10000.0;
+    float pq_white = encode_pq(white_norm);
+    float pq_lum = encode_pq(white_norm * a);
+    return clamp(pq_lum / max(pq_white, 0.001), 0.0, 1.0);
 }
 
 varying vec2 v_coords;
@@ -176,8 +251,11 @@ void main() {
     } else {
         rgb = sdr_to_pq(rgb);
     }
-    color.rgb = rgb * color.a;
-    color *= alpha;
+
+    float total_alpha = clamp(color.a * alpha, 0.0, 1.0);
+    float eff_alpha = optical_alpha_pq(total_alpha);
+    color.rgb = rgb * eff_alpha;
+    color.a = eff_alpha;
 
 #if defined(DEBUG_FLAGS)
     if (tint == 1.0)
