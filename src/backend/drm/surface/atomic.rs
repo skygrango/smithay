@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::backend::drm::color::{self, Colorspace, ConnectorColorState};
+use crate::backend::drm::color::{self, Colorspace, ConnectorColorState, CrtcColorState};
 use crate::backend::drm::error::AccessError;
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
@@ -65,6 +65,24 @@ impl Default for ResolvedColorState {
     }
 }
 
+/// Resolved CRTC hardware color pipeline blobs, created when [`CrtcColorState`] is staged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrtcColorBlobs {
+    /// `GAMMA_LUT` blob handle (`Blob(0)` = disabled).
+    pub gamma_blob: property::Value<'static>,
+    /// `CTM` blob handle (`Blob(0)` = disabled).
+    pub ctm_blob: property::Value<'static>,
+}
+
+impl Default for CrtcColorBlobs {
+    fn default() -> Self {
+        CrtcColorBlobs {
+            gamma_blob: property::Value::Blob(0),
+            ctm_blob: property::Value::Blob(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub active: bool,
@@ -74,18 +92,24 @@ pub struct State {
     pub connectors: HashSet<connector::Handle>,
     pub color_state: ConnectorColorState,
     pub resolved_color: ResolvedColorState,
+    /// Staged CRTC hardware color pipeline configuration (GAMMA_LUT, CTM).
+    pub crtc_color_state: CrtcColorState,
+    /// Resolved blobs for the staged CRTC color pipeline.
+    pub crtc_color_blobs: CrtcColorBlobs,
 }
 
 impl PartialEq for State {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // `resolved_color` is derived from `color_state` (and owns the metadata blob), so like
-        // the mode blob it is excluded from the comparison.
+        // `resolved_color` and `crtc_color_blobs` are derived from their respective logical
+        // states (and own the metadata blobs), so like the mode blob they are excluded from
+        // the comparison.
         self.active == other.active
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
             && self.color_state == other.color_state
+            && self.crtc_color_state == other.crtc_color_state
     }
 }
 
@@ -244,6 +268,9 @@ impl State {
             // We don't own the current metadata blob (if any), so don't reference it here;
             // requests are only ever built from the pending state anyway.
             resolved_color: ResolvedColorState::default(),
+            // CRTC hardware color pipeline: start in passthrough (no LUT/CTM).
+            crtc_color_state: CrtcColorState::default(),
+            crtc_color_blobs: CrtcColorBlobs::default(),
         })
     }
 
@@ -255,6 +282,8 @@ impl State {
         self.vrr = false;
         self.color_state = ConnectorColorState::default();
         self.resolved_color = ResolvedColorState::default();
+        self.crtc_color_state = CrtcColorState::default();
+        self.crtc_color_blobs = CrtcColorBlobs::default();
     }
 }
 
@@ -407,6 +436,8 @@ impl AtomicDrmSurface {
             connectors: connectors.iter().copied().collect(),
             color_state,
             resolved_color,
+            crtc_color_state: CrtcColorState::default(),
+            crtc_color_blobs: CrtcColorBlobs::default(),
         };
 
         drop(_guard);
@@ -579,6 +610,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 Some(&resolved_color),
+                Some(&pending.crtc_color_blobs),
                 &connectors,
                 [],
                 [&plane_state],
@@ -640,6 +672,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             Some(&pending.resolved_color),
+            Some(&pending.crtc_color_blobs),
             &connectors,
             [&conn],
             [&plane_state],
@@ -708,6 +741,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             Some(&resolved_color),
+            Some(&pending.crtc_color_blobs),
             &conns,
             removed,
             [&plane_state],
@@ -764,6 +798,7 @@ impl AtomicDrmSurface {
             Some(new_blob),
             pending.vrr,
             Some(&pending.resolved_color),
+            Some(&pending.crtc_color_blobs),
             pending.connectors.iter(),
             [],
             [&plane_state],
@@ -936,6 +971,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             value,
             Some(&pending.resolved_color),
+            Some(&pending.crtc_color_blobs),
             &pending.connectors,
             &[],
             [&plane_config],
@@ -1144,6 +1180,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 Some(&resolved),
+                Some(&pending.crtc_color_blobs),
                 &pending.connectors,
                 &[],
                 [&plane_config],
@@ -1171,6 +1208,146 @@ impl AtomicDrmSurface {
 
         pending.color_state = color_state;
         pending.resolved_color = resolved;
+        Ok(())
+    }
+
+    /// Stages a new [`CrtcColorState`] (hardware GAMMA_LUT and CTM) to be applied on the
+    /// next [`commit`](Self::commit).
+    ///
+    /// Creates DRM property blobs from the provided LUT and CTM data, validates them with a
+    /// `TEST_ONLY` atomic commit, and stages the result. DEGAMMA_LUT is intentionally not
+    /// exposed; it is buggy on most drivers (Intel, AMD, NVidia) in the post-blend pipeline
+    /// and is deliberately excluded from HDR rendering (matching KWin's `drm_crtc.cpp`).
+    ///
+    /// Returns [`Error::TestFailed`] if the driver rejects the requested pipeline,
+    /// [`Error::UnknownProperty`] if the CRTC has no `GAMMA_LUT`/`CTM` property and a
+    /// non-`None` value is requested for it.
+    pub fn use_crtc_color_state(&self, crtc_color_state: CrtcColorState) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let current = self.state.read().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if pending.crtc_color_state == crtc_color_state {
+            return Ok(());
+        }
+
+        let destroy_blob = |blob: property::Value<'static>| {
+            if let property::Value::Blob(id) = blob {
+                if id != 0 {
+                    if let Err(err) = self.fd.destroy_property_blob(id) {
+                        warn!("Failed to destroy CRTC color pipeline blob: {}", err);
+                    }
+                }
+            }
+        };
+
+        let prop_mapping = self.prop_mapping.read().unwrap();
+
+        // Create GAMMA_LUT blob if requested.
+        let gamma_blob = match &crtc_color_state.gamma_lut {
+            Some(lut) => {
+                if prop_mapping.crtc_prop_handle(self.crtc, "GAMMA_LUT").is_err() {
+                    return Err(Error::UnknownProperty {
+                        handle: self.crtc.into(),
+                        name: "GAMMA_LUT",
+                    });
+                }
+                self.fd.create_property_blob(lut).map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Failed to create GAMMA_LUT property blob",
+                        dev: self.fd.dev_path(),
+                        source,
+                    })
+                })?
+            }
+            None => property::Value::Blob(0),
+        };
+
+        // Create CTM blob if requested.
+        let ctm_blob = match &crtc_color_state.ctm {
+            Some(ctm) => {
+                if prop_mapping.crtc_prop_handle(self.crtc, "CTM").is_err() {
+                    destroy_blob(gamma_blob);
+                    return Err(Error::UnknownProperty {
+                        handle: self.crtc.into(),
+                        name: "CTM",
+                    });
+                }
+                match self.fd.create_property_blob(ctm) {
+                    Ok(blob) => blob,
+                    Err(source) => {
+                        destroy_blob(gamma_blob);
+                        return Err(Error::Access(AccessError {
+                            errmsg: "Failed to create CTM property blob",
+                            dev: self.fd.dev_path(),
+                            source,
+                        }));
+                    }
+                }
+            }
+            None => property::Value::Blob(0),
+        };
+
+        let new_blobs = CrtcColorBlobs { gamma_blob, ctm_blob };
+
+        // TEST_ONLY validate the new pipeline.
+        let res = (|| {
+            let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+            let plane_config = PlaneState {
+                handle: self.plane,
+                config: Some(PlaneConfig {
+                    src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                    dst: Rectangle::from_size(
+                        (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                    ),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    damage_clips: None,
+                    fb: test_buffer.fb,
+                    fence: None,
+                }),
+            };
+
+            let req = AtomicRequest::build_request(
+                &prop_mapping,
+                self.crtc,
+                Some(pending.blob),
+                pending.vrr,
+                Some(&pending.resolved_color),
+                Some(&new_blobs),
+                &pending.connectors,
+                &[],
+                [&plane_config],
+            )?;
+
+            self.fd
+                .atomic_commit(
+                    AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                    req.build()?,
+                )
+                .map_err(|_| Error::TestFailed(self.crtc))
+        })();
+
+        if let Err(err) = res {
+            destroy_blob(new_blobs.gamma_blob);
+            destroy_blob(new_blobs.ctm_blob);
+            return Err(err);
+        }
+
+        // Destroy previously staged blobs that were never committed.
+        let old_gamma = std::mem::replace(&mut pending.crtc_color_blobs.gamma_blob, property::Value::Blob(0));
+        if old_gamma != current.crtc_color_blobs.gamma_blob {
+            destroy_blob(old_gamma);
+        }
+        let old_ctm = std::mem::replace(&mut pending.crtc_color_blobs.ctm_blob, property::Value::Blob(0));
+        if old_ctm != current.crtc_color_blobs.ctm_blob {
+            destroy_blob(old_ctm);
+        }
+
+        pending.crtc_color_state = crtc_color_state;
+        pending.crtc_color_blobs = new_blobs;
         Ok(())
     }
 
@@ -1217,6 +1394,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             Some(&pending.resolved_color),
+            Some(&pending.crtc_color_blobs),
             &pending_conns,
             removed,
             &*planes,
@@ -1307,6 +1485,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 Some(&pending.resolved_color),
+                Some(&pending.crtc_color_blobs),
                 &pending_conns,
                 removed,
                 &*planes,
@@ -1335,6 +1514,22 @@ impl AtomicDrmSurface {
                             }
                         }
                     }
+                }
+                // Destroy old CRTC color pipeline blobs now that the commit will replace them.
+                let destroy_crtc_blob = |blob: property::Value<'static>| {
+                    if let property::Value::Blob(id) = blob {
+                        if id != 0 {
+                            if let Err(err) = self.fd.destroy_property_blob(id) {
+                                warn!("Failed to destroy old CRTC color pipeline blob: {}", err);
+                            }
+                        }
+                    }
+                };
+                if current.crtc_color_blobs.gamma_blob != pending.crtc_color_blobs.gamma_blob {
+                    destroy_crtc_blob(current.crtc_color_blobs.gamma_blob);
+                }
+                if current.crtc_color_blobs.ctm_blob != pending.crtc_color_blobs.ctm_blob {
+                    destroy_crtc_blob(current.crtc_color_blobs.ctm_blob);
                 }
 
                 // new config
@@ -1402,14 +1597,16 @@ impl AtomicDrmSurface {
 
         // page flips work just like commits with fewer parameters..
         let prop_mapping = self.prop_mapping.read().unwrap();
-        // Connector color properties are deliberately omitted (`None`): the kernel latches
-        // them from the last commit, and re-emitting connector state on every flip makes the
-        // kernel re-run its modeset checks and can cause sinks to renegotiate infoframes.
+        // Connector color properties and CRTC color pipeline blobs are deliberately omitted
+        // (`None`): the kernel latches them from the last full commit, and re-emitting them on
+        // every flip would make the kernel re-run its modeset checks and potentially cause
+        // sinks to renegotiate infoframes.
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
             self.state.read().unwrap().vrr,
+            None,
             None,
             [],
             [],
@@ -1764,6 +1961,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         mode: Option<property::Value<'static>>,
         vrr: bool,
+        crtc_color_blobs: Option<&CrtcColorBlobs>,
     ) -> Result<(), Error> {
         let crtc_props = self.crtc_props.entry(crtc).or_default();
 
@@ -1778,6 +1976,16 @@ impl<'a> AtomicRequest<'a> {
                 handle: crtc.into(),
                 name: "VRR_ENABLED",
             });
+        }
+
+        // Insert CRTC hardware color pipeline blobs for debug visualization.
+        if let Some(blobs) = crtc_color_blobs {
+            if self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT").is_ok() {
+                crtc_props.insert("GAMMA_LUT", blobs.gamma_blob);
+            }
+            if self.mapping.crtc_prop_handle(crtc, "CTM").is_ok() {
+                crtc_props.insert("CTM", blobs.ctm_blob);
+            }
         }
 
         Ok(())
@@ -1998,6 +2206,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         mode: Option<property::Value<'static>>,
         vrr: bool,
+        crtc_color_blobs: Option<&CrtcColorBlobs>,
     ) -> Result<(), Error> {
         if let Some(blob) = mode {
             self.request
@@ -2018,6 +2227,18 @@ impl<'a> AtomicRequest<'a> {
                 handle: crtc.into(),
                 name: "VRR_ENABLED",
             });
+        }
+
+        // Apply CRTC hardware color pipeline blobs (GAMMA_LUT, CTM).
+        // Only set properties that the CRTC actually has; silently skip missing ones so
+        // that clearing (Blob(0)) on unsupported hardware doesn't fail the commit.
+        if let Some(blobs) = crtc_color_blobs {
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT") {
+                self.request.add_property(crtc, prop, blobs.gamma_blob);
+            }
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "CTM") {
+                self.request.add_property(crtc, prop, blobs.ctm_blob);
+            }
         }
 
         Ok(())
@@ -2253,6 +2474,7 @@ impl<'a> AtomicRequest<'a> {
         blob: Option<property::Value<'static>>,
         vrr: bool,
         color: Option<&ResolvedColorState>,
+        crtc_color_blobs: Option<&CrtcColorBlobs>,
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
@@ -2276,8 +2498,8 @@ impl<'a> AtomicRequest<'a> {
             req.reset_connector(*conn)?;
         }
 
-        // Set the crtc properties (active, mode_id, vrr_enabled).
-        req.set_crtc(crtc, blob, vrr)?;
+        // Set the crtc properties (active, mode_id, vrr_enabled, and hardware color pipeline).
+        req.set_crtc(crtc, blob, vrr, crtc_color_blobs)?;
 
         for plane_state in planes.into_iter() {
             req.set_plane(crtc, plane_state)?;
