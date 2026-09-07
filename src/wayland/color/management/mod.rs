@@ -587,10 +587,10 @@ pub struct ColorManagementState {
     /// identity a subsequent `get_preferred` delivers via `ready`. The table grows
     /// monotonically with distinct descriptions, which is bounded in practice (clients create
     /// the same few descriptions).
-    identities: Vec<ImageDescription>,
+    identities: Mutex<Vec<ImageDescription>>,
     /// Live `wp_color_management_output_v1` objects per output, for
     /// [`output_description_changed`](Self::output_description_changed).
-    output_objects: Vec<WpColorManagementOutputV1>,
+    output_objects: Mutex<Vec<WpColorManagementOutputV1>>,
 }
 
 impl ColorManagementState {
@@ -647,19 +647,20 @@ impl ColorManagementState {
             supported_primaries: supported_primaries.into_iter().collect(),
             supported_features,
             supported_intents,
-            identities: Vec::new(),
-            output_objects: Vec::new(),
+            identities: Mutex::new(Vec::new()),
+            output_objects: Mutex::new(Vec::new()),
         }
     }
 
     /// Returns the stable identity for a description, assigning a new one if it is not known
     /// yet.
-    fn identity_for(&mut self, desc: ImageDescription) -> u32 {
-        let index = match self.identities.iter().position(|d| *d == desc) {
+    fn identity_for(&self, desc: ImageDescription) -> u32 {
+        let mut identities = self.identities.lock().unwrap();
+        let index = match identities.iter().position(|d| *d == desc) {
             Some(index) => index,
             None => {
-                self.identities.push(desc);
-                self.identities.len() - 1
+                identities.push(desc);
+                identities.len() - 1
             }
         };
         index as u32 + 1
@@ -673,7 +674,7 @@ impl ColorManagementState {
     /// routes through
     /// [`ColorManagementHandler::preferred_description_for_surface`] — that must already
     /// return the new description when this is called.
-    pub fn preferred_changed(&mut self, surface: &WlSurface, desc: ImageDescription) {
+    pub fn preferred_changed(&self, surface: &WlSurface, desc: ImageDescription) {
         let identity = self.identity_for(desc);
         compositor::with_states(surface, |states| {
             let Some(data) = states.data_map.get::<ColorManagementSurfaceData>() else {
@@ -703,9 +704,10 @@ impl ColorManagementState {
     /// Clients react by calling `get_image_description`, which routes through
     /// [`ColorManagementHandler::description_for_output`] — that must already return the new
     /// description when this is called.
-    pub fn output_description_changed(&mut self, output: &Output) {
-        self.output_objects.retain(|obj| obj.is_alive());
-        for obj in &self.output_objects {
+    pub fn output_description_changed(&self, output: &Output) {
+        let mut output_objects = self.output_objects.lock().unwrap();
+        output_objects.retain(|obj| obj.is_alive());
+        for obj in output_objects.iter() {
             let same_output = obj
                 .data::<WlOutput>()
                 .and_then(Output::from_resource)
@@ -786,7 +788,12 @@ where
         match request {
             Request::GetOutput { id, output } => {
                 let obj = data_init.init(id, output);
-                state.color_management_state().output_objects.push(obj);
+                state
+                    .color_management_state()
+                    .output_objects
+                    .lock()
+                    .unwrap()
+                    .push(obj);
             }
             Request::GetSurface { id, surface } => {
                 let already_attached = compositor::with_states(&surface, |states| {
@@ -1452,13 +1459,13 @@ mod tests {
 
     #[test]
     fn identities_are_stable_per_description() {
-        let mut state = ColorManagementState {
+        let state = ColorManagementState {
             supported_tfs: Vec::new(),
             supported_primaries: Vec::new(),
             supported_features: Vec::new(),
             supported_intents: Vec::new(),
-            identities: Vec::new(),
-            output_objects: Vec::new(),
+            identities: Mutex::new(Vec::new()),
+            output_objects: Mutex::new(Vec::new()),
         };
 
         let srgb = ImageDescription::SRGB;
@@ -1570,13 +1577,13 @@ mod tests {
 
         // Distinct from a parametric PQ/BT.2020 twin, so the tone-mapping exemption survives
         // identity-based deduplication.
-        let mut state = ColorManagementState {
+        let state = ColorManagementState {
             supported_tfs: Vec::new(),
             supported_primaries: Vec::new(),
             supported_features: Vec::new(),
             supported_intents: Vec::new(),
-            identities: Vec::new(),
-            output_objects: Vec::new(),
+            identities: Mutex::new(Vec::new()),
+            output_objects: Mutex::new(Vec::new()),
         };
         let twin = ImageDescription {
             windows_bt2100: false,
@@ -1662,13 +1669,13 @@ mod tests {
         // A description built from set_primaries with sRGB's coordinates is a different
         // record than one built from set_primaries_named(srgb), even though the resolved
         // chromaticities match: primaries_named must only be sent for the latter.
-        let mut state = ColorManagementState {
+        let state = ColorManagementState {
             supported_tfs: Vec::new(),
             supported_primaries: Vec::new(),
             supported_features: Vec::new(),
             supported_intents: Vec::new(),
-            identities: Vec::new(),
-            output_objects: Vec::new(),
+            identities: Mutex::new(Vec::new()),
+            output_objects: Mutex::new(Vec::new()),
         };
         let named_desc = ImageDescription::SRGB;
         let raw_desc = ImageDescription {
