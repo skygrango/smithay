@@ -128,6 +128,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
+    ops::RangeInclusive,
     os::unix::io::{AsFd, OwnedFd},
     str::FromStr,
     sync::Arc,
@@ -176,6 +177,7 @@ use crate::{
 
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+    color::{Colorspace, ConnectorColorState, CrtcColorState},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -1697,6 +1699,14 @@ where
     {
         let mut clear_color = clear_color.into();
 
+        trace!(
+            elems_len = elements.len(),
+            ?frame_flags,
+            reset_pending = self.reset_pending,
+            commit_pending = self.surface.commit_pending(),
+            "DrmCompositor::render_frame entry"
+        );
+
         if !self.surface.is_active() {
             return Err(RenderFrameErrorType::<A, F, R>::PrepareFrame(
                 FrameError::DrmError(DrmError::DeviceInactive),
@@ -2061,6 +2071,14 @@ where
             }
         }
 
+        trace!(
+            primary_scanout = primary_plane_scanout_element.is_some(),
+            primary_render_len = primary_plane_elements.len(),
+            overlay_len = overlay_plane_elements.len(),
+            cursor_scanout = cursor_plane_element.is_some(),
+            "DrmCompositor::render_frame plane assignment"
+        );
+
         // Cleanup old state (e.g. old dmabuffers)
         for element_state in element_states.values_mut() {
             element_state.fb_cache.cleanup();
@@ -2080,17 +2098,15 @@ where
         // If not do a single atomic commit test and when that fails render everything that failed
         // the test on the primary plane. This will also automatically correct any mistake we made
         // during plane assignment and start the full test cycle on the next frame.
-        if next_frame_state
-            .test_state_complete(
-                previous_state,
-                &self.surface,
-                self.supports_fencing,
-                false,
-                allow_partial_update,
-            )
-            .is_err()
-        {
-            trace!("atomic test failed for frame, resetting frame");
+        let test_res = next_frame_state.test_state_complete(
+            previous_state,
+            &self.surface,
+            self.supports_fencing,
+            false,
+            allow_partial_update,
+        );
+        if let Err(ref test_err) = test_res {
+            warn!(?test_err, "atomic test failed for frame, resetting frame");
 
             let mut removed_overlay_elements: Vec<(usize, &E)> = Vec::with_capacity(
                 next_frame_state
@@ -2244,6 +2260,14 @@ where
             let render_res =
                 self.damage_tracker
                     .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
+
+            trace!(
+                age,
+                elements_len = elements.len(),
+                render_ok = render_res.is_ok(),
+                render_damage = ?render_res.as_ref().ok().and_then(|r| r.damage.as_ref()),
+                "DrmCompositor damage_tracker render_output result"
+            );
 
             // restore the renderer debug flags
             renderer.set_debug_flags(renderer_debug_flags);
@@ -2444,6 +2468,11 @@ where
         }
 
         let prepared_frame = self.next_frame.take().ok_or(FrameErrorType::<A, F>::EmptyFrame)?;
+        trace!(
+            is_empty = prepared_frame.is_empty(),
+            kind = ?prepared_frame.kind,
+            "DrmCompositor::queue_frame"
+        );
         if prepared_frame.is_empty() {
             return Err(FrameErrorType::<A, F>::EmptyFrame);
         }
@@ -2545,6 +2574,26 @@ where
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
+        trace!(
+            commit_pending = self.surface.commit_pending(),
+            supports_fencing = self.supports_fencing,
+            allow_partial_update,
+            planes_count = prepared_frame.frame.planes.len(),
+            "DrmCompositor::submit starting page_flip/commit"
+        );
+        for (plane_handle, plane_state) in prepared_frame.frame.planes.iter() {
+            trace!(
+                ?plane_handle,
+                skip = plane_state.skip,
+                has_config = plane_state.config.is_some(),
+                has_fence = plane_state
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.sync.as_ref())
+                    .is_some(),
+                "  plane in frame"
+            );
+        }
         let flip = if self.surface.commit_pending() {
             prepared_frame
                 .frame
@@ -2554,6 +2603,7 @@ where
                 .frame
                 .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
         };
+        trace!(?flip, "DrmCompositor::submit flip completed");
 
         let res = self.handle_flip(&prepared_frame, flip);
 
@@ -2743,6 +2793,106 @@ where
     /// used without a modeset on the attached connectors.
     pub fn use_vrr(&mut self, vrr: bool) -> FrameResult<(), A, F> {
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the colorspaces supported by the given connector's `Colorspace` property.
+    ///
+    /// See [`DrmSurface::supported_colorspaces`] for more details.
+    pub fn supported_colorspaces(&self, conn: connector::Handle) -> FrameResult<Vec<Colorspace>, A, F> {
+        self.surface
+            .supported_colorspaces(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the given connector supports the `HDR_OUTPUT_METADATA` property.
+    ///
+    /// See [`DrmSurface::hdr_metadata_supported`] for more details.
+    pub fn hdr_metadata_supported(&self, conn: connector::Handle) -> FrameResult<bool, A, F> {
+        self.surface
+            .hdr_metadata_supported(conn)
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns the valid range of the given connector's `max bpc` property, if any.
+    ///
+    /// See [`DrmSurface::max_bpc_range`] for more details.
+    pub fn max_bpc_range(&self, conn: connector::Handle) -> FrameResult<Option<RangeInclusive<u32>>, A, F> {
+        self.surface.max_bpc_range(conn).map_err(FrameError::DrmError)
+    }
+
+    /// Returns the [`ConnectorColorState`] to be used after the next commit.
+    pub fn pending_color_state(&self) -> ConnectorColorState {
+        self.surface.pending_color_state()
+    }
+
+    /// Returns the currently active [`ConnectorColorState`].
+    pub fn current_color_state(&self) -> ConnectorColorState {
+        self.surface.current_color_state()
+    }
+
+    /// Stages a new [`ConnectorColorState`] (colorspace, HDR metadata, max bpc) to be applied
+    /// with the next queued frame.
+    ///
+    /// A changed color state upgrades the next frame submission to a full atomic modeset
+    /// commit, so the connector color properties are applied in a *single* atomic commit
+    /// together with the mode, CRTC and plane state.
+    ///
+    /// See [`DrmSurface::use_color_state`] for more details.
+    pub fn use_color_state(&mut self, state: ConnectorColorState) -> FrameResult<(), A, F> {
+        let changed = self.surface.pending_color_state() != state;
+        self.surface
+            .use_color_state(state)
+            .map_err(FrameError::DrmError)?;
+        if changed {
+            self.damage_tracker = OutputDamageTracker::from_mode_source(self.output_mode_source.clone());
+        }
+        Ok(())
+    }
+
+    /// Stages a new [`CrtcColorState`] (hardware GAMMA_LUT and CTM) to be applied on the
+    /// next frame submission.
+    ///
+    /// See [`DrmSurface::use_crtc_color_state`] for more details.
+    pub fn use_crtc_color_state(&mut self, state: CrtcColorState) -> FrameResult<(), A, F> {
+        let changed = self.surface.pending_crtc_color_state() != state;
+        self.surface
+            .use_crtc_color_state(state)
+            .map_err(FrameError::DrmError)?;
+        if changed {
+            self.damage_tracker = OutputDamageTracker::from_mode_source(self.output_mode_source.clone());
+        }
+        Ok(())
+    }
+
+    /// Queries the size of the CRTC's hardware `GAMMA_LUT` if supported.
+    pub fn crtc_gamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_gamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether the CRTC supports hardware color transformation matrix (`CTM`).
+    pub fn crtc_has_ctm(&self) -> bool {
+        self.surface.crtc_has_ctm()
+    }
+
+    /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
+    pub fn crtc_degamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
+        self.surface.crtc_degamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is staged for the next commit.
+    pub fn pending_hdr_hardware_offload(&self) -> bool {
+        self.surface.pending_hdr_hardware_offload()
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is currently active on the CRTC.
+    pub fn current_hdr_hardware_offload(&self) -> bool {
+        self.surface.current_hdr_hardware_offload()
+    }
+
+    /// Returns whether HDR hardware CRTC offloading is staged for the next commit.
+    #[inline]
+    pub fn hdr_hardware_offload(&self) -> bool {
+        self.surface.hdr_hardware_offload()
     }
 
     /// Set the [`DebugFlags`] to use

@@ -7,8 +7,8 @@ use drm::node::DrmNode;
 
 use super::device::WeakDevice;
 use crate::backend::{
-    allocator::{dmabuf::Dmabuf, format::has_alpha, Buffer, Format, Fourcc, Modifier},
-    vulkan::{format::component_mapping_for_format, Device},
+    allocator::{Buffer, Format, Fourcc, Modifier, dmabuf::Dmabuf, format::has_alpha},
+    vulkan::{Device, format::component_mapping_for_format},
 };
 
 /// Vulkan image object.
@@ -84,9 +84,32 @@ impl VulkanImage {
             width,
             height,
             format,
+            None,
             usage,
             linear,
-            Option::<(_, Option<Modifier>)>::None,
+            Option::<Option<Modifier>>::None,
+            None,
+        )
+    }
+
+    pub fn new_with_fourcc(
+        device: &Device,
+        width: u32,
+        height: u32,
+        format: Fourcc,
+        usage: vk::ImageUsageFlags,
+        linear: bool,
+    ) -> Result<Self, Error> {
+        let vk_format = super::format::get_vk_format(format).ok_or(Error::UnsupportedFormat)?;
+        Self::new_internal(
+            device,
+            width,
+            height,
+            vk_format,
+            Some(format),
+            usage,
+            linear,
+            Option::<Option<Modifier>>::None,
             None,
         )
     }
@@ -105,9 +128,10 @@ impl VulkanImage {
             width,
             height,
             vk_format,
+            Some(format),
             usage,
             false,
-            Some((format, modifiers)),
+            Some(modifiers),
             None,
         )
     }
@@ -140,9 +164,10 @@ impl VulkanImage {
             width,
             height,
             vk_format,
+            Some(dmabuf.format().code),
             usage,
             false,
-            Option::<(_, Option<Modifier>)>::None,
+            Option::<Option<Modifier>>::None,
             Some(dmabuf),
         )
     }
@@ -152,28 +177,28 @@ impl VulkanImage {
         width: u32,
         height: u32,
         vk_format: vk::Format,
+        fourcc: Option<Fourcc>,
         vk_usage: vk::ImageUsageFlags,
         linear: bool,
-        modifiers: Option<(Fourcc, impl IntoIterator<Item = Modifier>)>,
+        modifiers: Option<impl IntoIterator<Item = Modifier>>,
         dmabuf: Option<&Dmabuf>,
     ) -> Result<Self, Error> {
-        let (fourcc, modifiers) = modifiers
-            .map(|(fourcc, modifiers)| (fourcc, modifiers.into_iter().map(u64::from).collect::<Vec<_>>()))
-            .unzip();
+        let modifiers = modifiers.map(|modifiers| modifiers.into_iter().map(u64::from).collect::<Vec<_>>());
+        let fourcc = dmabuf.map(|d| d.format().code).or(fourcc);
         let has_alpha = fourcc.is_none_or(|fourcc| has_alpha(fourcc));
         let mut modifier_list = modifiers.as_deref().map(|modifiers| {
             vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(modifiers)
         });
-        let tiling = modifiers
-            .as_deref()
-            .map(|_| vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .unwrap_or_else(|| {
-                if linear {
-                    vk::ImageTiling::LINEAR
-                } else {
-                    vk::ImageTiling::OPTIMAL
-                }
-            });
+        let has_explicit_modifier = dmabuf
+            .map(|dmabuf| dmabuf.format().modifier != Modifier::Invalid)
+            .unwrap_or(false);
+        let tiling = if modifiers.is_some() || has_explicit_modifier {
+            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+        } else if linear {
+            vk::ImageTiling::LINEAR
+        } else {
+            vk::ImageTiling::OPTIMAL
+        };
 
         let mut image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -202,21 +227,23 @@ impl VulkanImage {
         }
 
         if let Some(dmabuf) = dmabuf {
-            plane_layouts = dmabuf
-                .offsets()
-                .zip(dmabuf.strides())
-                .map(|(offset, stride)| {
-                    vk::SubresourceLayout::default()
-                        .offset(offset as u64)
-                        .row_pitch(stride as u64)
-                })
-                .collect::<Vec<_>>();
+            if has_explicit_modifier {
+                plane_layouts = dmabuf
+                    .offsets()
+                    .zip(dmabuf.strides())
+                    .map(|(offset, stride)| {
+                        vk::SubresourceLayout::default()
+                            .offset(offset as u64)
+                            .row_pitch(stride as u64)
+                    })
+                    .collect::<Vec<_>>();
 
-            modifier_image_create_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(dmabuf.format().modifier.into())
-                .plane_layouts(&plane_layouts);
+                modifier_image_create_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                    .drm_format_modifier(dmabuf.format().modifier.into())
+                    .plane_layouts(&plane_layouts);
 
-            image_create_info = image_create_info.push_next(&mut modifier_image_create_info);
+                image_create_info = image_create_info.push_next(&mut modifier_image_create_info);
+            }
         };
 
         if modifiers.is_some() || dmabuf.is_some() {
@@ -236,13 +263,15 @@ impl VulkanImage {
             memory: vk::DeviceMemory::null(),
             device: device.downgrade(),
             view: None,
+            current_layout: std::sync::atomic::AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            needs_acquire: std::sync::atomic::AtomicBool::new(true),
             dmabuf_exportable: modifiers.is_some() || dmabuf.is_some(),
             dmabuf_plane_count: dmabuf.map(|dmabuf| dmabuf.num_planes() as u32).unwrap_or(0),
         };
 
         let drm_format = fourcc
             .map(|fourcc| {
-                let format = {
+                if tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT {
                     let mut image_modifier_properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
 
                     unsafe {
@@ -256,22 +285,31 @@ impl VulkanImage {
                             .map_err(Error::VulkanModifierQuery)?
                     };
 
-                    Format {
+                    let format = Format {
                         code: fourcc,
                         modifier: Modifier::from(image_modifier_properties.drm_format_modifier),
-                    }
-                };
+                    };
 
-                // Now that we know the format, get the number of planes
-                let format_plane_count = device
-                    .formats()
-                    .find(|entry| entry.format == format)
-                    .unwrap()
-                    .modifier_properties
-                    .drm_format_modifier_plane_count;
-                inner.dmabuf_plane_count = format_plane_count;
+                    // Now that we know the format, get the number of planes
+                    let format_plane_count = device
+                        .formats()
+                        .find(|entry| entry.format == format)
+                        .map(|entry| entry.modifier_properties.drm_format_modifier_plane_count)
+                        .unwrap_or(1);
+                    inner.dmabuf_plane_count = format_plane_count;
 
-                Ok(format)
+                    Ok(format)
+                } else {
+                    let modifier = if linear {
+                        Modifier::Linear
+                    } else {
+                        Modifier::Invalid
+                    };
+                    Ok(Format {
+                        code: fourcc,
+                        modifier,
+                    })
+                }
             })
             .transpose()?;
 
@@ -287,12 +325,27 @@ impl VulkanImage {
             .iter()
             .enumerate()
         {
-            if memory_reqs.memory_type_bits & (i as u32) != 0
+            if (memory_reqs.memory_type_bits & (1 << i)) != 0
                 && types.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
             {
                 alloc_create_info = alloc_create_info.memory_type_index(i as u32);
                 mem_bits = Some(types.property_flags.clone());
                 break;
+            }
+        }
+
+        if mem_bits.is_none() {
+            for (i, types) in device
+                .memory_properties()
+                .memory_types_as_slice()
+                .iter()
+                .enumerate()
+            {
+                if (memory_reqs.memory_type_bits & (1 << i)) != 0 {
+                    alloc_create_info = alloc_create_info.memory_type_index(i as u32);
+                    mem_bits = Some(types.property_flags.clone());
+                    break;
+                }
             }
         }
 
@@ -309,7 +362,7 @@ impl VulkanImage {
             alloc_create_info = alloc_create_info.push_next(&mut memory_dedicated_info);
         }
 
-        if inner.dmabuf_exportable {
+        if inner.dmabuf_exportable && dmabuf.is_none() {
             memory_export_info = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             alloc_create_info = alloc_create_info.push_next(&mut memory_export_info);
@@ -408,6 +461,10 @@ impl VulkanImage {
         self.format
     }
 
+    pub fn has_alpha(&self) -> bool {
+        self.has_alpha
+    }
+
     pub fn vk(&self) -> &vk::Image {
         &self.inner.image
     }
@@ -432,6 +489,36 @@ impl VulkanImage {
                     .as_ref()
                     .is_some_and(|format| format.modifier == Modifier::Linear))
     }
+
+    pub fn current_layout(&self) -> vk::ImageLayout {
+        vk::ImageLayout::from_raw(
+            self.inner
+                .current_layout
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    pub fn set_current_layout(&self, layout: vk::ImageLayout) {
+        self.inner
+            .current_layout
+            .store(layout.as_raw(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn needs_acquire(&self) -> bool {
+        self.inner
+            .needs_acquire
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_needs_acquire(&self, val: bool) {
+        self.inner
+            .needs_acquire
+            .store(val, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn dmabuf_exportable(&self) -> bool {
+        self.inner.dmabuf_exportable
+    }
 }
 
 #[derive(Debug)]
@@ -441,6 +528,8 @@ pub(crate) struct ImageInner {
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) device: WeakDevice,
     pub(crate) view: Option<vk::ImageView>,
+    pub(crate) current_layout: std::sync::atomic::AtomicI32,
+    pub(crate) needs_acquire: std::sync::atomic::AtomicBool,
 
     pub(crate) dmabuf_exportable: bool,
     pub(crate) dmabuf_plane_count: u32,

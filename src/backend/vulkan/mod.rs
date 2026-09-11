@@ -70,7 +70,7 @@ use std::{
     sync::LazyLock,
 };
 
-use ash::{vk, Entry};
+use ash::{Entry, vk};
 use libc::c_void;
 use tracing::{error, info, trace, warn};
 
@@ -84,6 +84,7 @@ pub mod version;
 pub use self::{
     device::Device, format::FormatList, instance::Instance, phd::PhysicalDevice, version::Version,
 };
+pub use ash;
 
 static LIBRARY: LazyLock<Result<Entry, LoadError>> =
     LazyLock::new(|| unsafe { Entry::load().map_err(|_| LoadError) });
@@ -167,8 +168,14 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
                 trace!(ty, "{message}")
             }
             vk::DebugUtilsMessageSeverityFlagsEXT::INFO => info!(ty, "{message}"),
-            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => warn!(ty, "{message}"),
-            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => error!(ty, "{message}"),
+            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+                eprintln!("[Vulkan Warning] [{ty}] {message}");
+                warn!(ty, "{message}");
+            }
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+                eprintln!("[Vulkan Error] [{ty}] {message}");
+                error!(ty, "{message}");
+            }
             _ => (),
         }
     });

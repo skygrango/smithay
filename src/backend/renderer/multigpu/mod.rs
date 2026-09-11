@@ -582,7 +582,11 @@ impl<A: GraphicsApi> GpuManager<A> {
                 let dmabuf = get_dmabuf(buffer).unwrap();
                 let mut texture = MultiTexture::from_surface(Some(surface), dmabuf.size(), dmabuf.format());
 
-                if !self.devices.iter().any(|device| target_node == *device.node()) {
+                if !self
+                    .devices
+                    .iter()
+                    .any(|device| is_same_gpu(&target_node, device.node()))
+                {
                     return Err(Error::DeviceMissing);
                 }
 
@@ -590,17 +594,19 @@ impl<A: GraphicsApi> GpuManager<A> {
                 let first = devices.next().unwrap();
 
                 let src_node = import_on_src_node(dmabuf, Some(damage), &mut texture, first, None, devices)?;
-                if src_node != target_node {
+                if !is_same_gpu(&src_node, &target_node) {
                     let target_id = self
                         .devices
                         .iter()
-                        .find_map(|dev| (*dev.node() == target_node).then(|| dev.renderer().context_id()))
+                        .find_map(|dev| {
+                            is_same_gpu(dev.node(), &target_node).then(|| dev.renderer().context_id())
+                        })
                         .unwrap();
                     let src_id = self
                         .devices
                         .iter()
                         .find_map(|dev| {
-                            (*dev.node() == src_node).then(|| dev.renderer().context_id().erased())
+                            is_same_gpu(dev.node(), &src_node).then(|| dev.renderer().context_id().erased())
                         })
                         .unwrap();
 
@@ -639,7 +645,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .filter(|format| {
                             self.devices
                                 .iter()
-                                .find(|device| target_node == *device.node())
+                                .find(|device| is_same_gpu(&target_node, device.node()))
                                 .unwrap()
                                 .renderer()
                                 .mem_formats()
@@ -652,7 +658,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                     let src_device = self
                         .devices
                         .iter_mut()
-                        .find(|device| src_node == *device.node())
+                        .find(|device| is_same_gpu(&src_node, device.node()))
                         .unwrap();
 
                     let mappings = {
@@ -2083,6 +2089,14 @@ where
         alpha: f32,
     ) -> Result<(), Error<R, T>> {
         let render_id = self.frame.as_mut().unwrap().context_id();
+        trace!(
+            ?src,
+            ?dst,
+            damage_len = damage.len(),
+            alpha,
+            has_tex = texture.get::<R>(&render_id).is_some(),
+            "MultiRenderer::render_texture_from_to"
+        );
         let sync = texture.needs_synchronization::<R>(&render_id);
         if let Some(sync) = sync {
             if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
@@ -2130,6 +2144,16 @@ where
     #[profiling::function]
     fn finish(mut self) -> Result<sync::SyncPoint, Self::Error> {
         self.finish_internal()
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(
+        &mut self,
+        desc: Option<&crate::wayland::color::management::ImageDescription>,
+    ) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_surface_color_description(desc);
+        }
     }
 }
 
@@ -2328,6 +2352,30 @@ where
     }
 }
 
+pub fn is_same_gpu(a: &DrmNode, b: &DrmNode) -> bool {
+    if a == b {
+        return true;
+    }
+    use crate::backend::drm::NodeType;
+    if let (Some(Ok(a_render)), Some(Ok(b_render))) = (
+        a.node_with_type(NodeType::Render),
+        b.node_with_type(NodeType::Render),
+    ) {
+        if a_render == b_render {
+            return true;
+        }
+    }
+    if let (Some(Ok(a_primary)), Some(Ok(b_primary))) = (
+        a.node_with_type(NodeType::Primary),
+        b.node_with_type(NodeType::Primary),
+    ) {
+        if a_primary == b_primary {
+            return true;
+        }
+    }
+    false
+}
+
 fn import_on_src_node<'a, R, T>(
     dmabuf: &Dmabuf,
     damage: Option<&[Rectangle<i32, BufferCoords>]>,
@@ -2347,23 +2395,35 @@ where
 {
     match dmabuf.node() {
         Some(node) => {
-            if node == *render.node() {
+            if is_same_gpu(&node, render.node()) {
                 let renderer = render.renderer_mut();
                 let imported = renderer.import_dmabuf(dmabuf, damage).map_err(Error::Render)?;
                 texture.insert_texture::<R>(&renderer.context_id(), imported);
-            } else if target.as_ref().is_some_and(|target| node == *target.node()) {
-                let renderer = target.unwrap().renderer_mut();
+                Ok(*render.node())
+            } else if target
+                .as_ref()
+                .is_some_and(|target| is_same_gpu(&node, target.node()))
+            {
+                let target_dev = target.unwrap();
+                let renderer = target_dev.renderer_mut();
                 let imported = renderer.import_dmabuf(dmabuf, damage).map_err(Error::Target)?;
                 texture.insert_texture::<T>(&renderer.context_id(), imported);
-            } else if let Some(other) = others.find(|other| node == *(other.node())) {
+                Ok(*target_dev.node())
+            } else if let Some(other) = others.find(|other| is_same_gpu(&node, other.node())) {
                 let renderer = other.renderer_mut();
                 let imported = renderer.import_dmabuf(dmabuf, damage).map_err(Error::Render)?;
                 texture.insert_texture::<R>(&renderer.context_id(), imported);
+                Ok(*other.node())
+            } else if render.can_do_cross_device_imports() {
+                if let Ok(imported) = render.renderer_mut().import_dmabuf(dmabuf, damage) {
+                    texture.insert_texture::<R>(&render.renderer().context_id(), imported);
+                    Ok(*render.node())
+                } else {
+                    Err(Error::DeviceMissing)
+                }
             } else {
-                return Err(Error::DeviceMissing);
-            };
-
-            Ok(node)
+                Err(Error::DeviceMissing)
+            }
         }
         None => {
             // try them all
@@ -2930,7 +2990,9 @@ where
         other_renderers.iter_mut().map(|x| &mut **x),
     )?;
 
-    if src_node == *render.node() {
+    debug!(?src_node, render_node = ?render.node(), "MultiRenderer import_dmabuf_internal node match");
+
+    if is_same_gpu(&src_node, render.node()) {
         // when we are on the same node, we are done
         Ok(texture)
     } else {
@@ -2939,7 +3001,10 @@ where
         let target_id = render.renderer().context_id().erased();
         let mut target_texture = texture_internal.textures.remove(&target_id);
 
-        let res = if let Some(target) = target.as_mut().filter(|target| src_node == *target.node()) {
+        let res = if let Some(target) = target
+            .as_mut()
+            .filter(|target| is_same_gpu(&src_node, target.node()))
+        {
             let src_id = target.renderer().context_id().erased();
             let src_texture = match texture_internal.textures.get(&src_id).unwrap() {
                 GpuSingleTexture::Direct(tex) => tex
@@ -2950,7 +3015,10 @@ where
 
             texture_copy::<T, R>(target, render, src_texture, &mut target_texture, damage)
                 .map_err(Error::transpose)
-        } else if let Some(other) = other_renderers.iter_mut().find(|other| src_node == *other.node()) {
+        } else if let Some(other) = other_renderers
+            .iter_mut()
+            .find(|other| is_same_gpu(&src_node, other.node()))
+        {
             let src_id = other.renderer().context_id().erased();
             let src_texture = match texture_internal.textures.get(&src_id).unwrap() {
                 GpuSingleTexture::Direct(tex) => tex

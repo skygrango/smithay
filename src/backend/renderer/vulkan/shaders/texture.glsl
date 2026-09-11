@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_image_load_formatted : enable
 
 layout(
 local_size_x = 8,
@@ -6,7 +7,7 @@ local_size_y = 8,
 local_size_z = 1
 ) in;
 
-layout(binding = 0, rgba8) uniform image2D dst;
+layout(binding = 0) uniform image2D dst;
 layout(binding = 1) uniform sampler2D tex;
 layout(push_constant, std140) uniform PushConstants {
     vec4 srcRect;
@@ -15,6 +16,11 @@ layout(push_constant, std140) uniform PushConstants {
     float alpha;
 
     uint damageSize;
+    uint isBgr;
+    uint hasAlpha;
+    uint pad0;
+    uint pad1;
+    uint pad2;
     ivec4 damage[4];
 } params;
 
@@ -57,12 +63,23 @@ void main() {
         if (coord.x >= rect.x && coord.x < (rect.x + rect.z) &&
             coord.y >= rect.y && coord.y < (rect.y + rect.w))
         {
-            vec4 color = texture(tex, uv) * params.alpha;
-            if (color.a < 1.0) {
-                vec4 blend = imageLoad(dst, ivec2(coord)).bgra - vec4(color.a);
-                color = color + blend;
+            vec4 raw = texture(tex, uv);
+            if (params.hasAlpha == 0) {
+                raw.a = 1.0;
             }
-            imageStore(dst, ivec2(coord), color.bgra);
+            vec4 color = raw * params.alpha;
+
+            if (color.a < 1.0) {
+                vec4 dstColor = imageLoad(dst, ivec2(coord));
+                if (params.isBgr != 0) {
+                    dstColor = dstColor.bgra;
+                }
+                color = color + dstColor * (1.0 - color.a);
+            }
+            if (params.isBgr != 0) {
+                color = color.bgra;
+            }
+            imageStore(dst, ivec2(coord), color);
             break;
         }
     }

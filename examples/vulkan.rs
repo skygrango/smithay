@@ -5,20 +5,20 @@ use drm_fourcc::{DrmFourcc, DrmModifier};
 use rustix::fs::{Mode, OFlags};
 use smithay::{
     backend::{
-        allocator::{dmabuf::AsDmabuf, format::FormatSet, vulkan::VulkanAllocator, Allocator, Buffer},
+        allocator::{Allocator, Buffer, dmabuf::AsDmabuf, format::FormatSet, vulkan::VulkanAllocator},
         drm::DrmDeviceFd,
         egl::{EGLContext, EGLDevice, EGLDisplay},
         renderer::{
+            Bind, Color32F, ExportMem, Frame, ImportMem, Renderer,
             gles::{GlesError, GlesRenderer},
             sync::Interrupted,
             vulkan::VulkanRenderer,
-            Bind, Color32F, ExportMem, Frame, ImportMem, Renderer,
         },
         vulkan::{
+            Instance, PhysicalDevice,
             format::{get_vk_format, known_formats},
             image::{ImageUsageFlags, VulkanImage},
             version::Version,
-            Instance, PhysicalDevice,
         },
     },
     utils::{DeviceFd, Point, Rectangle, Size, Transform},

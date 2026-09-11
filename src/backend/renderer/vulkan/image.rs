@@ -1,4 +1,8 @@
-use crate::backend::{allocator::Fourcc, renderer::Texture, vulkan::image::VulkanImage};
+use crate::backend::{
+    allocator::Fourcc,
+    renderer::Texture,
+    vulkan::{format::get_drm_format, image::VulkanImage},
+};
 
 impl Texture for VulkanImage {
     fn width(&self) -> u32 {
@@ -10,6 +14,8 @@ impl Texture for VulkanImage {
     }
 
     fn format(&self) -> Option<Fourcc> {
-        self.drm.map(|format| format.code)
+        self.drm
+            .map(|format| format.code)
+            .or_else(|| get_drm_format(self.format()))
     }
 }

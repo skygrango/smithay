@@ -16,7 +16,7 @@ use ash::{ext, vk};
 use scopeguard::ScopeGuard;
 use tracing::{error, info, info_span, warn};
 
-use super::{get_env_or_max_version, vulkan_debug_utils_callback, LoadError, Version, LIBRARY};
+use super::{LIBRARY, LoadError, Version, get_env_or_max_version, vulkan_debug_utils_callback};
 
 /// An error that may occur when creating an [`Instance`].
 #[derive(Debug, thiserror::Error)]
@@ -125,14 +125,21 @@ impl Instance {
 
         let mut layers = Vec::new();
 
-        // Enable debug layers if present and debug assertions are enabled.
-        if cfg!(debug_assertions) {
+        // Enable debug layers if present and debug assertions or validation flag is enabled.
+        let want_validation = cfg!(debug_assertions)
+            || std::env::var_os("COSMIC_VULKAN_VALIDATION").is_some()
+            || std::env::var_os("SMITHAY_VULKAN_VALIDATION").is_some()
+            || std::env::var_os("VK_LAYER_KHRONOS_VALIDATION").is_some()
+            || std::env::var("COSMIC_RENDERER").as_deref() == Ok("vulkan");
+
+        if want_validation {
             const VALIDATION: &CStr = c"VK_LAYER_KHRONOS_validation";
 
             if available_layers
                 .iter()
                 .any(|layer| layer.as_c_str() == VALIDATION)
             {
+                info!("Enabling Vulkan validation layer: {:?}", VALIDATION);
                 layers.push(VALIDATION);
             } else {
                 warn!("Validation layers not available. These can be installed through your package manager",);

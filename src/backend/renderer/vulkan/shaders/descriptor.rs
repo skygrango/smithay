@@ -3,28 +3,34 @@ use ash::vk::{
     DescriptorSet as VkDescriptorSet, DescriptorSetAllocateInfo, DescriptorSetLayout, Result as VkError,
 };
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
-use crate::backend::vulkan::{device::WeakDevice, Device};
+use crate::backend::vulkan::{Device, device::WeakDevice};
+
+#[derive(Debug)]
+struct PoolInner {
+    pool: DescriptorPool,
+    free_sets: Mutex<Vec<VkDescriptorSet>>,
+}
 
 #[derive(Debug)]
 pub struct DescriptorSet {
     device: WeakDevice,
-    pool: Weak<DescriptorPool>,
+    pool: Weak<PoolInner>,
     vk: VkDescriptorSet,
 }
 
 impl DescriptorSet {
     pub fn vk(&self) -> VkDescriptorSet {
-        self.vk.clone()
+        self.vk
     }
 }
 
 impl Drop for DescriptorSet {
     fn drop(&mut self) {
-        if let Some((device, pool)) = self.device.upgrade().zip(self.pool.upgrade()) {
-            unsafe {
-                let _ = device.vk().free_descriptor_sets(*pool, &[self.vk]);
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut free) = pool.free_sets.lock() {
+                free.push(self.vk);
             }
         }
     }
@@ -33,20 +39,16 @@ impl Drop for DescriptorSet {
 #[derive(Debug)]
 struct Pool {
     device: WeakDevice,
-    vk: Option<Arc<DescriptorPool>>,
-    len: usize,
+    inner: Arc<PoolInner>,
+    allocated: usize,
     capacity: usize,
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        if let Some((device, pool)) = self
-            .device
-            .upgrade()
-            .zip(self.vk.take().and_then(Arc::into_inner))
-        {
+        if let Some(device) = self.device.upgrade() {
             unsafe {
-                device.vk().destroy_descriptor_pool(pool, None);
+                device.vk().destroy_descriptor_pool(self.inner.pool, None);
             }
         }
     }
@@ -93,19 +95,33 @@ impl DescriptorAllocator {
             return Err(Error::LostDevice);
         };
 
+        // 1. Check if any pool has an already allocated and freed descriptor set
+        for pool in self.pools.iter_mut() {
+            if let Ok(mut free) = pool.inner.free_sets.lock() {
+                if let Some(vk) = free.pop() {
+                    return Ok(DescriptorSet {
+                        device: self.device.clone(),
+                        pool: Arc::downgrade(&pool.inner),
+                        vk,
+                    });
+                }
+            }
+        }
+
+        // 2. Check if any pool has remaining capacity to allocate a new set
         let layouts = &[self.layout];
         let mut alloc_info = DescriptorSetAllocateInfo::default().set_layouts(layouts);
 
         for pool in self.pools.iter_mut() {
-            if pool.len < pool.capacity {
-                alloc_info = alloc_info.descriptor_pool((**pool.vk.as_ref().unwrap()).clone());
+            if pool.allocated < pool.capacity {
+                alloc_info = alloc_info.descriptor_pool(pool.inner.pool);
                 match unsafe { device.vk().allocate_descriptor_sets(&alloc_info) } {
                     Err(VkError::ERROR_FRAGMENTED_POOL) | Err(VkError::ERROR_OUT_OF_POOL_MEMORY) => continue,
                     Ok(set) => {
-                        pool.len += 1;
+                        pool.allocated += 1;
                         return Ok(DescriptorSet {
                             device: self.device.clone(),
-                            pool: pool.vk.as_ref().map(Arc::downgrade).unwrap(),
+                            pool: Arc::downgrade(&pool.inner),
                             vk: set[0],
                         });
                     }
@@ -114,7 +130,7 @@ impl DescriptorAllocator {
             }
         }
 
-        // no (free) pool found
+        // 3. No (free) pool found, create a new one
         let size = self
             .pools
             .last()
@@ -134,25 +150,29 @@ impl DescriptorAllocator {
                 .create_descriptor_pool(&create_info, None)
                 .map_err(Error::DescriptorPool)?
         };
+        let inner = Arc::new(PoolInner {
+            pool,
+            free_sets: Mutex::new(Vec::new()),
+        });
         self.pools.push(Pool {
             device: self.device.clone(),
-            vk: Some(Arc::new(pool)),
-            len: 0,
+            inner: inner.clone(),
+            allocated: 0,
             capacity: size as usize,
         });
 
         let pool = self.pools.last_mut().unwrap();
-        alloc_info = alloc_info.descriptor_pool((**pool.vk.as_ref().unwrap()).clone());
+        alloc_info = alloc_info.descriptor_pool(pool.inner.pool);
         let set = unsafe {
             device
                 .vk()
                 .allocate_descriptor_sets(&alloc_info)
                 .map_err(Error::AllocError)?
         };
-        pool.len += 1;
+        pool.allocated += 1;
         Ok(DescriptorSet {
             device: self.device.clone(),
-            pool: pool.vk.as_ref().map(Arc::downgrade).unwrap(),
+            pool: Arc::downgrade(&pool.inner),
             vk: set[0],
         })
     }

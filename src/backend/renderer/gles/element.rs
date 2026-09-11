@@ -68,6 +68,18 @@ impl PixelShaderElement {
         self.additional_uniforms = additional_uniforms.into_iter().map(|u| u.into_owned()).collect();
         self.commit_counter.increment();
     }
+
+    /// Creates a dummy pixel shader element that performs no rendering.
+    pub fn dummy() -> Self {
+        Self::new(
+            GlesPixelProgram::dummy(),
+            Rectangle::zero(),
+            None,
+            0.0,
+            Vec::new(),
+            Kind::Unspecified,
+        )
+    }
 }
 
 impl Element for PixelShaderElement {
@@ -136,7 +148,6 @@ impl RenderElement<GlesRenderer> for PixelShaderElement {
 pub struct TextureShaderElement {
     inner: TextureRenderElement<GlesTexture>,
     program: GlesTexProgram,
-    id: Id,
     additional_uniforms: Vec<Uniform<'static>>,
 }
 
@@ -152,8 +163,6 @@ impl TextureShaderElement {
         Self {
             inner,
             program,
-            id: Id::new(),
-
             additional_uniforms: additional_uniforms.into_iter().map(|u| u.into_owned()).collect(),
         }
     }
@@ -161,7 +170,10 @@ impl TextureShaderElement {
 
 impl Element for TextureShaderElement {
     fn id(&self) -> &Id {
-        &self.id
+        // This wrapper is recreated for every output frame.  Preserve the
+        // wrapped texture buffer's stable identity so output damage tracking
+        // can distinguish a small texture update from a brand-new element.
+        self.inner.id()
     }
 
     fn current_commit(&self) -> CommitCounter {

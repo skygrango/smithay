@@ -2,16 +2,18 @@ use ash::vk::{self, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo, Sha
 
 use crate::backend::{
     renderer::vulkan::shaders::descriptor::DescriptorAllocator,
-    vulkan::{device::WeakDevice, Device},
+    vulkan::{Device, device::WeakDevice},
 };
 
 mod clear;
 mod descriptor;
+mod hdr_texture;
 mod texture;
 use self::clear::*;
 pub use self::descriptor::DescriptorSet;
+use self::hdr_texture::*;
 use self::texture::*;
-pub use self::{clear::ClearPushConstants, texture::TexPushConstants};
+pub use self::{clear::ClearPushConstants, hdr_texture::HdrTexPushConstants, texture::TexPushConstants};
 
 pub fn spirv_u32(shader: &[u8]) -> &[u32] {
     let len = shader.len();
@@ -30,12 +32,16 @@ pub struct Pipelines {
     tex_pipeline: Pipeline,
     tex_layout: PipelineLayout,
     tex_desc_pool: DescriptorAllocator,
+    hdr_tex_pipeline: Pipeline,
+    hdr_tex_layout: PipelineLayout,
+    hdr_tex_desc_pool: DescriptorAllocator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinShader {
     Clear,
     Texture,
+    HdrTexture,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +134,38 @@ impl Pipelines {
         };
         let tex_desc_pool = DescriptorAllocator::new(&device, descriptor_set, &*TEX_SIZES);
 
+        let create_info = vk::ShaderModuleCreateInfo::default().code(spirv_u32(HDR_TEX_SHADER));
+        let hdr_tex_shader = unsafe {
+            device
+                .vk()
+                .create_shader_module(&create_info, None)
+                .map_err(Error::Shader)?
+        };
+
+        let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(HDR_TEX_BINDINGS.as_slice());
+        let descriptor_set = unsafe {
+            device
+                .vk()
+                .create_descriptor_set_layout(&create_info, None)
+                .map_err(Error::DescriptorSetLayout)?
+        };
+        let layouts = [descriptor_set];
+
+        let constants = [vk::PushConstantRange::default()
+            .stage_flags(ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<HdrTexPushConstants>() as u32)];
+        let create_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&layouts)
+            .push_constant_ranges(&constants);
+        let hdr_tex_layout = unsafe {
+            device
+                .vk()
+                .create_pipeline_layout(&create_info, None)
+                .map_err(Error::PipelineLayout)?
+        };
+        let hdr_tex_desc_pool = DescriptorAllocator::new(&device, descriptor_set, &*HDR_TEX_SIZES);
+
         let create_infos = [
             vk::ComputePipelineCreateInfo::default()
                 .stage(
@@ -145,6 +183,14 @@ impl Pipelines {
                         .module(tex_shader),
                 )
                 .layout(tex_layout.clone()),
+            vk::ComputePipelineCreateInfo::default()
+                .stage(
+                    PipelineShaderStageCreateInfo::default()
+                        .stage(ShaderStageFlags::COMPUTE)
+                        .name(c"main")
+                        .module(hdr_tex_shader),
+                )
+                .layout(hdr_tex_layout.clone()),
         ];
         let pipelines = unsafe {
             device
@@ -162,6 +208,7 @@ impl Pipelines {
         unsafe {
             device.vk().destroy_shader_module(clear_shader, None);
             device.vk().destroy_shader_module(tex_shader, None);
+            device.vk().destroy_shader_module(hdr_tex_shader, None);
         }
 
         Ok(Pipelines {
@@ -174,6 +221,9 @@ impl Pipelines {
             tex_pipeline: pipelines[1],
             tex_layout,
             tex_desc_pool,
+            hdr_tex_pipeline: pipelines[2],
+            hdr_tex_layout,
+            hdr_tex_desc_pool,
         })
     }
 
@@ -191,10 +241,18 @@ impl Pipelines {
         &self.tex_layout
     }
 
+    pub fn hdr_tex_pipeline(&self) -> &Pipeline {
+        &self.hdr_tex_pipeline
+    }
+    pub fn hdr_tex_pipeline_layout(&self) -> &PipelineLayout {
+        &self.hdr_tex_layout
+    }
+
     pub fn alloc_descriptor_set(&mut self, shader: BuiltinShader) -> Result<DescriptorSet, Error> {
         match shader {
             BuiltinShader::Clear => self.clear_desc_pool.alloc_descriptor_set().map_err(Into::into),
             BuiltinShader::Texture => self.tex_desc_pool.alloc_descriptor_set().map_err(Into::into),
+            BuiltinShader::HdrTexture => self.hdr_tex_desc_pool.alloc_descriptor_set().map_err(Into::into),
         }
     }
 }
@@ -207,6 +265,8 @@ impl Drop for Pipelines {
                 device.vk().destroy_pipeline(self.clear_pipeline, None);
                 device.vk().destroy_pipeline_layout(self.tex_layout, None);
                 device.vk().destroy_pipeline(self.tex_pipeline, None);
+                device.vk().destroy_pipeline_layout(self.hdr_tex_layout, None);
+                device.vk().destroy_pipeline(self.hdr_tex_pipeline, None);
                 device.vk().destroy_pipeline_cache(self.cache, None);
             }
         }

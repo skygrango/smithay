@@ -22,6 +22,7 @@ pub struct ClearPushConstants {
     pub color: [f32; 4],
     pub blend: u32,
     pub size: u32,
-    pub _padding0: [u32; 2],
+    pub is_bgr: u32,
+    pub _padding0: [u32; 1],
     pub rects: [Rectangle<i32, Physical>; 6],
 }

@@ -1,8 +1,8 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::backend::{
-    drm::{sync::DrmTimeline, DrmDeviceFd},
-    renderer::vulkan::{cmds::CommandPool, sync::VulkanTimeline, Error},
+    drm::{DrmDeviceFd, sync::DrmTimeline},
+    renderer::vulkan::{Error, cmds::CommandPool, sync::VulkanTimeline},
     vulkan::Device,
 };
 use ash::{

@@ -16,7 +16,7 @@ use smithay::{
             Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer,
             gles::{GlesRenderbuffer, GlesRenderer},
         },
-        vulkan::{image::ImageUsageFlags, version::Version, Instance, PhysicalDevice},
+        vulkan::{Instance, PhysicalDevice, image::ImageUsageFlags, version::Version},
     },
     utils::{DeviceFd, Rectangle, Transform},
 };

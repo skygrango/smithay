@@ -1,5 +1,5 @@
 use std::{
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
     pin::Pin,
 };
 
@@ -13,13 +13,14 @@ use ash::{
     },
 };
 
-use crate::backend::vulkan::{version::Version, PhysicalDevice};
+use crate::backend::vulkan::{PhysicalDevice, version::Version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     DmabufMemory,
     HostImageCopy,
     ExportTimeline,
+    QueueFamilyForeign,
 }
 
 pub struct Features {
@@ -66,6 +67,14 @@ impl Features {
             let features = unsafe { features.as_mut().get_unchecked_mut() };
             features.features_12.timeline_semaphore = 1;
             features.features_ext_host_image_copy.host_image_copy = 1;
+            features
+                .features
+                .features
+                .shader_storage_image_read_without_format = 1;
+            features
+                .features
+                .features
+                .shader_storage_image_write_without_format = 1;
         }
 
         features
@@ -81,6 +90,9 @@ impl Features {
         }
         if self.features_ext_host_image_copy.host_image_copy == 0 {
             return Err("host_image_copy");
+        }
+        if self.features.features.shader_storage_image_write_without_format == 0 {
+            return Err("shader_storage_image_write_without_format");
         }
 
         Ok(())
@@ -140,6 +152,14 @@ impl Capability {
         Some(Capability::HostImageCopy)
     }
 
+    pub fn supports_queue_family_foreign(phd: &PhysicalDevice) -> Option<Capability> {
+        if !phd.has_device_extension(ext::queue_family_foreign::NAME) {
+            return None;
+        }
+
+        Some(Capability::QueueFamilyForeign)
+    }
+
     pub fn supports_dmabuf_memory(phd: &PhysicalDevice) -> Option<Capability> {
         for ext in [
             khr::external_memory_fd::NAME,
@@ -164,6 +184,7 @@ impl Capability {
                 ] as &'static [&CStr],
                 Capability::HostImageCopy => &[ext::host_image_copy::NAME],
                 Capability::ExportTimeline => &[khr::external_semaphore_fd::NAME],
+                Capability::QueueFamilyForeign => &[ext::queue_family_foreign::NAME],
             })
             .copied()
             .collect()

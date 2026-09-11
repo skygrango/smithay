@@ -56,8 +56,8 @@ use super::{
 };
 use crate::{
     backend::drm::{
-        sync::{DrmTimeline, WeakDrmTimeline},
         DrmDeviceFd,
+        sync::{DrmTimeline, WeakDrmTimeline},
     },
     wayland::{Dispatch2, GlobalData, GlobalDispatch2},
 };

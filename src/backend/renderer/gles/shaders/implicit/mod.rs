@@ -7,6 +7,9 @@ pub(in super::super) const FRAGMENT_SHADER: &str = include_str!("./texture.frag"
 pub(in super::super) const VERTEX_SHADER_SOLID: &str = include_str!("./solid.vert");
 pub(in super::super) const FRAGMENT_SHADER_SOLID: &str = include_str!("./solid.frag");
 
+#[cfg(feature = "wayland_frontend")]
+pub(in super::super) const FRAGMENT_SHADER_HDR: &str = include_str!("./hdr_texture.frag");
+
 #[derive(Debug)]
 pub(in super::super) struct GlesTexProgramInternal {
     pub(in super::super) program: ffi::types::GLuint,
@@ -121,5 +124,36 @@ impl Drop for GlesPixelProgramInner {
         let _ = self
             .destruction_callback_sender
             .send(CleanupResource::Program(self.debug.program));
+    }
+}
+
+impl GlesPixelProgram {
+    /// Creates a dummy pixel program that does not reference any OpenGL resources.
+    pub fn dummy() -> Self {
+        let (sender, _) = std::sync::mpsc::channel();
+        GlesPixelProgram(Arc::new(GlesPixelProgramInner {
+            normal: GlesPixelProgramInternal {
+                program: 0,
+                uniform_matrix: 0,
+                uniform_tex_matrix: 0,
+                uniform_size: 0,
+                uniform_alpha: 0,
+                attrib_vert: 0,
+                attrib_position: 0,
+                additional_uniforms: HashMap::new(),
+            },
+            debug: GlesPixelProgramInternal {
+                program: 0,
+                uniform_matrix: 0,
+                uniform_tex_matrix: 0,
+                uniform_size: 0,
+                uniform_alpha: 0,
+                attrib_vert: 0,
+                attrib_position: 0,
+                additional_uniforms: HashMap::new(),
+            },
+            destruction_callback_sender: sender,
+            uniform_tint: 0,
+        }))
     }
 }

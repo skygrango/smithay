@@ -36,8 +36,8 @@ pub mod pixman;
 #[cfg(feature = "renderer_vulkan")]
 pub mod vulkan;
 
-mod color;
-pub use color::Color32F;
+pub mod color;
+pub use color::{Color32F, HdrOutputConfig, sdr_color_to_hdr};
 
 use crate::backend::allocator::{Format, Fourcc, dmabuf::Dmabuf};
 #[cfg(all(
@@ -295,6 +295,14 @@ pub trait Frame {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), Self::Error>;
+
+    /// Sets the color description of the surface currently being drawn.
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(
+        &mut self,
+        _desc: Option<&crate::wayland::color::management::ImageDescription>,
+    ) {
+    }
 
     /// Render a texture to the current target as a flat 2d-plane at a given
     /// position and applying the given transformation with the given alpha value.

@@ -50,6 +50,7 @@
 pub mod alpha_modifier;
 pub mod background_effect;
 pub mod buffer;
+pub mod color;
 pub mod commit_timing;
 pub mod compositor;
 pub mod content_type;
@@ -86,6 +87,7 @@ pub mod shm;
 pub mod single_pixel_buffer;
 pub mod socket;
 pub mod tablet_manager;
+pub mod tearing_control;
 pub mod text_input;
 pub mod viewporter;
 pub mod virtual_keyboard;

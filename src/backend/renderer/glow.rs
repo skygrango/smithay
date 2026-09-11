@@ -161,6 +161,18 @@ impl GlowRenderer {
         }
         Ok(func(&self.glow))
     }
+
+    /// Configures the renderer for HDR output.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn set_hdr_output(&mut self, config: Option<HdrOutputConfig>) -> Result<(), GlesError> {
+        BorrowMut::<GlesRenderer>::borrow_mut(self).set_hdr_output(config)
+    }
+
+    /// Returns the currently active HDR output configuration, if any.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn hdr_output(&self) -> Option<HdrOutputConfig> {
+        Borrow::<GlesRenderer>::borrow(self).hdr_output()
+    }
 }
 
 impl GlowFrame<'_, '_> {
@@ -341,6 +353,16 @@ impl Frame for GlowFrame<'_, '_> {
     }
     fn output_size(&self) -> Size<i32, Physical> {
         self.frame.as_ref().unwrap().output_size()
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn set_surface_color_description(
+        &mut self,
+        desc: Option<&crate::wayland::color::management::ImageDescription>,
+    ) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_surface_color_description(desc);
+        }
     }
 
     #[profiling::function]
