@@ -16,7 +16,7 @@ use ash::{ext, vk};
 use scopeguard::ScopeGuard;
 use tracing::{error, info, info_span, warn};
 
-use super::{get_env_or_max_version, vulkan_debug_utils_callback, LoadError, Version, LIBRARY};
+use super::{LIBRARY, LoadError, Version, get_env_or_max_version, vulkan_debug_utils_callback};
 
 /// An error that may occur when creating an [`Instance`].
 #[derive(Debug, thiserror::Error)]

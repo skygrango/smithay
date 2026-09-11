@@ -35,18 +35,18 @@ use crate::{
         allocator::{dmabuf::DmabufFlags, format::has_alpha},
         renderer::vulkan::VulkanRenderer,
         vulkan::{
+            PhysicalDevice,
             device::{Device, DeviceError, QueueType},
             image::{Error as ImageError, VulkanImage},
             version::Version,
-            PhysicalDevice,
         },
     },
     utils::{Buffer as BufferCoord, Size},
 };
 
 use super::{
-    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES},
     Allocator, Buffer,
+    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES},
 };
 
 pub use crate::backend::vulkan::image::ImageUsageFlags;
@@ -327,11 +327,7 @@ impl AsDmabuf for VulkanImage {
                     .vk()
                     .get_image_subresource_layout(self.inner.image, subresource)
             };
-            builder.add_plane(
-                fd.clone(),
-                layout.offset as u32,
-                layout.row_pitch as u32,
-            );
+            builder.add_plane(fd.clone(), layout.offset as u32, layout.row_pitch as u32);
         }
 
         #[cfg(feature = "backend_drm")]

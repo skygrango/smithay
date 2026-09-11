@@ -7,8 +7,8 @@ use drm::node::DrmNode;
 
 use super::device::WeakDevice;
 use crate::backend::{
-    allocator::{dmabuf::Dmabuf, format::has_alpha, Buffer, Format, Fourcc, Modifier},
-    vulkan::{format::component_mapping_for_format, Device},
+    allocator::{Buffer, Format, Fourcc, Modifier, dmabuf::Dmabuf, format::has_alpha},
+    vulkan::{Device, format::component_mapping_for_format},
 };
 
 /// Vulkan image object.

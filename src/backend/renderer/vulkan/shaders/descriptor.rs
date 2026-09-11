@@ -5,7 +5,7 @@ use ash::vk::{
 
 use std::sync::{Arc, Weak};
 
-use crate::backend::vulkan::{device::WeakDevice, Device};
+use crate::backend::vulkan::{Device, device::WeakDevice};
 
 #[derive(Debug)]
 pub struct DescriptorSet {

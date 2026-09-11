@@ -3,22 +3,22 @@
 use crate::{
     backend::{
         allocator::{
+            Format, Fourcc,
             dmabuf::{Dmabuf, WeakDmabuf},
             format::FormatSet,
-            Format, Fourcc,
         },
-        drm::{sync::DrmSyncPoint, DrmDeviceFd},
+        drm::{DrmDeviceFd, sync::DrmSyncPoint},
         renderer::{
-            vulkan::shaders::{ClearPushConstants, TexPushConstants},
             Bind, ContextId, ExportMem, Frame, ImportDma, ImportMem, Renderer, RendererSuper, Texture,
             TextureMapping,
+            vulkan::shaders::{ClearPushConstants, TexPushConstants},
         },
         vulkan::{
+            PhysicalDevice, UnsupportedProperty,
             device::{Device, DeviceError, QueueType, WeakDevice},
             format::{get_drm_format, get_vk_format, known_formats},
             image::{Error as ImageError, ImageUsageFlags, VulkanImage},
             version::Version,
-            PhysicalDevice, UnsupportedProperty,
         },
     },
     reexports::drm::node::DrmNode,
@@ -30,15 +30,15 @@ use ash::vk::{
     Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags, ImageLayout,
     ImageMemoryBarrier, ImageSubresourceLayers, ImageSubresourceRange, ImageToMemoryCopyEXT, MemoryMapFlags,
     MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint, PipelineStageFlags,
-    Result as VkResult, SamplerAddressMode, SamplerCreateFlags, SamplerCreateInfo, SamplerMipmapMode,
-    SemaphoreWaitInfo, ShaderStageFlags, SubmitInfo, TimelineSemaphoreSubmitInfo, QUEUE_FAMILY_IGNORED,
+    QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags, SamplerCreateInfo,
+    SamplerMipmapMode, SemaphoreWaitInfo, ShaderStageFlags, SubmitInfo, TimelineSemaphoreSubmitInfo,
 };
 use gbm::Modifier;
 use indexmap::IndexSet;
 
 use std::{collections::HashMap, ffi::CStr, fmt, ptr::NonNull};
 
-use super::{sync::SyncPoint, Color32F};
+use super::{Blit, BlitFrame, Color32F, TextureFilter, sync::SyncPoint};
 
 //mod buffer;
 mod capabilities;
@@ -82,7 +82,6 @@ impl Drop for VulkanRenderer {
         unsafe { self.device.vk().destroy_sampler(self.texture_sampler, None) };
     }
 }
-
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -268,9 +267,8 @@ impl VulkanRenderer {
             .vk_ext_host_image_copy()
             .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
 
-        let host_ptr = unsafe {
-            ptr.offset((region.loc.y as isize * stride as isize) + (region.loc.x as isize * 4))
-        };
+        let host_ptr =
+            unsafe { ptr.offset((region.loc.y as isize * stride as isize) + (region.loc.x as isize * 4)) };
 
         unsafe {
             device_copy
@@ -591,8 +589,8 @@ impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
             let width = data.width;
             let height = data.height;
             let stride = data.stride;
-            let fourcc = shm_format_to_fourcc(data.format)
-                .ok_or(Error::UnsupportedWlPixelFormat(data.format))?;
+            let fourcc =
+                shm_format_to_fourcc(data.format).ok_or(Error::UnsupportedWlPixelFormat(data.format))?;
 
             if !self.mem_formats().any(|f| f == fourcc) {
                 return Err(Error::UnsupportedWlPixelFormat(data.format));
@@ -647,7 +645,10 @@ impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
     }
 
     fn shm_formats(&self) -> Box<dyn Iterator<Item = wayland_server::protocol::wl_shm::Format>> {
-        Box::new(self.mem_formats().filter_map(crate::wayland::shm::fourcc_to_shm_format))
+        Box::new(
+            self.mem_formats()
+                .filter_map(crate::wayland::shm::fourcc_to_shm_format),
+        )
     }
 }
 
@@ -1166,6 +1167,55 @@ impl Frame for VulkanFrame<'_, '_> {
         } else {
             Ok(SyncPoint::signaled())
         }
+    }
+}
+
+impl Blit for VulkanRenderer {
+    fn blit(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        _filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        let size = Size::from((Texture::width(&to.0) as i32, Texture::height(&to.0) as i32));
+        let mut frame = VulkanFrame {
+            renderer: self,
+            fb: to,
+            _marker: std::marker::PhantomData,
+            transform: Transform::Normal,
+            size,
+            last_sequence: None,
+        };
+        let src_rect = Rectangle::from_loc_and_size(
+            (src.loc.x as f64, src.loc.y as f64),
+            (src.size.w as f64, src.size.h as f64),
+        );
+        frame.render_texture_from_to(&from.0, src_rect, dst, &[dst], &[], Transform::Normal, 1.0)?;
+        frame.finish()
+    }
+}
+
+impl BlitFrame<VulkanFramebuffer> for VulkanFrame<'_, '_> {
+    fn blit_to(
+        &mut self,
+        to: &mut VulkanFramebuffer,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        self.renderer.blit(self.fb, to, src, dst, filter)
+    }
+
+    fn blit_from(
+        &mut self,
+        from: &VulkanFramebuffer,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        self.renderer.blit(from, self.fb, src, dst, filter)
     }
 }
 

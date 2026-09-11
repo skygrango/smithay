@@ -2,7 +2,7 @@ use ash::vk::{self, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo, Sha
 
 use crate::backend::{
     renderer::vulkan::shaders::descriptor::DescriptorAllocator,
-    vulkan::{device::WeakDevice, Device},
+    vulkan::{Device, device::WeakDevice},
 };
 
 mod clear;

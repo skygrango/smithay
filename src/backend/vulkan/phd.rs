@@ -29,7 +29,7 @@ use tracing::info_span;
 #[cfg(feature = "backend_drm")]
 use tracing::instrument;
 
-use super::{version::Version, Instance, UnsupportedProperty};
+use super::{Instance, UnsupportedProperty, version::Version};
 
 /// A Vulkan physical device.
 ///

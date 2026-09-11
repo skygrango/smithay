@@ -1,14 +1,13 @@
 use crate::backend::{
     renderer::ContextId,
-    vulkan::{format::FormatEntry, image::VulkanImage, PhysicalDevice},
+    vulkan::{PhysicalDevice, format::FormatEntry, image::VulkanImage},
 };
 use ash::{
-    ext, khr,
+    Device as VkDevice, ext, khr,
     vk::{
         self, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDeviceFeatures2,
         PhysicalDeviceMemoryProperties, Queue, QueueFlags,
     },
-    Device as VkDevice,
 };
 use drm::node::DrmNode;
 use std::{
