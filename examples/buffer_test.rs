@@ -8,7 +8,7 @@ use smithay::{
             dmabuf::{AnyError, Dmabuf, DmabufAllocator},
             dumb::DumbAllocator,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
-            vulkan::{ImageUsageFlags, VulkanAllocator},
+            vulkan::VulkanAllocator,
         },
         drm::{DrmDeviceFd, DrmNode},
         egl::{EGLContext, EGLDevice, EGLDisplay},
@@ -16,7 +16,7 @@ use smithay::{
             Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer,
             gles::{GlesRenderbuffer, GlesRenderer},
         },
-        vulkan::{Instance, PhysicalDevice, version::Version},
+        vulkan::{image::ImageUsageFlags, version::Version, Instance, PhysicalDevice},
     },
     utils::{DeviceFd, Rectangle, Transform},
 };
@@ -483,7 +483,12 @@ fn usage_flags_from_string(flags: &str) -> Result<ImageUsageFlags, String> {
         .split('+')
         .map(|f| {
             Ok(match f.to_lowercase().trim() {
-                "all" => ImageUsageFlags::all(),
+                "all" => {
+                    ImageUsageFlags::TRANSFER_SRC
+                        | ImageUsageFlags::TRANSFER_DST
+                        | ImageUsageFlags::SAMPLED
+                        | ImageUsageFlags::COLOR_ATTACHMENT
+                }
                 "empty" | "none" => ImageUsageFlags::empty(),
                 "color_attachment" => ImageUsageFlags::COLOR_ATTACHMENT,
                 "sampled" => ImageUsageFlags::SAMPLED,

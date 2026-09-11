@@ -4,16 +4,16 @@
 //! explicit sync.
 //!
 //! Currently, the implementation here assumes acquire fences are already signalled
-//! when the surface transaction is ready. Use [`DrmSyncPointBlocker`].
+//! when the surface transaction is ready. Use [`DrmSyncPointBlocker`](crate::backend::drm::sync::DrmSyncPointBlocker).
 //!
-//! The server should only expose the protocol if [`supports_syncobj_eventfd`] returns
+//! The server should only expose the protocol if [`supports_syncobj_eventfd`](crate::backend::drm::sync::supports_syncobj_eventfd) returns
 //! `true`. Or it won't be possible to create the blocker. This is similar to other
 //! implementations.
 //!
 //! The release fence is signalled when all references to a
 //! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
-//!
 //! ```no_run
+//! # use smithay::backend::drm::sync::supports_syncobj_eventfd;
 //! # use smithay::wayland::drm_syncobj::*;
 //!
 //! pub struct State {
@@ -38,11 +38,7 @@
 //! smithay::delegate_dispatch2!(State);
 //! ```
 
-use std::{
-    cell::RefCell,
-    os::unix::io::AsFd,
-    sync::{Arc, Weak},
-};
+use std::cell::RefCell;
 use tracing::warn;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
     wp_linux_drm_syncobj_manager_v1::{self, WpLinuxDrmSyncobjManagerV1},
@@ -59,23 +55,16 @@ use super::{
     dmabuf::get_dmabuf,
 };
 use crate::{
-    backend::drm::DrmDeviceFd,
+    backend::drm::{
+        sync::{DrmTimeline, WeakDrmTimeline},
+        DrmDeviceFd,
+    },
     wayland::{Dispatch2, GlobalData, GlobalDispatch2},
 };
 
-mod sync_point;
-pub use sync_point::*;
-
-/// Test if DRM device supports `syncobj_eventfd`.
-// Similar to test used in Mutter
-pub fn supports_syncobj_eventfd(device: &DrmDeviceFd) -> bool {
-    // Pass device as placeholder for eventfd as well, since `drm_ffi` requires
-    // a valid fd.
-    match drm_ffi::syncobj::eventfd(device.as_fd(), 0, 0, device.as_fd(), false) {
-        Ok(_) => unreachable!(),
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-    }
-}
+pub use crate::backend::drm::sync::{
+    DrmSyncPoint, DrmSyncPointBlocker, DrmSyncPointSource, supports_syncobj_eventfd,
+};
 
 /// Handler trait for DRM syncobj protocol.
 pub trait DrmSyncobjHandler {
@@ -124,7 +113,7 @@ impl Cacheable for DrmSyncobjCachedState {
 pub struct DrmSyncobjState {
     global: GlobalId,
     import_device: Option<DrmDeviceFd>,
-    known_timelines: Vec<Weak<DrmTimelineInner>>,
+    known_timelines: Vec<WeakDrmTimeline>,
 }
 
 impl DrmSyncobjState {
@@ -170,7 +159,7 @@ impl DrmSyncobjState {
 
     /// Sets a new `import_device` to import the syncobj fds and wait on them.
     pub fn update_device(&mut self, import_device: DrmDeviceFd) {
-        for timeline in self.known_timelines.iter().filter_map(Weak::upgrade) {
+        for timeline in self.known_timelines.iter().filter_map(WeakDrmTimeline::upgrade) {
             if let Err(err) = timeline.update_device(&import_device) {
                 warn!(?err, "Failed to update existing timeline");
             }
@@ -183,7 +172,7 @@ impl DrmSyncobjState {
     /// Note: This will cause any future timeline import to raise a protocol error for
     /// clients that have bound this protocol until [`DrmSyncobjHandler::drm_syncobj_state`] returns `Some` again.
     pub fn into_global(self) -> GlobalId {
-        for timeline in self.known_timelines.iter().filter_map(Weak::upgrade) {
+        for timeline in self.known_timelines.iter().filter_map(WeakDrmTimeline::upgrade) {
             timeline.invalidate();
         }
         self.global
@@ -348,7 +337,7 @@ where
                 if let Some(state) = state.drm_syncobj_state() {
                     match state.import_device.as_ref().map(|dev| DrmTimeline::new(dev, fd)) {
                         Some(Ok(timeline)) => {
-                            state.known_timelines.push(Arc::downgrade(&timeline.0));
+                            state.known_timelines.push(timeline.downgrade());
                             data_init.init::<_, _>(id, DrmSyncobjTimelineData { timeline });
                         }
                         Some(Err(err)) => {
@@ -511,7 +500,7 @@ impl<D: DrmSyncobjHandler> Dispatch2<WpLinuxDrmSyncobjTimelineV1, D> for DrmSync
         if let Some(state) = state.drm_syncobj_state() {
             state
                 .known_timelines
-                .retain(|t| t.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &self.timeline.0)))
+                .retain(|t| t.upgrade().is_some_and(|t| t != self.timeline))
         }
     }
 }
