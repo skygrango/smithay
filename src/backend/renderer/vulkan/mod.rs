@@ -67,6 +67,10 @@ pub struct VulkanRenderer {
     timeline: sync::VulkanTimeline,
     pub(crate) node: Option<DrmNode>,
 
+    debug_flags: super::DebugFlags,
+    downscale_filter: super::TextureFilter,
+    upscale_filter: super::TextureFilter,
+
     // A bunch of the previous structs contain Weak-device references.
     // So we want to drop this last for proper cleanup and avoiding accidental
     // resource leaks.
@@ -78,6 +82,7 @@ impl Drop for VulkanRenderer {
         unsafe { self.device.vk().destroy_sampler(self.texture_sampler, None) };
     }
 }
+
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -113,6 +118,15 @@ pub enum Error {
     DrmError(#[source] std::io::Error),
     #[error("Underlying Vulkan Device was destroyed")]
     DeadDevice,
+    #[cfg(feature = "wayland_frontend")]
+    #[error("Unsupported wl_shm pixel format: `{0:?}`")]
+    UnsupportedWlPixelFormat(wayland_server::protocol::wl_shm::Format),
+    #[error("Buffer access error")]
+    BufferAccessError,
+    #[error("Unsupported pixel format")]
+    UnsupportedPixelFormat,
+    #[error("GLES error: {0}")]
+    GlesError(String),
 }
 
 impl VulkanRenderer {
@@ -125,8 +139,8 @@ impl VulkanRenderer {
         // Check matching drm descriptor, if provided
         let node = if let Some(fd) = drm.as_ref() {
             let node = DrmNode::from_file(fd).map_err(|_| Error::MismatchedDrmDevice)?;
-            if !(phd.render_node().ok().flatten().is_some_and(|node| node == node)
-                || phd.primary_node().ok().flatten().is_some_and(|node| node == node))
+            if !(phd.render_node().ok().flatten().is_some_and(|n| n == node)
+                || phd.primary_node().ok().flatten().is_some_and(|n| n == node))
             {
                 return Err(Error::MismatchedDrmDevice);
             }
@@ -218,6 +232,9 @@ impl VulkanRenderer {
             seq_no: 0,
             node,
             timeline,
+            debug_flags: super::DebugFlags::empty(),
+            downscale_filter: super::TextureFilter::Linear,
+            upscale_filter: super::TextureFilter::Linear,
         })
     }
 
@@ -229,6 +246,77 @@ impl VulkanRenderer {
                 .map_err(Error::SemaphoreError)?
         };
         self.cmd_pool.clean_old_buffers(val);
+        Ok(())
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn upload_shm_memory_to_image(
+        &self,
+        image: &VulkanImage,
+        ptr: *const u8,
+        stride: i32,
+        region: Rectangle<i32, BufferCoords>,
+    ) -> Result<(), Error> {
+        use ash::ext::host_image_copy;
+
+        if region.size.w <= 0 || region.size.h <= 0 {
+            return Ok(());
+        }
+
+        let device_copy = self
+            .device
+            .vk_ext_host_image_copy()
+            .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
+
+        let host_ptr = unsafe {
+            ptr.offset((region.loc.y as isize * stride as isize) + (region.loc.x as isize * 4))
+        };
+
+        unsafe {
+            device_copy
+                .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
+                    .old_layout(ImageLayout::UNDEFINED)
+                    .new_layout(ImageLayout::GENERAL)
+                    .image(*image.vk())
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .layer_count(1)
+                            .level_count(1),
+                    )])
+                .map_err(Error::HostImageTransitionError)?;
+            device_copy
+                .copy_memory_to_image(
+                    &vk::CopyMemoryToImageInfoEXT::default()
+                        .flags(HostImageCopyFlagsEXT::MEMCPY)
+                        .dst_image(*image.vk())
+                        .dst_image_layout(ImageLayout::GENERAL)
+                        .regions(&[MemoryToImageCopyEXT::default()
+                            .host_pointer(host_ptr as *const _)
+                            .memory_row_length((stride / 4) as u32)
+                            .memory_image_height(0)
+                            .image_subresource(
+                                ImageSubresourceLayers::default()
+                                    .aspect_mask(ImageAspectFlags::COLOR)
+                                    .mip_level(0)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .image_offset(Offset3D {
+                                x: region.loc.x,
+                                y: region.loc.y,
+                                z: 0,
+                            })
+                            .image_extent(
+                                Extent3D::default()
+                                    .depth(1)
+                                    .width(region.size.w as u32)
+                                    .height(region.size.h as u32),
+                            )]),
+                )
+                .map_err(Error::HostImageCopyError)?;
+        }
+
         Ok(())
     }
 }
@@ -251,19 +339,21 @@ impl Renderer for VulkanRenderer {
     }
 
     fn downscale_filter(&mut self, filter: super::TextureFilter) -> Result<(), Self::Error> {
-        todo!()
+        self.downscale_filter = filter;
+        Ok(())
     }
 
     fn upscale_filter(&mut self, filter: super::TextureFilter) -> Result<(), Self::Error> {
-        todo!()
+        self.upscale_filter = filter;
+        Ok(())
     }
 
     fn set_debug_flags(&mut self, flags: super::DebugFlags) {
-        todo!()
+        self.debug_flags = flags;
     }
 
     fn debug_flags(&self) -> super::DebugFlags {
-        todo!()
+        self.debug_flags
     }
 
     fn render<'frame, 'buffer>(
@@ -286,10 +376,12 @@ impl Renderer for VulkanRenderer {
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        todo!()
+        while let Err(super::sync::Interrupted) = sync.wait() {}
+        Ok(())
     }
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
+        self.dmabuf_cache.retain(|weak, _| weak.upgrade().is_some());
         Ok(())
     }
 }
@@ -371,7 +463,63 @@ impl ImportMem for VulkanRenderer {
         data: &[u8],
         region: Rectangle<i32, BufferCoords>,
     ) -> Result<(), Self::Error> {
-        todo!()
+        if region.size.w <= 0 || region.size.h <= 0 {
+            return Ok(());
+        }
+
+        use ash::ext::host_image_copy;
+
+        let device_copy = self
+            .device
+            .vk_ext_host_image_copy()
+            .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
+
+        unsafe {
+            device_copy
+                .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
+                    .old_layout(ImageLayout::UNDEFINED)
+                    .new_layout(ImageLayout::GENERAL)
+                    .image(*texture.vk())
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .layer_count(1)
+                            .level_count(1),
+                    )])
+                .map_err(Error::HostImageTransitionError)?;
+            device_copy
+                .copy_memory_to_image(
+                    &vk::CopyMemoryToImageInfoEXT::default()
+                        .flags(HostImageCopyFlagsEXT::MEMCPY)
+                        .dst_image(*texture.vk())
+                        .dst_image_layout(ImageLayout::GENERAL)
+                        .regions(&[MemoryToImageCopyEXT::default()
+                            .host_pointer(data.as_ptr() as *const _)
+                            .memory_row_length(0)
+                            .memory_image_height(0)
+                            .image_subresource(
+                                ImageSubresourceLayers::default()
+                                    .aspect_mask(ImageAspectFlags::COLOR)
+                                    .mip_level(0)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .image_offset(Offset3D {
+                                x: region.loc.x,
+                                y: region.loc.y,
+                                z: 0,
+                            })
+                            .image_extent(
+                                Extent3D::default()
+                                    .depth(1)
+                                    .width(region.size.w as u32)
+                                    .height(region.size.h as u32),
+                            )]),
+                )
+                .map_err(Error::HostImageCopyError)?;
+        }
+
+        Ok(())
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -416,6 +564,95 @@ impl ImportDma for VulkanRenderer {
         self.device.formats().any(|entry| entry.format == format)
     }
 }
+
+#[cfg(feature = "wayland_frontend")]
+impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
+    #[profiling::function]
+    fn import_shm_buffer(
+        &mut self,
+        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoords>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        use crate::wayland::shm::{shm_format_to_fourcc, with_buffer_contents};
+
+        type CacheMap = HashMap<ContextId<VulkanImage>, VulkanImage>;
+
+        let mut surface_lock = surface.as_ref().map(|surface_data| {
+            surface_data
+                .data_map
+                .get_or_insert_threadsafe(|| std::sync::Arc::new(std::sync::Mutex::new(CacheMap::new())))
+                .lock()
+                .unwrap()
+        });
+
+        with_buffer_contents(buffer, |ptr, len, data| {
+            let offset = data.offset;
+            let width = data.width;
+            let height = data.height;
+            let stride = data.stride;
+            let fourcc = shm_format_to_fourcc(data.format)
+                .ok_or(Error::UnsupportedWlPixelFormat(data.format))?;
+
+            if !self.mem_formats().any(|f| f == fourcc) {
+                return Err(Error::UnsupportedWlPixelFormat(data.format));
+            }
+
+            let expected_len = (offset + stride * height) as usize;
+            if len < expected_len {
+                return Err(Error::BufferAccessError);
+            }
+
+            let size = (width, height).into();
+            let id = self.context_id();
+            let expected_vk_format = get_vk_format(fourcc).unwrap_or(vk::Format::UNDEFINED);
+            let cached_texture = surface_lock
+                .as_ref()
+                .and_then(|cache| cache.get(&id).cloned())
+                .filter(|texture| texture.size() == size && texture.format() == expected_vk_format);
+
+            let base_ptr = unsafe { ptr.offset(offset as isize) };
+
+            let texture = if let Some(texture) = cached_texture {
+                if damage.is_empty() {
+                    self.upload_shm_memory_to_image(&texture, base_ptr, stride, Rectangle::from_size(size))?;
+                } else {
+                    let buffer_rect = Rectangle::from_size(size);
+                    for region in damage.iter().filter_map(|r| r.intersection(buffer_rect)) {
+                        self.upload_shm_memory_to_image(&texture, base_ptr, stride, region)?;
+                    }
+                }
+                texture
+            } else {
+                let image = VulkanImage::new_exportable(
+                    &self.device,
+                    width as u32,
+                    height as u32,
+                    fourcc,
+                    std::iter::once(Modifier::Linear),
+                    vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
+                )
+                .map_err(Error::ImageError)?;
+
+                self.upload_shm_memory_to_image(&image, base_ptr, stride, Rectangle::from_size(size))?;
+
+                if let Some(cache) = surface_lock.as_mut() {
+                    cache.insert(id, image.clone());
+                }
+                image
+            };
+            Ok(texture)
+        })
+        .map_err(|_| Error::BufferAccessError)?
+    }
+
+    fn shm_formats(&self) -> Box<dyn Iterator<Item = wayland_server::protocol::wl_shm::Format>> {
+        Box::new(self.mem_formats().filter_map(crate::wayland::shm::fourcc_to_shm_format))
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl crate::backend::renderer::ImportDmaWl for VulkanRenderer {}
 
 pub enum VulkanMapping {
     Mapped(NonNull<u8>, usize, VulkanImage, WeakDevice),
@@ -808,7 +1045,7 @@ impl Frame for VulkanFrame<'_, '_> {
                             .size
                             .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
 
-                        dbg!(Rectangle::new(rect_constrained_loc, rect_clamped_size))
+                        Rectangle::new(rect_constrained_loc, rect_clamped_size)
                     })
                     .chain(std::iter::repeat_with(Rectangle::zero))
                     .take(4)
@@ -903,7 +1140,7 @@ impl Frame for VulkanFrame<'_, '_> {
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        todo!()
+        self.renderer.wait(sync)
     }
 
     fn finish(self) -> Result<SyncPoint, Self::Error> {
@@ -1028,7 +1265,7 @@ impl VulkanFrame<'_, '_> {
                             .size
                             .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
 
-                        dbg!(Rectangle::new(rect_constrained_loc, rect_clamped_size))
+                        Rectangle::new(rect_constrained_loc, rect_clamped_size)
                     })
                     .chain(std::iter::repeat_with(Rectangle::zero))
                     .take(6)
@@ -1125,12 +1362,19 @@ impl Bind<VulkanImage> for VulkanRenderer {
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        let image = VulkanImage::new_from_dmabuf(
-            &self.device,
-            target,
-            ImageUsageFlags::STORAGE | ImageUsageFlags::TRANSFER_SRC,
-        )
-        .map_err(Error::ImageError)?;
+        let image = match self.dmabuf_cache.get(&target.weak()) {
+            Some(image) if image.vk_usage().contains(ImageUsageFlags::STORAGE) => image.clone(),
+            _ => {
+                let image = VulkanImage::new_from_dmabuf(
+                    &self.device,
+                    target,
+                    ImageUsageFlags::STORAGE | ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::SAMPLED,
+                )
+                .map_err(Error::ImageError)?;
+                self.dmabuf_cache.insert(target.weak(), image.clone());
+                image
+            }
+        };
         Ok(VulkanFramebuffer(image))
     }
 

@@ -123,3 +123,35 @@ impl Drop for GlesPixelProgramInner {
             .send(CleanupResource::Program(self.debug.program));
     }
 }
+
+impl GlesPixelProgram {
+    /// Creates a dummy pixel program that does not reference any OpenGL resources.
+    pub fn dummy() -> Self {
+        let (sender, _) = std::sync::mpsc::channel();
+        GlesPixelProgram(Arc::new(GlesPixelProgramInner {
+            normal: GlesPixelProgramInternal {
+                program: 0,
+                uniform_matrix: 0,
+                uniform_tex_matrix: 0,
+                uniform_size: 0,
+                uniform_alpha: 0,
+                attrib_vert: 0,
+                attrib_position: 0,
+                additional_uniforms: HashMap::new(),
+            },
+            debug: GlesPixelProgramInternal {
+                program: 0,
+                uniform_matrix: 0,
+                uniform_tex_matrix: 0,
+                uniform_size: 0,
+                uniform_alpha: 0,
+                attrib_vert: 0,
+                attrib_position: 0,
+                additional_uniforms: HashMap::new(),
+            },
+            destruction_callback_sender: sender,
+            uniform_tint: 0,
+        }))
+    }
+}
+

@@ -68,6 +68,18 @@ impl PixelShaderElement {
         self.additional_uniforms = additional_uniforms.into_iter().map(|u| u.into_owned()).collect();
         self.commit_counter.increment();
     }
+
+    /// Creates a dummy pixel shader element that performs no rendering.
+    pub fn dummy() -> Self {
+        Self::new(
+            GlesPixelProgram::dummy(),
+            Rectangle::zero(),
+            None,
+            0.0,
+            Vec::new(),
+            Kind::Unspecified,
+        )
+    }
 }
 
 impl Element for PixelShaderElement {
