@@ -1970,7 +1970,7 @@ where
                         )?
                         .reply_unchecked()?
                     {
-                        if prop.type_ == AtomEnum::ATOM.into() {
+                        if prop.type_ == u32::from(AtomEnum::ATOM) {
                             if let Some(values) = prop.value32() {
                                 let mime_types = values
                                     .filter_map(|val| match val {
@@ -1987,7 +1987,7 @@ where
                         }
                     }
                 }
-                x if x == AtomEnum::NONE.into() => {
+                x if x == u32::from(AtomEnum::NONE) => {
                     // transfer failed
                     if let Some(transfer) = selection.incoming.remove(&n.requestor) {
                         transfer.destroy(loop_handle);

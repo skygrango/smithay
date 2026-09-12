@@ -151,6 +151,7 @@ pub fn update_hdr_surface_uniforms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::renderer::Color32F;
 
     #[test]
     fn srgb_endpoints_decode_to_linear_endpoints() {

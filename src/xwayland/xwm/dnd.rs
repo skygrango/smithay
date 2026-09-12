@@ -982,7 +982,7 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
                 .ok()?
                 .reply()
                 .ok()?;
-            if prop.type_ != AtomEnum::ATOM.into() {
+            if prop.type_ != u32::from(AtomEnum::ATOM) {
                 return None;
             }
             let client_ver = prop.value32()?.next()?;

@@ -1560,11 +1560,11 @@ impl X11Surface {
 
     pub(super) fn update_property(&self, atom: Atom) -> Result<Option<WmWindowProperty>, ConnectionError> {
         match atom {
-            atom if atom == self.atoms._NET_WM_NAME || atom == AtomEnum::WM_NAME.into() => {
+            atom if atom == self.atoms._NET_WM_NAME || atom == u32::from(AtomEnum::WM_NAME) => {
                 self.update_title()?;
                 Ok(Some(WmWindowProperty::Title))
             }
-            atom if atom == AtomEnum::WM_CLASS.into() => {
+            atom if atom == u32::from(AtomEnum::WM_CLASS) => {
                 self.update_class()?;
                 Ok(Some(WmWindowProperty::Class))
             }
@@ -1576,11 +1576,11 @@ impl X11Surface {
                 self.update_hints()?;
                 Ok(Some(WmWindowProperty::Hints))
             }
-            atom if atom == AtomEnum::WM_NORMAL_HINTS.into() => {
+            atom if atom == u32::from(AtomEnum::WM_NORMAL_HINTS) => {
                 self.update_normal_hints()?;
                 Ok(Some(WmWindowProperty::NormalHints))
             }
-            atom if atom == AtomEnum::WM_TRANSIENT_FOR.into() => {
+            atom if atom == u32::from(AtomEnum::WM_TRANSIENT_FOR) => {
                 self.update_transient_for()?;
                 Ok(Some(WmWindowProperty::TransientFor))
             }
@@ -1922,7 +1922,7 @@ impl X11Surface {
         let bytes = bytes.collect::<Vec<u8>>();
 
         match reply.type_ {
-            x if x == AtomEnum::STRING.into() => Ok(Some(WINDOWS_1252.decode(&bytes).0.to_string())),
+            x if x == u32::from(AtomEnum::STRING) => Ok(Some(WINDOWS_1252.decode(&bytes).0.to_string())),
             x if x == self.atoms.UTF8_STRING => Ok(String::from_utf8(bytes).ok()),
             _ => Ok(None),
         }
