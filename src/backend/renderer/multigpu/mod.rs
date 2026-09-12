@@ -826,6 +826,19 @@ impl<'render, 'target, R: GraphicsApi, T: GraphicsApi> MultiRenderer<'render, 't
         self.target.as_mut().map(|data| data.device.renderer_mut())
     }
 
+    /// The DRM node of the render device.
+    pub fn node(&self) -> &crate::reexports::drm::node::DrmNode {
+        self.render.node()
+    }
+
+    /// The DRM node of the target device, or render device if no target device is configured.
+    pub fn target_node(&self) -> &crate::reexports::drm::node::DrmNode {
+        self.target
+            .as_ref()
+            .map(|data| data.device.node())
+            .unwrap_or_else(|| self.render.node())
+    }
+
     /// The devices of the render-api, starting with the render-device.
     fn render_devices(&mut self) -> impl Iterator<Item = &mut R::Device> {
         std::iter::once(&mut *self.render).chain(self.other_renderers.iter_mut().map(|dev| &mut **dev))

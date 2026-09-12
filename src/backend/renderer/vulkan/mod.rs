@@ -281,6 +281,10 @@ impl VulkanRenderer {
         self.hdr_config
     }
 
+    pub fn node(&self) -> Option<DrmNode> {
+        self.node
+    }
+
     pub fn cleanup(&mut self) -> Result<(), Error> {
         let val = unsafe {
             self.device
