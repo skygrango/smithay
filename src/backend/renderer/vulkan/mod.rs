@@ -1850,6 +1850,28 @@ impl Bind<VulkanImage> for VulkanRenderer {
     }
 }
 
+impl super::Offscreen<VulkanImage> for VulkanRenderer {
+    fn create_buffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoords>,
+    ) -> Result<VulkanImage, Self::Error> {
+        let usage = ImageUsageFlags::STORAGE
+            | ImageUsageFlags::TRANSFER_SRC
+            | ImageUsageFlags::TRANSFER_DST
+            | ImageUsageFlags::SAMPLED;
+        VulkanImage::new_with_fourcc(
+            &self.device,
+            size.w as u32,
+            size.h as u32,
+            format,
+            usage,
+            false,
+        )
+        .map_err(Error::ImageError)
+    }
+}
+
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
         use crate::backend::allocator::Buffer as AllocBuffer;
