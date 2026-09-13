@@ -775,6 +775,21 @@ where
             render_elements,
         )
     }
+
+    /// Returns the overall hardware scanout capabilities of the underlying surface.
+    pub fn scanout_capabilities(
+        &self,
+    ) -> FrameResult<crate::backend::drm::color::DrmScanoutCapabilities, A, F> {
+        self.with_compositor(|compositor| compositor.scanout_capabilities())
+    }
+
+    /// Stages a CRTC color state (DEGAMMA_LUT, CTM, GAMMA_LUT) on the underlying surface.
+    pub fn use_crtc_color_state(
+        &self,
+        color_state: crate::backend::drm::color::CrtcColorState,
+    ) -> FrameResult<(), A, F> {
+        self.with_compositor(|compositor| compositor.use_crtc_color_state(color_state))
+    }
 }
 
 impl<A, F, U, G> DrmOutput<A, F, U, G>

@@ -20,6 +20,8 @@
 //! `smithay-drm-extras`' `display_info` module and libdisplay-info's
 //! `Info::hdr_static_metadata()` / `Info::supported_signal_colorimetry()`.
 
+use crate::backend::allocator::format::FormatSet;
+
 /// Value of the `Colorspace` connector property.
 ///
 /// This selects the colorimetry signalled to the sink in the AVI infoframe (HDMI) or MSA/SDP
@@ -235,12 +237,15 @@ impl ConnectorColorState {
 /// Encodes normalized absolute luminance (0.0 to 1.0, where 1.0 = 10,000 cd/m²) to a ST 2084 (PQ) code value.
 #[inline]
 pub fn encode_pq(value: f32) -> f32 {
+    if value <= 0.0 {
+        return 0.0;
+    }
     const M1: f32 = 0.159_301_76;
     const M2: f32 = 78.84375;
     const C1: f32 = 0.8359375;
     const C2: f32 = 18.851_563;
     const C3: f32 = 18.6875;
-    let p = value.max(0.0).powf(M1);
+    let p = value.powf(M1);
     ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
 }
 
@@ -292,6 +297,77 @@ impl DrmColorLut {
         for i in 0..size {
             let val = (i as f32) / denom;
             lut.push(Self::from_rgb(val, val, val));
+        }
+        lut
+    }
+
+    /// Generates an sRGB degamma hardware lookup table (non-linear sRGB to linear radiance [0.0, 1.0]).
+    pub fn create_srgb_degamma_lut(size: usize) -> Vec<Self> {
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let input = (i as f32) / denom;
+            let linear = if input <= 0.04045 {
+                input / 12.92
+            } else {
+                ((input + 0.055) / 1.055).powf(2.4)
+            };
+            lut.push(Self::from_rgb(linear, linear, linear));
+        }
+        lut
+    }
+
+    /// Generates an sRGB gamma hardware lookup table (linear radiance [0.0, 1.0] to non-linear sRGB).
+    pub fn create_srgb_gamma_lut(size: usize) -> Vec<Self> {
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let linear = (i as f32) / denom;
+            let non_linear = if linear <= 0.0031308 {
+                12.92 * linear
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            lut.push(Self::from_rgb(non_linear, non_linear, non_linear));
+        }
+        lut
+    }
+
+    /// Generates a SMPTE ST.2084 PQ degamma hardware lookup table (PQ code values [0.0, 1.0] to linear luminance [0.0, 1.0]).
+    pub fn create_pq_degamma_lut(size: usize) -> Vec<Self> {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = (2523.0 / 4096.0) * 128.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = (2413.0 / 4096.0) * 32.0;
+        let c3 = (2392.0 / 4096.0) * 32.0;
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f64;
+        for i in 0..size {
+            let v = (i as f64) / denom;
+            let v_m2 = v.powf(1.0 / m2);
+            let num = (v_m2 - c1).max(0.0);
+            let den = (c2 - c3 * v_m2).max(1e-6);
+            let linear = (num / den).powf(1.0 / m1) as f32;
+            lut.push(Self::from_rgb(linear, linear, linear));
+        }
+        lut
+    }
+
+    /// Generates an ARIB STD-B67 HLG degamma hardware lookup table (HLG code values [0.0, 1.0] to linear radiance [0.0, 1.0]).
+    pub fn create_hlg_degamma_lut(size: usize) -> Vec<Self> {
+        let a = 0.17883277f32;
+        let b = 1.0 - 4.0 * a;
+        let c = 0.5 - a * ((4.0 * a).ln());
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let e = (i as f32) / denom;
+            let linear = if e <= 0.5 {
+                (e * e) / 3.0
+            } else {
+                (((e - c) / a).exp() + b) / 12.0
+            };
+            lut.push(Self::from_rgb(linear, linear, linear));
         }
         lut
     }
@@ -366,6 +442,38 @@ impl DrmColorCtm {
             [0.0163916, 0.0880132, 0.8955950],
         ])
     }
+
+    /// Linear Rec.709 to BT.2020 color gamut matrix scaled by a luminance factor.
+    pub fn rec709_to_bt2020_scaled(scale: f64) -> Self {
+        Self::from_3x3([
+            [0.6274040 * scale, 0.3292820 * scale, 0.0433136 * scale],
+            [0.0690970 * scale, 0.9195400 * scale, 0.0113612 * scale],
+            [0.0163916 * scale, 0.0880132 * scale, 0.8955950 * scale],
+        ])
+    }
+
+    /// Linear BT.2020 to Rec.709 color gamut matrix (row-major).
+    pub fn bt2020_to_rec709() -> Self {
+        Self::from_3x3([
+            [1.6604910, -0.5876411, -0.0728499],
+            [-0.1245505, 1.1328999, -0.0083494],
+            [-0.0181508, -0.1005789, 1.1187297],
+        ])
+    }
+
+    /// Linear BT.2020 to Rec.709 color gamut matrix scaled by a luminance factor.
+    pub fn bt2020_to_rec709_scaled(scale: f64) -> Self {
+        Self::from_3x3([
+            [1.6604910 * scale, -0.5876411 * scale, -0.0728499 * scale],
+            [-0.1245505 * scale, 1.1328999 * scale, -0.0083494 * scale],
+            [-0.0181508 * scale, -0.1005789 * scale, 1.1187297 * scale],
+        ])
+    }
+
+    /// Identity matrix scaled by a luminance factor.
+    pub fn identity_scaled(scale: f64) -> Self {
+        Self::from_3x3([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, scale]])
+    }
 }
 
 /// CRTC hardware color management pipeline configuration.
@@ -377,6 +485,401 @@ pub struct CrtcColorState {
     pub ctm: Option<DrmColorCtm>,
     /// Pre-blending degamma lookup table (DEGAMMA_LUT).
     pub degamma_lut: Option<Vec<DrmColorLut>>,
+}
+
+/// CRTC hardware color capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrtcColorCapabilities {
+    /// Whether the CRTC supports a post-blending gamma lookup table (GAMMA_LUT).
+    pub has_gamma_lut: bool,
+    /// Maximum size of the hardware GAMMA_LUT in entries.
+    pub gamma_lut_size: u64,
+    /// Whether the CRTC supports a pre-blending degamma lookup table (DEGAMMA_LUT).
+    pub has_degamma_lut: bool,
+    /// Maximum size of the hardware DEGAMMA_LUT in entries.
+    pub degamma_lut_size: u64,
+    /// Whether the CRTC supports a hardware color transformation matrix (CTM).
+    pub has_ctm: bool,
+}
+
+/// Color transformation to be executed on the KMS plane or CRTC for direct scanout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaneColorConversion {
+    /// scRGB (Extended Linear Rec.709 FP16) to BT.2020 PQ.
+    ScRgbToPq { reference_white: u16 },
+    /// SDR (sRGB Rec.709 8/10-bit) to BT.2020 PQ.
+    SrgbToPq { reference_white: u16 },
+    /// HLG to BT.2020 PQ.
+    HlgToPq { reference_white: u16 },
+    /// scRGB (Extended Linear Rec.709 FP16) to SDR Rec.709 sRGB.
+    ScRgbToSrgb,
+    /// BT.2020 PQ (HDR10) to SDR Rec.709 sRGB.
+    PqToSrgb,
+    /// HLG to SDR Rec.709 sRGB.
+    HlgToSrgb,
+}
+
+impl PlaneColorConversion {
+    /// Builds the CRTC color state needed to perform this conversion in display hardware.
+    pub fn to_crtc_color_state(&self, gamma_lut_size: usize, degamma_lut_size: usize) -> CrtcColorState {
+        let gamma_size = if gamma_lut_size > 0 { gamma_lut_size } else { 4096 };
+        match self {
+            PlaneColorConversion::ScRgbToPq { reference_white } => {
+                let ref_white = if *reference_white > 0 {
+                    *reference_white
+                } else {
+                    80
+                };
+                // scRGB values span from negative (out-of-Rec.709 wide-gamut colors) to
+                // > 1.0 (HDR highlights up to 125.0 for 10,000 cd/m² with 80 cd/m² nominal white).
+                // Hardware 1D LUT (GAMMA_LUT) input domain is fixed to [0.0, 1.0].
+                // We pre-scale in CTM by (ref_white / 10,000.0) so that all positive luminance
+                // up to 10,000 cd/m² maps continuously into [0.0, 1.0] without clamping highlights,
+                // and Rec.709 primaries rotate into BT.2020 primaries turning wide-gamut coordinates
+                // non-negative.
+                let scale = (ref_white as f64) / 10000.0;
+                let ctm = DrmColorCtm::rec709_to_bt2020_scaled(scale);
+                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, 10000.0);
+                CrtcColorState {
+                    degamma_lut: None,
+                    ctm: Some(ctm),
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+            PlaneColorConversion::SrgbToPq { reference_white } => {
+                let ref_white = if *reference_white > 0 {
+                    *reference_white
+                } else {
+                    203
+                };
+                // SDR input is strictly in [0.0, 1.0] (no out-of-gamut negative values, no >1.0 highlights).
+                // DEGAMMA linearizes non-linear sRGB into linear [0.0, 1.0].
+                // CTM rotates Rec.709 primaries into BT.2020 primaries with row sums = 1.0, keeping values in [0.0, 1.0].
+                // GAMMA_LUT scales linear [0.0, 1.0] to PQ [0, ref_white], utilizing 100% of all LUT entries
+                // to maintain deep blacks, full contrast, and prevent washed-out visuals.
+                let ctm = DrmColorCtm::rec709_to_bt2020();
+                let degamma_lut = if degamma_lut_size > 0 {
+                    Some(DrmColorLut::create_srgb_degamma_lut(degamma_lut_size))
+                } else {
+                    None
+                };
+                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, ref_white as f32);
+                CrtcColorState {
+                    degamma_lut,
+                    ctm: Some(ctm),
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+            PlaneColorConversion::HlgToPq { reference_white } => {
+                let ref_white = if *reference_white > 0 {
+                    *reference_white
+                } else {
+                    1000
+                };
+                // HLG is already BT.2020 color primaries, input strictly in [0.0, 1.0].
+                // DEGAMMA converts HLG to linear [0.0, 1.0].
+                // GAMMA_LUT scales linear [0.0, 1.0] to PQ [0, ref_white].
+                let degamma_lut = if degamma_lut_size > 0 {
+                    Some(DrmColorLut::create_hlg_degamma_lut(degamma_lut_size))
+                } else {
+                    None
+                };
+                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, ref_white as f32);
+                CrtcColorState {
+                    degamma_lut,
+                    ctm: None,
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+            PlaneColorConversion::ScRgbToSrgb => {
+                let gamma_lut = DrmColorLut::create_srgb_gamma_lut(gamma_size);
+                CrtcColorState {
+                    degamma_lut: None,
+                    ctm: None,
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+            PlaneColorConversion::PqToSrgb => {
+                let degamma_lut = if degamma_lut_size > 0 {
+                    Some(DrmColorLut::create_pq_degamma_lut(degamma_lut_size))
+                } else {
+                    None
+                };
+                let ctm = DrmColorCtm::bt2020_to_rec709();
+                let gamma_lut = DrmColorLut::create_srgb_gamma_lut(gamma_size);
+                CrtcColorState {
+                    degamma_lut,
+                    ctm: Some(ctm),
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+            PlaneColorConversion::HlgToSrgb => {
+                let degamma_lut = if degamma_lut_size > 0 {
+                    Some(DrmColorLut::create_hlg_degamma_lut(degamma_lut_size))
+                } else {
+                    None
+                };
+                let ctm = DrmColorCtm::bt2020_to_rec709();
+                let gamma_lut = DrmColorLut::create_srgb_gamma_lut(gamma_size);
+                CrtcColorState {
+                    degamma_lut,
+                    ctm: Some(ctm),
+                    gamma_lut: Some(gamma_lut),
+                }
+            }
+        }
+    }
+}
+
+/// The scanout execution plan evaluated for a fullscreen client surface,
+/// following the strict efficiency hierarchy:
+/// DirectPassthrough -> PlaneColorop -> CrtcHardware -> VulkanFastDirectFlip
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanoutPlan {
+    /// 1. Passthrough direct scanout: Client color characteristics match the output pipeline.
+    /// Zero transformation on both GPU and Display Engine (0% GPU, 0% display color pipe).
+    /// (Native BT.2020 PQ on HDR output, or sRGB/Rec.709 on SDR output).
+    #[default]
+    DirectPassthrough,
+    /// 2. DRM Plane Colorop direct scanout:
+    /// Transformation occurs on the KMS Plane COLOR_PIPELINE before blending (0% GPU).
+    PlaneColorop(PlaneColorConversion),
+    /// 3. DRM CRTC Color Management direct scanout:
+    /// Transformation occurs on the KMS CRTC (DEGAMMA_LUT, CTM, GAMMA_LUT) after blending (0% GPU).
+    CrtcHardware(PlaneColorConversion),
+    /// 4. Fast GPU Shader Scanout:
+    /// Fallback path when hardware Colorop/CRTC cannot handle or atomic test fails.
+    /// Vulkan renderer compute/fragment shader directly transforms 1:1 into swapchain scanout buffer.
+    VulkanFastDirectFlip,
+}
+
+impl ScanoutPlan {
+    /// Returns whether this plan attempts zero-copy direct scanout on the primary plane.
+    #[inline]
+    pub fn allows_primary_scanout(&self) -> bool {
+        matches!(
+            self,
+            ScanoutPlan::DirectPassthrough | ScanoutPlan::PlaneColorop(_) | ScanoutPlan::CrtcHardware(_)
+        )
+    }
+
+    /// Returns the hardware color conversion if this plan requires CRTC color state modification.
+    #[inline]
+    pub fn requires_crtc_color_state(&self) -> Option<PlaneColorConversion> {
+        match self {
+            ScanoutPlan::CrtcHardware(conv) => Some(*conv),
+            _ => None,
+        }
+    }
+
+    /// Returns the hardware color conversion if this plan requires Plane COLOR_PIPELINE modification.
+    #[inline]
+    pub fn requires_plane_colorop(&self) -> Option<PlaneColorConversion> {
+        match self {
+            ScanoutPlan::PlaneColorop(conv) => Some(*conv),
+            _ => None,
+        }
+    }
+}
+
+/// Overall DRM hardware scanout capabilities for a display surface.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DrmScanoutCapabilities {
+    /// Color capabilities of the driving CRTC.
+    pub crtc_color: CrtcColorCapabilities,
+    /// Whether the primary plane supports DRM COLOR_PIPELINE (colorop).
+    pub supports_plane_colorop: bool,
+    /// Supported pixel formats on the primary plane.
+    pub primary_plane_formats: FormatSet,
+    /// Whether the primary plane supports FP16 formats (e.g. ABGR16161616F / XBGR16161616F).
+    pub supports_fp16: bool,
+    /// Whether the primary plane supports 10-bit formats (e.g. XRGB2101010 / XBGR2101010).
+    pub supports_10bit: bool,
+}
+
+impl DrmScanoutCapabilities {
+    /// Whether the hardware can directly scan out scRGB FP16 content via CRTC color management.
+    pub fn supports_scrgb_hardware_scanout(&self) -> bool {
+        self.supports_fp16 && self.crtc_color.has_gamma_lut && self.crtc_color.has_ctm
+    }
+
+    /// Whether the hardware can directly scan out SDR content onto an HDR output via CRTC color management.
+    pub fn supports_sdr_to_hdr_hardware_scanout(&self) -> bool {
+        self.crtc_color.has_degamma_lut && self.crtc_color.has_gamma_lut && self.crtc_color.has_ctm
+    }
+
+    /// Whether the hardware can directly scan out HLG content onto an HDR output via CRTC color management.
+    pub fn supports_hlg_to_hdr_hardware_scanout(&self) -> bool {
+        self.crtc_color.has_degamma_lut && self.crtc_color.has_gamma_lut
+    }
+
+    /// Evaluates the appropriate scanout plan for a given content image description,
+    /// following the strict efficiency hierarchy:
+    /// DirectPassthrough -> PlaneColorop -> CrtcHardware -> VulkanFastDirectFlip
+    pub fn evaluate_scanout_plan(
+        &self,
+        output_hdr_enabled: bool,
+        desc: Option<&crate::wayland::color::management::ImageDescription>,
+        output_reference_white: u16,
+    ) -> ScanoutPlan {
+        if !output_hdr_enabled {
+            match desc {
+                Some(desc)
+                    if desc.windows_scrgb
+                        || desc.transfer
+                            == crate::wayland::color::management::TransferFunction::ExtLinear =>
+                {
+                    // scRGB FP16 on SDR output
+                    let conv = PlaneColorConversion::ScRgbToSrgb;
+                    if self.supports_plane_colorop && self.supports_fp16 {
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_fp16 && self.crtc_color.has_gamma_lut {
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                Some(desc) if desc.is_pq_bt2020() => {
+                    // PQ BT.2020 on SDR output
+                    let conv = PlaneColorConversion::PqToSrgb;
+                    if self.supports_plane_colorop {
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.crtc_color.has_degamma_lut
+                        && self.crtc_color.has_ctm
+                        && self.crtc_color.has_gamma_lut
+                    {
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
+                    // HLG on SDR output
+                    let conv = PlaneColorConversion::HlgToSrgb;
+                    if self.supports_plane_colorop {
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.crtc_color.has_degamma_lut
+                        && self.crtc_color.has_ctm
+                        && self.crtc_color.has_gamma_lut
+                    {
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                Some(desc) if desc.is_hdr() => {
+                    // Generic HDR on SDR requires shader tonemapping
+                    ScanoutPlan::VulkanFastDirectFlip
+                }
+                _ => {
+                    // Standard SDR on SDR output -> Zero transform
+                    ScanoutPlan::DirectPassthrough
+                }
+            }
+        } else {
+            // HDR output active (BT.2020 PQ signal)
+            match desc {
+                Some(desc) if desc.is_pq_bt2020() => {
+                    // Tier 1: Native PQ BT.2020 matches output HDR pipeline directly.
+                    // Zero GPU, zero plane/CRTC color transformation.
+                    ScanoutPlan::DirectPassthrough
+                }
+                Some(desc)
+                    if desc.windows_scrgb
+                        || desc.transfer
+                            == crate::wayland::color::management::TransferFunction::ExtLinear =>
+                {
+                    // scRGB FP16 on HDR
+                    let ref_white = desc.luminances_or_default().2 as u16;
+                    let conv = PlaneColorConversion::ScRgbToPq {
+                        reference_white: if ref_white > 0 {
+                            ref_white
+                        } else if output_reference_white > 0 {
+                            output_reference_white
+                        } else {
+                            203
+                        },
+                    };
+                    if self.supports_plane_colorop && self.supports_fp16 {
+                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_scrgb_hardware_scanout() {
+                        // Tier 2B: CRTC Color Management
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        // Tier 3: Vulkan Shader Fast Flip
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
+                    // HLG on HDR
+                    let ref_white = desc.luminances_or_default().2 as u16;
+                    let conv = PlaneColorConversion::HlgToPq {
+                        reference_white: if ref_white > 0 {
+                            ref_white
+                        } else if output_reference_white > 0 {
+                            output_reference_white
+                        } else {
+                            203
+                        },
+                    };
+                    if self.supports_plane_colorop {
+                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_hlg_to_hdr_hardware_scanout() {
+                        // Tier 2B: CRTC Color Management
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        // Tier 3: Vulkan Shader Fast Flip
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                Some(desc) if !desc.is_hdr() => {
+                    // Tagged SDR on HDR
+                    let effective_ref_white = if output_reference_white > 0 {
+                        output_reference_white
+                    } else {
+                        203
+                    };
+                    let conv = PlaneColorConversion::SrgbToPq {
+                        reference_white: effective_ref_white,
+                    };
+                    if self.supports_plane_colorop {
+                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_sdr_to_hdr_hardware_scanout() {
+                        // Tier 2B: CRTC Color Management
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        // Tier 3: Vulkan Shader Fast Flip
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                None => {
+                    // Untagged SDR on HDR
+                    let effective_ref_white = if output_reference_white > 0 {
+                        output_reference_white
+                    } else {
+                        203
+                    };
+                    let conv = PlaneColorConversion::SrgbToPq {
+                        reference_white: effective_ref_white,
+                    };
+                    if self.supports_plane_colorop {
+                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_sdr_to_hdr_hardware_scanout() {
+                        // Tier 2B: CRTC Color Management
+                        ScanoutPlan::CrtcHardware(conv)
+                    } else {
+                        // Tier 3: Vulkan Shader Fast Flip
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+                _ => ScanoutPlan::VulkanFastDirectFlip,
+            }
+        }
+    }
 }
 
 pub(super) mod ffi {
@@ -620,5 +1123,642 @@ mod tests {
 
         hdr2.reference_white = Some(300.0);
         assert_ne!(hdr, hdr2);
+    }
+
+    #[test]
+    fn srgb_degamma_lut_generation() {
+        let lut = DrmColorLut::create_srgb_degamma_lut(1024);
+        assert_eq!(lut.len(), 1024);
+        assert_eq!(lut[0].red, 0);
+        assert_eq!(lut[1023].red, 65535);
+
+        // Mid-gray test: sRGB 0.5 (~128/255) decodes to ~0.214 in linear
+        // 0.214 * 65535 = ~14024
+        let mid = lut[512].red;
+        assert!((mid as i32 - 14024).abs() < 100, "mid={mid}");
+    }
+
+    #[test]
+    fn drm_color_ctm_scaled() {
+        let scale = 0.5;
+        let ctm = DrmColorCtm::rec709_to_bt2020_scaled(scale);
+        let r0 = DrmColorCtm::from_s31_32(ctm.matrix[0])
+            + DrmColorCtm::from_s31_32(ctm.matrix[1])
+            + DrmColorCtm::from_s31_32(ctm.matrix[2]);
+        assert!((r0 - scale).abs() < 2e-6, "r0={r0} scale={scale}");
+    }
+
+    #[test]
+    fn scanout_plan_evaluation() {
+        use crate::wayland::color::management::ImageDescription;
+        let mut caps = DrmScanoutCapabilities {
+            crtc_color: CrtcColorCapabilities {
+                has_gamma_lut: true,
+                gamma_lut_size: 4096,
+                has_degamma_lut: true,
+                degamma_lut_size: 4096,
+                has_ctm: true,
+            },
+            supports_plane_colorop: false,
+            primary_plane_formats: FormatSet::default(),
+            supports_fp16: true,
+            supports_10bit: true,
+        };
+
+        // 1. Tier 1: SDR on SDR (zero transform)
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::SRGB), 203);
+        assert_eq!(plan, ScanoutPlan::DirectPassthrough);
+
+        // 2. Tier 1: PQ BT.2020 on HDR (zero transform)
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_BT2100), 203);
+        assert_eq!(plan, ScanoutPlan::DirectPassthrough);
+
+        // --- Target: SDR Output ---
+        // 1. SDR sRGB on SDR output -> DirectPassthrough
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::SRGB), 203);
+        assert_eq!(plan, ScanoutPlan::DirectPassthrough);
+
+        // 2. scRGB on SDR output:
+        // 2a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert_eq!(plan, ScanoutPlan::PlaneColorop(PlaneColorConversion::ScRgbToSrgb));
+        // 2b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert_eq!(plan, ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToSrgb));
+        // 2c. Fallback to Shader (no FP16)
+        caps.supports_fp16 = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.supports_fp16 = true;
+
+        // 3. PQ BT.2020 on SDR output:
+        // 3a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_BT2100), 203);
+        assert_eq!(plan, ScanoutPlan::PlaneColorop(PlaneColorConversion::PqToSrgb));
+        // 3b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_BT2100), 203);
+        assert_eq!(plan, ScanoutPlan::CrtcHardware(PlaneColorConversion::PqToSrgb));
+        // 3c. Fallback to Shader (missing DEGAMMA)
+        caps.crtc_color.has_degamma_lut = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_BT2100), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.crtc_color.has_degamma_lut = true;
+
+        // 4. HLG on SDR output:
+        use crate::wayland::color::management::TransferFunction;
+        let mut hlg_desc = ImageDescription::WINDOWS_BT2100;
+        hlg_desc.transfer = TransferFunction::Hlg;
+        // 4a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(false, Some(&hlg_desc), 203);
+        assert_eq!(plan, ScanoutPlan::PlaneColorop(PlaneColorConversion::HlgToSrgb));
+        // 4b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&hlg_desc), 203);
+        assert_eq!(plan, ScanoutPlan::CrtcHardware(PlaneColorConversion::HlgToSrgb));
+        // 4c. Fallback to Shader (missing CTM)
+        caps.crtc_color.has_ctm = false;
+        let plan = caps.evaluate_scanout_plan(false, Some(&hlg_desc), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.crtc_color.has_ctm = true;
+
+        // --- Target: HDR Output ---
+        // 5. PQ BT.2020 on HDR output -> DirectPassthrough
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_BT2100), 203);
+        assert_eq!(plan, ScanoutPlan::DirectPassthrough);
+
+        // 6. scRGB on HDR output:
+        // 6a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::PlaneColorop(PlaneColorConversion::ScRgbToPq { .. })
+        ));
+        // 6b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToPq { .. })
+        ));
+        // 6c. Fallback to Shader (no CTM)
+        caps.crtc_color.has_ctm = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.crtc_color.has_ctm = true;
+
+        // 7. sRGB on HDR output:
+        // 7a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::SRGB), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::PlaneColorop(PlaneColorConversion::SrgbToPq { .. })
+        ));
+        // 7b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::SRGB), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::SrgbToPq { .. })
+        ));
+        // 7c. Fallback to Shader (no DEGAMMA)
+        caps.crtc_color.has_degamma_lut = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&ImageDescription::SRGB), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.crtc_color.has_degamma_lut = true;
+
+        // 8. HLG on HDR output:
+        // 8a. PlaneColorop
+        caps.supports_plane_colorop = true;
+        let plan = caps.evaluate_scanout_plan(true, Some(&hlg_desc), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::PlaneColorop(PlaneColorConversion::HlgToPq { .. })
+        ));
+        // 8b. CrtcHardware
+        caps.supports_plane_colorop = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&hlg_desc), 203);
+        assert!(matches!(
+            plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::HlgToPq { .. })
+        ));
+        // 8c. Fallback to Shader (no DEGAMMA)
+        caps.crtc_color.has_degamma_lut = false;
+        let plan = caps.evaluate_scanout_plan(true, Some(&hlg_desc), 203);
+        assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
+        caps.crtc_color.has_degamma_lut = true;
+    }
+
+    #[test]
+    fn test_scrgb_to_pq_hardware_conversion_extended_range_and_negative() {
+        let conv = PlaneColorConversion::ScRgbToPq { reference_white: 203 };
+        let state = conv.to_crtc_color_state(4096, 4096);
+        assert!(state.degamma_lut.is_none());
+        assert!(state.ctm.is_some());
+        assert!(state.gamma_lut.is_some());
+
+        let ctm = state.ctm.unwrap();
+        let gamma_lut = state.gamma_lut.unwrap();
+        assert_eq!(gamma_lut.len(), 4096);
+
+        // Helper to apply 3x3 CTM to RGB vector
+        let apply_ctm = |rgb: [f64; 3]| -> [f64; 3] {
+            let m00 = DrmColorCtm::from_s31_32(ctm.matrix[0]);
+            let m01 = DrmColorCtm::from_s31_32(ctm.matrix[1]);
+            let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
+            let m10 = DrmColorCtm::from_s31_32(ctm.matrix[3]);
+            let m11 = DrmColorCtm::from_s31_32(ctm.matrix[4]);
+            let m12 = DrmColorCtm::from_s31_32(ctm.matrix[5]);
+            let m20 = DrmColorCtm::from_s31_32(ctm.matrix[6]);
+            let m21 = DrmColorCtm::from_s31_32(ctm.matrix[7]);
+            let m22 = DrmColorCtm::from_s31_32(ctm.matrix[8]);
+            [
+                m00 * rgb[0] + m01 * rgb[1] + m02 * rgb[2],
+                m10 * rgb[0] + m11 * rgb[1] + m12 * rgb[2],
+                m20 * rgb[0] + m21 * rgb[1] + m22 * rgb[2],
+            ]
+        };
+
+        // 1. Negative values test (wide color gamut in Rec.709 coordinates)
+        // BT.2020 pure green in Rec.709 primaries has negative Red and Blue:
+        // [-0.4677, 1.0772, -0.0298]
+        let wide_gamut_green_scrgb = [-0.4677, 1.0772, -0.0298];
+        let transformed = apply_ctm(wide_gamut_green_scrgb);
+        // After rec709_to_bt2020 rotation and luminance scaling, coordinates must be non-negative!
+        assert!(transformed[0] >= -1e-4, "Red was negative: {}", transformed[0]);
+        assert!(
+            transformed[1] > 0.0,
+            "Green should be positive: {}",
+            transformed[1]
+        );
+        assert!(transformed[2] >= -1e-4, "Blue was negative: {}", transformed[2]);
+
+        // 2. Nominal white test: scRGB 1.0 maps to 203 nits in PQ
+        let white_scrgb = [1.0, 1.0, 1.0];
+        let white_out = apply_ctm(white_scrgb);
+        let expected_linear = 203.0 / 10000.0;
+        assert!((white_out[0] - expected_linear).abs() < 1e-5);
+        assert!((white_out[1] - expected_linear).abs() < 1e-5);
+        assert!((white_out[2] - expected_linear).abs() < 1e-5);
+
+        // 3. Extended range HDR highlight test: values exceeding 1.0
+        // E.g. 1000 nits highlight: 1000 / 203 = ~4.926 in scRGB
+        let highlight_scrgb = [4.926108, 4.926108, 4.926108];
+        let highlight_out = apply_ctm(highlight_scrgb);
+        // 1000 / 10000 = 0.1, which MUST be <= 1.0 so hardware 1D LUT does NOT clamp it!
+        assert!((highlight_out[0] - 0.100).abs() < 1e-3);
+        assert!(
+            highlight_out[0] <= 1.0,
+            "Highlight must not exceed LUT domain [0, 1]!"
+        );
+
+        // 4. Maximum HDR luminance (10,000 nits): 10000 / 203 = 49.261 in scRGB
+        let max_hdr_scrgb = [49.26108, 49.26108, 49.26108];
+        let max_out = apply_ctm(max_hdr_scrgb);
+        assert!((max_out[0] - 1.000).abs() < 1e-3, "10,000 nits must map to 1.0!");
+
+        // 5. Verify GAMMA_LUT encodes ST 2084 PQ continuously without clipping
+        // At index 0 (0.0): 0
+        assert_eq!(gamma_lut[0].red, 0);
+        // At index corresponding to 0.1 (1000 nits): PQ(0.1) = ~0.7518 -> ~49270 in u16
+        let idx_1000nits = (0.1 * 4095.0) as usize;
+        let pq_1000 = gamma_lut[idx_1000nits].red;
+        assert!((pq_1000 as i32 - 49270).abs() < 200, "pq_1000={pq_1000}");
+        // At index 4095 (1.0 = 10,000 nits): PQ(1.0) = 1.0 -> 65535 in u16
+        assert_eq!(gamma_lut[4095].red, 65535);
+    }
+
+    #[test]
+    fn test_srgb_to_pq_hardware_conversion_full_precision_and_black_level() {
+        let conv = PlaneColorConversion::SrgbToPq { reference_white: 335 };
+        let state = conv.to_crtc_color_state(4096, 4096);
+        assert!(state.degamma_lut.is_some());
+        assert!(state.ctm.is_some());
+        assert!(state.gamma_lut.is_some());
+
+        let degamma_lut = state.degamma_lut.unwrap();
+        let ctm = state.ctm.unwrap();
+        let gamma_lut = state.gamma_lut.unwrap();
+
+        assert_eq!(degamma_lut.len(), 4096);
+        assert_eq!(gamma_lut.len(), 4096);
+
+        // 1. DEGAMMA linearizes sRGB
+        assert_eq!(degamma_lut[0].red, 0);
+        assert_eq!(degamma_lut[4095].red, 65535);
+
+        // 2. CTM is unscaled Rec.709 to BT.2020 matrix (row sums = 1.0)
+        let m00 = DrmColorCtm::from_s31_32(ctm.matrix[0]);
+        let m01 = DrmColorCtm::from_s31_32(ctm.matrix[1]);
+        let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
+        let r0 = m00 + m01 + m02;
+        assert!((r0 - 1.0).abs() < 2e-6, "r0={r0} must be 1.0 (unscaled CTM)");
+
+        // 3. GAMMA_LUT maps linear [0.0, 1.0] to PQ [0.0, ref_white]
+        // Entry 0 must be STRICTLY 0 (0.0 nits true black, no washed out / lifted black)
+        assert_eq!(gamma_lut[0].red, 0);
+        assert_eq!(gamma_lut[0].green, 0);
+        assert_eq!(gamma_lut[0].blue, 0);
+
+        // Entry 4095 must encode exactly 335 nits in PQ:
+        // encode_pq(335 / 10000) = 0.633611 -> 41524 in u16
+        let expected_white = (encode_pq(335.0 / 10000.0) * 65535.0).round() as u16;
+        assert_eq!(gamma_lut[4095].red, expected_white);
+
+        // Entry 1 is (1/4095) * 335 = 0.0818 nits, providing fine shadow gradations (no shadow posterization)
+        assert!(gamma_lut[1].red < 7000);
+        assert!(gamma_lut[1].red > 0);
+    }
+
+    #[test]
+    fn test_print_hardware_color_support() {
+        use crate::backend::allocator::format::FormatSet;
+        use crate::backend::drm::color::{
+            CrtcColorCapabilities, DrmScanoutCapabilities, PlaneColorConversion, ScanoutPlan,
+        };
+        use crate::backend::drm::device::DrmDeviceFd;
+        use crate::utils::DeviceFd;
+        use crate::wayland::color::management::{ImageDescription, TransferFunction};
+        use drm::Device as BasicDevice;
+        use drm::control::Device as ControlDevice;
+        use std::fs::OpenOptions;
+        use std::os::unix::io::OwnedFd;
+
+        println!(
+            "\n╔═══════════════════════════════════════════════════════════════════════════════════════════╗"
+        );
+        println!(
+            "║                      DRM HARDWARE COLOR MANAGEMENT SCANOUT REPORT                         ║"
+        );
+        println!(
+            "╚═══════════════════════════════════════════════════════════════════════════════════════════╝"
+        );
+
+        let candidates = ["/dev/dri/card1", "/dev/dri/card0", "/dev/dri/card2"];
+        let mut found_any = false;
+
+        for path in candidates {
+            let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+                continue;
+            };
+            found_any = true;
+            let device_fd = DeviceFd::from(OwnedFd::from(file));
+            let drm_fd = DrmDeviceFd::new(device_fd);
+            let _ = drm_fd.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+            let _ = drm_fd.set_client_capability(drm::ClientCapability::Atomic, true);
+            let _ = drm_fd.set_client_capability(drm::ClientCapability::PlaneColorPipeline, true);
+
+            let driver = drm_fd
+                .get_driver()
+                .map(|d| {
+                    format!(
+                        "{} ({}) - {}",
+                        d.name().to_string_lossy(),
+                        d.date().to_string_lossy(),
+                        d.description().to_string_lossy()
+                    )
+                })
+                .unwrap_or_else(|_| "Unknown Driver".to_string());
+
+            println!("\n[DRM Node: {}]", path);
+            println!("  Driver: {}", driver);
+
+            let res = match drm_fd.resource_handles() {
+                Ok(r) => r,
+                Err(err) => {
+                    println!("  Failed to get resources: {}", err);
+                    continue;
+                }
+            };
+            let planes = drm_fd.plane_handles().unwrap_or_default();
+
+            println!(
+                "  Resources: {} Connectors, {} CRTCs, {} Planes",
+                res.connectors().len(),
+                res.crtcs().len(),
+                planes.len()
+            );
+
+            // Connectors inspection
+            println!("\n  --- Connectors ---");
+            for conn_handle in res.connectors() {
+                if let Ok(conn_info) = drm_fd.get_connector(*conn_handle, false) {
+                    let name = format!("{:?}", conn_info.interface());
+                    let state = format!("{:?}", conn_info.state());
+                    println!("    • Connector {:?} ({}): State = {}", conn_handle, name, state);
+
+                    if let Ok(props) = drm_fd.get_properties(*conn_handle) {
+                        let (prop_ids, prop_vals) = props.as_props_and_values();
+                        for (prop_id, val) in prop_ids.iter().zip(prop_vals.iter()) {
+                            if let Ok(info) = drm_fd.get_property(*prop_id) {
+                                let pname = info.name().to_string_lossy();
+                                if pname == "Colorspace" {
+                                    let mut enums = Vec::new();
+                                    if let drm::control::property::ValueType::Enum(items) = info.value_type()
+                                    {
+                                        let (_, enum_values) = items.values();
+                                        for item in enum_values {
+                                            enums.push(item.name().to_string_lossy().into_owned());
+                                        }
+                                    }
+                                    println!(
+                                        "      - Colorspace property present (current raw val: {}). Supported: {:?}",
+                                        val, enums
+                                    );
+                                } else if pname == "HDR_OUTPUT_METADATA" {
+                                    println!(
+                                        "      - HDR_OUTPUT_METADATA property present (blob id: {})",
+                                        val
+                                    );
+                                } else if pname == "max bpc" {
+                                    println!("      - max bpc property present (current val: {})", val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // CRTCs inspection
+            println!("\n  --- CRTCs Color Pipeline Capabilities ---");
+            let mut best_crtc_color = CrtcColorCapabilities::default();
+            for crtc_handle in res.crtcs() {
+                let mut has_gamma = false;
+                let mut has_degamma = false;
+                let mut has_ctm = false;
+                let mut has_vrr = false;
+                let mut gamma_size = 0u64;
+                let mut degamma_size = 0u64;
+
+                if let Ok(props) = drm_fd.get_properties(*crtc_handle) {
+                    let (prop_ids, prop_vals) = props.as_props_and_values();
+                    for (prop_id, val) in prop_ids.iter().zip(prop_vals.iter()) {
+                        if let Ok(info) = drm_fd.get_property(*prop_id) {
+                            let pname = info.name().to_string_lossy();
+                            match pname.as_ref() {
+                                "GAMMA_LUT" => has_gamma = true,
+                                "GAMMA_LUT_SIZE" => gamma_size = *val,
+                                "DEGAMMA_LUT" => has_degamma = true,
+                                "DEGAMMA_LUT_SIZE" => degamma_size = *val,
+                                "CTM" => has_ctm = true,
+                                "VRR_ENABLED" => has_vrr = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                println!("    • CRTC {:?}:", crtc_handle);
+                println!(
+                    "        GAMMA_LUT:     {} (size: {} entries)",
+                    if has_gamma { "SUPPORTED" } else { "NO" },
+                    gamma_size
+                );
+                println!(
+                    "        DEGAMMA_LUT:   {} (size: {} entries)",
+                    if has_degamma { "SUPPORTED" } else { "NO" },
+                    degamma_size
+                );
+                println!(
+                    "        CTM (3x3 S31): {}",
+                    if has_ctm { "SUPPORTED" } else { "NO" }
+                );
+                println!(
+                    "        VRR_ENABLED:   {}",
+                    if has_vrr { "SUPPORTED" } else { "NO" }
+                );
+
+                if has_gamma && gamma_size >= best_crtc_color.gamma_lut_size {
+                    best_crtc_color = CrtcColorCapabilities {
+                        has_gamma_lut: has_gamma,
+                        gamma_lut_size: gamma_size,
+                        has_degamma_lut: has_degamma,
+                        degamma_lut_size: degamma_size,
+                        has_ctm,
+                    };
+                }
+            }
+
+            // Planes inspection
+            println!("\n  --- Planes Color & Format Capabilities ---");
+            let mut primary_supports_fp16 = false;
+            let mut primary_supports_10bit = false;
+            let mut primary_supports_colorop = false;
+            let primary_format_set = FormatSet::default();
+
+            for plane_handle in &planes {
+                if let Ok(plane_info) = drm_fd.get_plane(*plane_handle) {
+                    let mut plane_type = "Overlay";
+                    let mut has_colorop = false;
+
+                    if let Ok(props) = drm_fd.get_properties(*plane_handle) {
+                        let (prop_ids, prop_vals) = props.as_props_and_values();
+                        for (prop_id, val) in prop_ids.iter().zip(prop_vals.iter()) {
+                            if let Ok(info) = drm_fd.get_property(*prop_id) {
+                                let pname = info.name().to_string_lossy();
+                                if pname == "type" {
+                                    plane_type = match *val {
+                                        1 => "Primary",
+                                        2 => "Cursor",
+                                        _ => "Overlay",
+                                    };
+                                } else if pname == "COLOR_PIPELINE" {
+                                    has_colorop = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut has_fp16 = false;
+                    let mut has_10bit = false;
+                    for raw_fmt in plane_info.formats() {
+                        if let Ok(fourcc) = drm_fourcc::DrmFourcc::try_from(*raw_fmt) {
+                            match fourcc {
+                                drm_fourcc::DrmFourcc::Abgr16161616f
+                                | drm_fourcc::DrmFourcc::Xbgr16161616f
+                                | drm_fourcc::DrmFourcc::Argb16161616f
+                                | drm_fourcc::DrmFourcc::Xrgb16161616f => has_fp16 = true,
+                                drm_fourcc::DrmFourcc::Xbgr2101010
+                                | drm_fourcc::DrmFourcc::Abgr2101010
+                                | drm_fourcc::DrmFourcc::Xrgb2101010
+                                | drm_fourcc::DrmFourcc::Argb2101010 => has_10bit = true,
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    println!(
+                        "    • Plane {:?} [{}]: Formats: {}, FP16: {}, 10-bit: {}, COLOR_PIPELINE: {}",
+                        plane_handle,
+                        plane_type,
+                        plane_info.formats().len(),
+                        if has_fp16 { "YES" } else { "NO" },
+                        if has_10bit { "YES" } else { "NO" },
+                        if has_colorop { "YES" } else { "NO" }
+                    );
+
+                    if plane_type == "Primary" {
+                        primary_supports_fp16 = has_fp16;
+                        primary_supports_10bit = has_10bit;
+                        primary_supports_colorop = has_colorop;
+                    }
+                }
+            }
+
+            let scanout_caps = DrmScanoutCapabilities {
+                crtc_color: best_crtc_color,
+                supports_plane_colorop: primary_supports_colorop,
+                primary_plane_formats: primary_format_set,
+                supports_fp16: primary_supports_fp16,
+                supports_10bit: primary_supports_10bit,
+            };
+
+            println!("\n  ══════════════════════════════════════════════════════════════════════════");
+            println!("   HARDWARE COLOR CONVERSION SCANOUT MATRIX EVALUATION");
+            println!("  ══════════════════════════════════════════════════════════════════════════");
+
+            let test_cases = [
+                (
+                    "SDR Display (sRGB)",
+                    false,
+                    "sRGB (8/10-bit SDR)",
+                    Some(ImageDescription::SRGB),
+                ),
+                (
+                    "SDR Display (sRGB)",
+                    false,
+                    "scRGB (FP16 Linear)",
+                    Some(ImageDescription::WINDOWS_SCRGB),
+                ),
+                (
+                    "SDR Display (sRGB)",
+                    false,
+                    "PQ BT.2020 (HDR10)",
+                    Some(ImageDescription::WINDOWS_BT2100),
+                ),
+                ("SDR Display (sRGB)", false, "HLG BT.2020", {
+                    let mut h = ImageDescription::WINDOWS_BT2100;
+                    h.transfer = TransferFunction::Hlg;
+                    Some(h)
+                }),
+                (
+                    "HDR Display (BT.2020 PQ)",
+                    true,
+                    "PQ BT.2020 (HDR10)",
+                    Some(ImageDescription::WINDOWS_BT2100),
+                ),
+                (
+                    "HDR Display (BT.2020 PQ)",
+                    true,
+                    "scRGB (FP16 Linear)",
+                    Some(ImageDescription::WINDOWS_SCRGB),
+                ),
+                (
+                    "HDR Display (BT.2020 PQ)",
+                    true,
+                    "sRGB (Tagged SDR)",
+                    Some(ImageDescription::SRGB),
+                ),
+                ("HDR Display (BT.2020 PQ)", true, "HLG BT.2020", {
+                    let mut h = ImageDescription::WINDOWS_BT2100;
+                    h.transfer = TransferFunction::Hlg;
+                    Some(h)
+                }),
+            ];
+
+            let mut current_target = "";
+            for (target_name, is_hdr, content_name, desc) in &test_cases {
+                if current_target != *target_name {
+                    current_target = *target_name;
+                    println!("\n  ▶ Target: {}", target_name);
+                }
+                let plan = scanout_caps.evaluate_scanout_plan(*is_hdr, desc.as_ref(), 203);
+                let plan_str = match plan {
+                    ScanoutPlan::DirectPassthrough => "DirectPassthrough (0% GPU, 0% CRTC/Plane)".to_string(),
+                    ScanoutPlan::PlaneColorop(conv) => {
+                        format!("PlaneColorop (DRM Plane COLOR_PIPELINE: {:?})", conv)
+                    }
+                    ScanoutPlan::CrtcHardware(conv) => {
+                        let state = conv.to_crtc_color_state(
+                            scanout_caps.crtc_color.gamma_lut_size as usize,
+                            scanout_caps.crtc_color.degamma_lut_size as usize,
+                        );
+                        format!(
+                            "CrtcHardware (DEGAMMA: {}, CTM: {}, GAMMA: {})",
+                            if state.degamma_lut.is_some() {
+                                format!("{} entries", scanout_caps.crtc_color.degamma_lut_size)
+                            } else {
+                                "None".to_string()
+                            },
+                            if state.ctm.is_some() {
+                                "S31.32 matrix"
+                            } else {
+                                "None"
+                            },
+                            if state.gamma_lut.is_some() {
+                                format!("{} entries", scanout_caps.crtc_color.gamma_lut_size)
+                            } else {
+                                "None".to_string()
+                            }
+                        )
+                    }
+                    ScanoutPlan::VulkanFastDirectFlip => {
+                        "VulkanFastDirectFlip (GPU Compute Shader Fallback)".to_string()
+                    }
+                };
+                println!("    • {:<22} ➔ {}", content_name, plan_str);
+            }
+            println!("\n  ══════════════════════════════════════════════════════════════════════════\n");
+        }
+
+        if !found_any {
+            println!("  [NOTE] No accessible DRM card node found in /dev/dri/ (running in container/CI).");
+        }
     }
 }

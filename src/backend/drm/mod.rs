@@ -89,8 +89,8 @@ use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
 pub use color::{
-    Colorspace, ConnectorColorState, CrtcColorState, CtaCoordinate, DrmColorCtm, DrmColorLut, Eotf,
-    HdrOutputMetadata,
+    Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, CtaCoordinate, DrmColorCtm,
+    DrmColorLut, DrmScanoutCapabilities, Eotf, HdrOutputMetadata, PlaneColorConversion, ScanoutPlan,
 };
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,

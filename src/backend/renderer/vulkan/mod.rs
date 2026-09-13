@@ -26,13 +26,13 @@ use crate::{
 };
 
 use ash::vk::{
-    self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyFlags, DependencyInfo,
-    DescriptorImageInfo, DescriptorType, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT,
-    ImageAspectFlags, ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange,
-    ImageToMemoryCopyEXT, MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D,
-    PipelineBindPoint, PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode,
-    SamplerCreateFlags, SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo,
-    ShaderStageFlags, SubmitInfo2,
+    self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyInfo, DescriptorImageInfo,
+    DescriptorType, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags,
+    ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange, ImageToMemoryCopyEXT,
+    MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint,
+    PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags,
+    SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags,
+    SubmitInfo2,
 };
 use gbm::Modifier;
 use indexmap::IndexSet;

@@ -250,6 +250,8 @@ impl DrmDevice {
 
         Ok(
             if !force_legacy && fd.set_client_capability(ClientCapability::Atomic, true).is_ok() {
+                // Proactively enable Plane COLOR_PIPELINE (colorop) capability
+                let _ = fd.set_client_capability(ClientCapability::PlaneColorPipeline, true);
                 DrmDeviceInternal::Atomic(AtomicDrmDevice::new(fd, active, disable_connectors)?)
             } else {
                 info!("Falling back to LegacyDrmDevice");

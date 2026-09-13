@@ -177,7 +177,7 @@ use crate::{
 
 use super::{
     DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
-    color::{Colorspace, ConnectorColorState, CrtcColorState},
+    color::{Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, DrmScanoutCapabilities},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -2877,6 +2877,18 @@ where
     /// Queries the size of the CRTC's hardware `DEGAMMA_LUT` if supported.
     pub fn crtc_degamma_lut_size(&self) -> FrameResult<Option<u64>, A, F> {
         self.surface.crtc_degamma_lut_size().map_err(FrameError::DrmError)
+    }
+
+    /// Returns the CRTC hardware color pipeline capabilities.
+    pub fn crtc_color_capabilities(&self) -> FrameResult<CrtcColorCapabilities, A, F> {
+        self.surface
+            .crtc_color_capabilities()
+            .map_err(FrameError::DrmError)
+    }
+
+    /// Returns the overall hardware scanout capabilities of this compositor's surface.
+    pub fn scanout_capabilities(&self) -> FrameResult<DrmScanoutCapabilities, A, F> {
+        self.surface.scanout_capabilities().map_err(FrameError::DrmError)
     }
 
     /// Returns whether HDR hardware CRTC offloading is staged for the next commit.

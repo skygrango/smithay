@@ -371,7 +371,7 @@ format_tables! {
 }
 
 /// A set of [`Format`]s
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FormatSet {
     formats: Arc<IndexSet<Format>>,
 }

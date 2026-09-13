@@ -15,7 +15,7 @@ pub(super) mod gbm;
 pub(super) mod legacy;
 use super::{
     DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes,
-    color::{Colorspace, ConnectorColorState, CrtcColorState},
+    color::{Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, DrmScanoutCapabilities},
     device::PlaneClaimStorage,
     error::Error,
     plane_type,
@@ -470,6 +470,50 @@ impl DrmSurface {
             DrmSurfaceInternal::Atomic(surf) => surf.crtc_degamma_lut_size(),
             DrmSurfaceInternal::Legacy(_) => Ok(None),
         }
+    }
+
+    /// Returns the CRTC hardware color pipeline capabilities.
+    pub fn crtc_color_capabilities(&self) -> Result<CrtcColorCapabilities, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.crtc_color_capabilities(),
+            DrmSurfaceInternal::Legacy(_) => Ok(CrtcColorCapabilities::default()),
+        }
+    }
+
+    /// Returns the overall hardware scanout capabilities of this surface.
+    pub fn scanout_capabilities(&self) -> Result<DrmScanoutCapabilities, Error> {
+        let crtc_color = self.crtc_color_capabilities()?;
+        let plane_info = self.plane_info();
+        let mut supports_fp16 = false;
+        let mut supports_10bit = false;
+        for fmt in plane_info.formats.iter() {
+            match fmt.code {
+                drm_fourcc::DrmFourcc::Abgr16161616f
+                | drm_fourcc::DrmFourcc::Xbgr16161616f
+                | drm_fourcc::DrmFourcc::Argb16161616f
+                | drm_fourcc::DrmFourcc::Xrgb16161616f => {
+                    supports_fp16 = true;
+                }
+                drm_fourcc::DrmFourcc::Xbgr2101010
+                | drm_fourcc::DrmFourcc::Abgr2101010
+                | drm_fourcc::DrmFourcc::Xrgb2101010
+                | drm_fourcc::DrmFourcc::Argb2101010 => {
+                    supports_10bit = true;
+                }
+                _ => {}
+            }
+        }
+        let supports_plane_colorop = match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.supports_plane_colorop(),
+            DrmSurfaceInternal::Legacy(_) => false,
+        };
+        Ok(DrmScanoutCapabilities {
+            crtc_color,
+            supports_plane_colorop,
+            primary_plane_formats: plane_info.formats.clone(),
+            supports_fp16,
+            supports_10bit,
+        })
     }
 
     /// Returns whether HDR hardware CRTC offloading is staged for the next commit.

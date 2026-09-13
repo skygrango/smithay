@@ -10,11 +10,25 @@ use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::ops::RangeInclusive;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
 };
+
+fn create_lut_property_blob<D: std::os::unix::io::AsFd>(
+    fd: &D,
+    lut: &[DrmColorLut],
+) -> Result<property::Value<'static>, std::io::Error> {
+    let slice = unsafe {
+        std::slice::from_raw_parts_mut(
+            lut.as_ptr() as *mut u8,
+            std::mem::size_of::<DrmColorLut>() * lut.len(),
+        )
+    };
+    let blob = drm_ffi::mode::create_property_blob(fd.as_fd(), slice)?;
+    Ok(property::Value::Blob(blob.blob_id as u64))
+}
 
 use crate::backend::drm::color::{self, Colorspace, ConnectorColorState, CrtcColorState, DrmColorLut};
 use crate::backend::drm::error::AccessError;
@@ -36,6 +50,7 @@ use crate::{
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use super::{PlaneConfig, PlaneState, VrrSupport};
+use crate::backend::drm::color::CrtcColorCapabilities;
 
 /// Connector color state resolved against the actual properties of the surface's connectors,
 /// ready to be put into an atomic request.
@@ -71,6 +86,8 @@ pub struct CrtcColorBlobs {
     pub gamma_blob: property::Value<'static>,
     /// `CTM` blob handle (`Blob(0)` = disabled).
     pub ctm_blob: property::Value<'static>,
+    /// `DEGAMMA_LUT` blob handle (`Blob(0)` = disabled).
+    pub degamma_blob: property::Value<'static>,
 }
 
 impl Default for CrtcColorBlobs {
@@ -78,6 +95,7 @@ impl Default for CrtcColorBlobs {
         CrtcColorBlobs {
             gamma_blob: property::Value::Blob(0),
             ctm_blob: property::Value::Blob(0),
+            degamma_blob: property::Value::Blob(0),
         }
     }
 }
@@ -957,6 +975,23 @@ impl AtomicDrmSurface {
         Ok(None)
     }
 
+    /// Returns the CRTC hardware color pipeline capabilities.
+    pub fn crtc_color_capabilities(&self) -> Result<CrtcColorCapabilities, Error> {
+        let gamma_size = self.crtc_gamma_lut_size()?.unwrap_or(0);
+        let degamma_size = self.crtc_degamma_lut_size()?.unwrap_or(0);
+        let has_ctm = self.crtc_has_ctm();
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        let has_gamma = prop_mapping.crtc_prop_handle(self.crtc, "GAMMA_LUT").is_ok() || gamma_size > 0;
+        let has_degamma = prop_mapping.crtc_prop_handle(self.crtc, "DEGAMMA_LUT").is_ok() || degamma_size > 0;
+        Ok(CrtcColorCapabilities {
+            has_gamma_lut: has_gamma,
+            gamma_lut_size: gamma_size,
+            has_degamma_lut: has_degamma,
+            degamma_lut_size: degamma_size,
+            has_ctm,
+        })
+    }
+
     pub fn vrr_enabled(&self) -> bool {
         self.pending.read().unwrap().vrr
     }
@@ -1123,7 +1158,7 @@ impl AtomicDrmSurface {
         })?;
 
         Ok(match info.value_type() {
-            property::ValueType::UnsignedRange(min, max) => Some(min as u32..=max as u32),
+            property::ValueType::UnsignedRange(min, max) => Some(*min as u32..=*max as u32),
             _ => None,
         })
     }
@@ -1136,6 +1171,28 @@ impl AtomicDrmSurface {
     /// Returns the currently active [`ConnectorColorState`].
     pub fn current_color_state(&self) -> ConnectorColorState {
         self.state.read().unwrap().color_state
+    }
+
+    /// Returns whether the primary plane supports DRM COLOR_PIPELINE (colorop).
+    pub fn supports_plane_colorop(&self) -> bool {
+        if let Ok(mapping) = self.prop_mapping.read() {
+            if let Some(plane_props) = mapping.planes.get(&self.plane) {
+                if plane_props.contains_key("COLOR_PIPELINE") {
+                    return true;
+                }
+            }
+        }
+        if let Ok(props) = self.fd.get_properties(self.plane) {
+            let (prop_ids, _) = props.as_props_and_values();
+            for prop_id in prop_ids {
+                if let Ok(info) = self.fd.get_property(*prop_id) {
+                    if info.name().to_string_lossy() == "COLOR_PIPELINE" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Stages a new [`ConnectorColorState`] to be applied on the next commit.
@@ -1271,10 +1328,11 @@ impl AtomicDrmSurface {
                 if size > 0 && size <= 4096 {
                     let ref_white = color_state.reference_white.unwrap_or(203.0);
                     let pq_lut = DrmColorLut::create_pq_lut(size as usize, ref_white);
-                    if let Ok(gamma_blob) = self.fd.create_property_blob(&pq_lut) {
+                    if let Ok(gamma_blob) = create_lut_property_blob(&*self.fd, pq_lut.as_slice()) {
                         let candidate_blobs = CrtcColorBlobs {
                             gamma_blob,
                             ctm_blob: property::Value::Blob(0),
+                            degamma_blob: property::Value::Blob(0),
                         };
                         if test_request(&candidate_blobs).is_ok() {
                             info!(
@@ -1319,6 +1377,13 @@ impl AtomicDrmSurface {
         let old_ctm = std::mem::replace(&mut pending.crtc_color_blobs.ctm_blob, property::Value::Blob(0));
         if old_ctm != current.crtc_color_blobs.ctm_blob {
             destroy_blob(old_ctm);
+        }
+        let old_degamma = std::mem::replace(
+            &mut pending.crtc_color_blobs.degamma_blob,
+            property::Value::Blob(0),
+        );
+        if old_degamma != current.crtc_color_blobs.degamma_blob {
+            destroy_blob(old_degamma);
         }
 
         pending.color_state = color_state;
@@ -1372,7 +1437,7 @@ impl AtomicDrmSurface {
                         name: "GAMMA_LUT",
                     });
                 }
-                self.fd.create_property_blob(lut).map_err(|source| {
+                create_lut_property_blob(&*self.fd, lut.as_slice()).map_err(|source| {
                     Error::Access(AccessError {
                         errmsg: "Failed to create GAMMA_LUT property blob",
                         dev: self.fd.dev_path(),
@@ -1408,7 +1473,38 @@ impl AtomicDrmSurface {
             None => property::Value::Blob(0),
         };
 
-        let new_blobs = CrtcColorBlobs { gamma_blob, ctm_blob };
+        // Create DEGAMMA_LUT blob if requested.
+        let degamma_blob = match &crtc_color_state.degamma_lut {
+            Some(lut) => {
+                if prop_mapping.crtc_prop_handle(self.crtc, "DEGAMMA_LUT").is_err() {
+                    destroy_blob(gamma_blob);
+                    destroy_blob(ctm_blob);
+                    return Err(Error::UnknownProperty {
+                        handle: self.crtc.into(),
+                        name: "DEGAMMA_LUT",
+                    });
+                }
+                match create_lut_property_blob(&*self.fd, lut.as_slice()) {
+                    Ok(blob) => blob,
+                    Err(source) => {
+                        destroy_blob(gamma_blob);
+                        destroy_blob(ctm_blob);
+                        return Err(Error::Access(AccessError {
+                            errmsg: "Failed to create DEGAMMA_LUT property blob",
+                            dev: self.fd.dev_path(),
+                            source,
+                        }));
+                    }
+                }
+            }
+            None => property::Value::Blob(0),
+        };
+
+        let new_blobs = CrtcColorBlobs {
+            gamma_blob,
+            ctm_blob,
+            degamma_blob,
+        };
 
         // TEST_ONLY validate the new pipeline.
         let res = (|| {
@@ -1446,12 +1542,16 @@ impl AtomicDrmSurface {
                     AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                     req.build()?,
                 )
-                .map_err(|_| Error::TestFailed(self.crtc))
+                .map_err(|source| {
+                    warn!(?source, crtc = ?self.crtc, "CRTC color state atomic test commit failed");
+                    Error::TestFailed(self.crtc)
+                })
         })();
 
         if let Err(err) = res {
             destroy_blob(new_blobs.gamma_blob);
             destroy_blob(new_blobs.ctm_blob);
+            destroy_blob(new_blobs.degamma_blob);
             return Err(err);
         }
 
@@ -1463,6 +1563,13 @@ impl AtomicDrmSurface {
         let old_ctm = std::mem::replace(&mut pending.crtc_color_blobs.ctm_blob, property::Value::Blob(0));
         if old_ctm != current.crtc_color_blobs.ctm_blob {
             destroy_blob(old_ctm);
+        }
+        let old_degamma = std::mem::replace(
+            &mut pending.crtc_color_blobs.degamma_blob,
+            property::Value::Blob(0),
+        );
+        if old_degamma != current.crtc_color_blobs.degamma_blob {
+            destroy_blob(old_degamma);
         }
 
         pending.crtc_color_state = crtc_color_state;
@@ -1665,6 +1772,9 @@ impl AtomicDrmSurface {
                 }
                 if current.crtc_color_blobs.ctm_blob != pending.crtc_color_blobs.ctm_blob {
                     destroy_crtc_blob(current.crtc_color_blobs.ctm_blob);
+                }
+                if current.crtc_color_blobs.degamma_blob != pending.crtc_color_blobs.degamma_blob {
+                    destroy_crtc_blob(current.crtc_color_blobs.degamma_blob);
                 }
 
                 // new config
@@ -2119,6 +2229,9 @@ impl<'a> AtomicRequest<'a> {
             if self.mapping.crtc_prop_handle(crtc, "CTM").is_ok() {
                 crtc_props.insert("CTM", blobs.ctm_blob);
             }
+            if self.mapping.crtc_prop_handle(crtc, "DEGAMMA_LUT").is_ok() {
+                crtc_props.insert("DEGAMMA_LUT", blobs.degamma_blob);
+            }
         }
 
         Ok(())
@@ -2371,6 +2484,9 @@ impl<'a> AtomicRequest<'a> {
             }
             if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "CTM") {
                 self.request.add_property(crtc, prop, blobs.ctm_blob);
+            }
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "DEGAMMA_LUT") {
+                self.request.add_property(crtc, prop, blobs.degamma_blob);
             }
         }
 
