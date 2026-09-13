@@ -48,7 +48,7 @@ impl Device {
                 OwnedFd::from_raw_fd(
                     khr_external_semaphore_fd
                         .get_semaphore_fd(&semaphore_get_info)
-                        .map_err(Error::SemaphoreError)?,
+                        .map_err(Error::SemaphoreExportError)?,
                 )
             };
             DrmTimeline::new(&dev, fd).ok()

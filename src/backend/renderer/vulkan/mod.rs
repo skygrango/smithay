@@ -119,6 +119,10 @@ pub enum Error {
     SamplerError(#[source] VkResult),
     #[error("Failed to create vulkan semaphore")]
     SemaphoreError(#[source] VkResult),
+    #[error("Failed to query semaphore counter value: `{0:?}`")]
+    SemaphoreCounterError(#[source] VkResult),
+    #[error("Failed to export semaphore fd: `{0:?}`")]
+    SemaphoreExportError(#[source] VkResult),
     #[error("Failed to submit command buffer")]
     SubmitError(#[source] VkResult),
     #[error("Error intefacing with the underlying drm device")]
@@ -286,11 +290,14 @@ impl VulkanRenderer {
     }
 
     pub fn cleanup(&mut self) -> Result<(), Error> {
-        let val = unsafe {
+        let val = match unsafe {
             self.device
                 .vk()
                 .get_semaphore_counter_value(self.timeline.vk)
-                .map_err(Error::SemaphoreError)?
+        } {
+            Ok(val) => val,
+            Err(vk::Result::ERROR_DEVICE_LOST) => return Err(Error::DeadDevice),
+            Err(err) => return Err(Error::SemaphoreCounterError(err)),
         };
         self.cmd_pool.clean_old_buffers(val);
         Ok(())
@@ -420,6 +427,7 @@ impl Renderer for VulkanRenderer {
             size: output_size,
             cmd_buffer: None,
             descriptors: Vec::new(),
+            images: Vec::new(),
             has_draws: false,
             _marker: std::marker::PhantomData,
             #[cfg(feature = "wayland_frontend")]
@@ -940,6 +948,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     size: Size<i32, Physical>,
     cmd_buffer: Option<ash::vk::CommandBuffer>,
     descriptors: Vec<shaders::DescriptorSet>,
+    images: Vec<VulkanImage>,
     has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
@@ -1008,6 +1017,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
         let buf = self.get_or_create_cmd_buffer()?;
         self.has_draws = true;
+        self.images.push(texture.clone());
         let descriptor = if is_hdr {
             self.renderer
                 .pipelines
@@ -1446,8 +1456,7 @@ impl Frame for VulkanFrame<'_, '_> {
         self.fb.0.set_needs_acquire(true);
 
         let prev_seq_no = self.renderer.seq_no;
-        self.renderer.seq_no += 1;
-        let next_seq_no = self.renderer.seq_no;
+        let next_seq_no = prev_seq_no + 1;
 
         let cmd_buffer_info = [CommandBufferSubmitInfo::default().command_buffer(buf)];
         let signal_semaphore_info = [SemaphoreSubmitInfo::default()
@@ -1471,17 +1480,29 @@ impl Frame for VulkanFrame<'_, '_> {
             .signal_semaphore_infos(&signal_semaphore_info)
             .wait_semaphore_infos(&wait_semaphore_info);
 
-        unsafe {
+        let submit_res = unsafe {
             self.renderer
                 .device
                 .vk()
                 .queue_submit2(*self.renderer.device.queue(), &[submit_info], Fence::null())
-                .map_err(Error::SubmitError)?;
+        };
+
+        if let Err(err) = submit_res {
+            self.cmd_buffer = Some(buf);
+            if err == vk::Result::ERROR_DEVICE_LOST {
+                return Err(Error::DeadDevice);
+            } else {
+                return Err(Error::SubmitError(err));
+            }
         }
+
+        self.renderer.seq_no = next_seq_no;
 
         let point = next_seq_no;
         let descs = std::mem::take(&mut self.descriptors);
-        self.renderer.cmd_pool.store_pending_buffer(buf, point, descs);
+        let mut images = std::mem::take(&mut self.images);
+        images.push(self.fb.0.clone());
+        self.renderer.cmd_pool.store_pending_buffer(buf, point, descs, images);
 
         trace!(point, "VulkanFrame::finish single command buffer submitted");
 
@@ -1538,6 +1559,7 @@ impl Blit for VulkanRenderer {
             size,
             cmd_buffer: None,
             descriptors: Vec::new(),
+            images: Vec::new(),
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,

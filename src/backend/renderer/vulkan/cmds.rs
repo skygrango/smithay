@@ -1,7 +1,10 @@
 use super::Error;
 use crate::backend::{
     renderer::vulkan::shaders::DescriptorSet,
-    vulkan::device::{Device, WeakDevice},
+    vulkan::{
+        device::{Device, WeakDevice},
+        image::VulkanImage,
+    },
 };
 
 use ash::vk::{
@@ -14,7 +17,7 @@ use std::collections::VecDeque;
 pub struct CommandPool {
     device: WeakDevice,
     vk: VkCommandPool,
-    pending_buffers: VecDeque<(u64, CommandBuffer, Vec<DescriptorSet>)>,
+    pending_buffers: VecDeque<(u64, CommandBuffer, Vec<DescriptorSet>, Vec<VulkanImage>)>,
 }
 
 impl CommandPool {
@@ -59,12 +62,18 @@ impl CommandPool {
         Ok(buf)
     }
 
-    pub fn store_pending_buffer(&mut self, buf: CommandBuffer, seq: u64, descs: Vec<DescriptorSet>) {
-        self.pending_buffers.push_back((seq, buf, descs));
+    pub fn store_pending_buffer(
+        &mut self,
+        buf: CommandBuffer,
+        seq: u64,
+        descs: Vec<DescriptorSet>,
+        images: Vec<VulkanImage>,
+    ) {
+        self.pending_buffers.push_back((seq, buf, descs, images));
     }
 
     pub fn clean_old_buffers(&mut self, seq: u64) {
-        let idx = self.pending_buffers.iter().position(|(s, _, _)| *s > seq);
+        let idx = self.pending_buffers.iter().position(|(s, _, _, _)| *s > seq);
 
         // TODO: truncate_front when stable
         let bufs = (if let Some(idx) = idx {
@@ -72,7 +81,7 @@ impl CommandPool {
         } else {
             self.pending_buffers.drain(..)
         })
-        .map(|(_, buf, _)| buf)
+        .map(|(_, buf, _, _)| buf)
         .collect::<Vec<CommandBuffer>>();
 
         if let Some(device) = self.device.upgrade() {
@@ -88,14 +97,17 @@ impl CommandPool {
 impl Drop for CommandPool {
     fn drop(&mut self) {
         if let Some(device) = self.device.upgrade() {
+            unsafe {
+                let _ = device.vk().device_wait_idle();
+            }
+
             let bufs = self
                 .pending_buffers
                 .drain(..)
-                .map(|(_, buf, _)| buf)
+                .map(|(_, buf, _, _)| buf)
                 .collect::<Vec<_>>();
 
             unsafe {
-                let _ = device.vk().device_wait_idle();
                 if !bufs.is_empty() {
                     device.vk().free_command_buffers(self.vk, &bufs);
                 }
