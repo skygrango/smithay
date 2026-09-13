@@ -26,13 +26,13 @@ use crate::{
 };
 
 use ash::vk::{
-    self, AccessFlags, BorderColor, CompareOp, DependencyFlags, DescriptorImageInfo, DescriptorType,
-    Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags, ImageLayout,
-    ImageMemoryBarrier, ImageSubresourceLayers, ImageSubresourceRange, ImageToMemoryCopyEXT, MemoryBarrier,
-    MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint,
-    PipelineStageFlags, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags,
-    SamplerCreateInfo, SamplerMipmapMode, SemaphoreWaitInfo, ShaderStageFlags, SubmitInfo,
-    TimelineSemaphoreSubmitInfo,
+    self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyFlags, DependencyInfo,
+    DescriptorImageInfo, DescriptorType, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT,
+    ImageAspectFlags, ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange,
+    ImageToMemoryCopyEXT, MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D,
+    PipelineBindPoint, PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode,
+    SamplerCreateFlags, SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo,
+    ShaderStageFlags, SubmitInfo2,
 };
 use gbm::Modifier;
 use indexmap::IndexSet;
@@ -1072,11 +1072,14 @@ impl Frame for VulkanFrame<'_, '_> {
 
         let fb_old_layout = self.fb.0.current_layout();
         let (fb_src_stage, fb_src_access) = if fb_needs_acquire {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else if fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else {
-            (PipelineStageFlags::COMPUTE_SHADER, AccessFlags::SHADER_WRITE)
+            (
+                PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::SHADER_STORAGE_WRITE,
+            )
         };
 
         let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
@@ -1088,15 +1091,51 @@ impl Frame for VulkanFrame<'_, '_> {
 
         let tex_old_layout = texture.current_layout();
         let (tex_src_stage, tex_src_access) = if tex_needs_acquire {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else if tex_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else {
             (
-                PipelineStageFlags::COMPUTE_SHADER | PipelineStageFlags::TRANSFER | PipelineStageFlags::HOST,
-                AccessFlags::SHADER_WRITE | AccessFlags::TRANSFER_WRITE | AccessFlags::HOST_WRITE,
+                PipelineStageFlags2::COMPUTE_SHADER
+                    | PipelineStageFlags2::ALL_TRANSFER
+                    | PipelineStageFlags2::HOST,
+                AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::TRANSFER_WRITE | AccessFlags2::HOST_WRITE,
             )
         };
+
+        let fb_barrier = ImageMemoryBarrier2::default()
+            .image(*self.fb.0.vk())
+            .old_layout(fb_old_layout)
+            .new_layout(ImageLayout::GENERAL)
+            .src_queue_family_index(fb_src_queue)
+            .dst_queue_family_index(fb_dst_queue)
+            .src_stage_mask(fb_src_stage)
+            .src_access_mask(fb_src_access)
+            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(AccessFlags2::SHADER_STORAGE_READ | AccessFlags2::SHADER_STORAGE_WRITE)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        let tex_barrier = ImageMemoryBarrier2::default()
+            .image(*texture.vk())
+            .old_layout(tex_old_layout)
+            .new_layout(ImageLayout::GENERAL)
+            .src_queue_family_index(tex_src_queue)
+            .dst_queue_family_index(tex_dst_queue)
+            .src_stage_mask(tex_src_stage)
+            .src_access_mask(tex_src_access)
+            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
 
         unsafe {
             self.renderer
@@ -1115,43 +1154,9 @@ impl Frame for VulkanFrame<'_, '_> {
                 &[descriptor.vk()],
                 &[],
             );
-            self.renderer.device.vk().cmd_pipeline_barrier(
+            self.renderer.device.vk().cmd_pipeline_barrier2(
                 buf,
-                fb_src_stage | tex_src_stage,
-                PipelineStageFlags::COMPUTE_SHADER,
-                DependencyFlags::empty(),
-                &[],
-                &[],
-                &[
-                    ImageMemoryBarrier::default()
-                        .image(*self.fb.0.vk())
-                        .old_layout(fb_old_layout)
-                        .new_layout(ImageLayout::GENERAL)
-                        .src_queue_family_index(fb_src_queue)
-                        .dst_queue_family_index(fb_dst_queue)
-                        .src_access_mask(fb_src_access)
-                        .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
-                        .subresource_range(
-                            ImageSubresourceRange::default()
-                                .aspect_mask(ImageAspectFlags::COLOR)
-                                .layer_count(1)
-                                .level_count(1),
-                        ),
-                    ImageMemoryBarrier::default()
-                        .image(*texture.vk())
-                        .old_layout(tex_old_layout)
-                        .new_layout(ImageLayout::GENERAL)
-                        .src_queue_family_index(tex_src_queue)
-                        .dst_queue_family_index(tex_dst_queue)
-                        .src_access_mask(tex_src_access)
-                        .dst_access_mask(AccessFlags::SHADER_READ)
-                        .subresource_range(
-                            ImageSubresourceRange::default()
-                                .aspect_mask(ImageAspectFlags::COLOR)
-                                .layer_count(1)
-                                .level_count(1),
-                        ),
-                ],
+                &DependencyInfo::default().image_memory_barriers(&[fb_barrier, tex_barrier]),
             );
         }
 
@@ -1376,33 +1381,6 @@ impl Frame for VulkanFrame<'_, '_> {
             }
         }
 
-        unsafe {
-            self.renderer.device.vk().cmd_pipeline_barrier(
-                buf,
-                PipelineStageFlags::COMPUTE_SHADER,
-                PipelineStageFlags::COMPUTE_SHADER,
-                DependencyFlags::empty(),
-                &[MemoryBarrier::default()
-                    .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)],
-                &[],
-                &[ImageMemoryBarrier::default()
-                    .image(*self.fb.0.vk())
-                    .old_layout(ImageLayout::GENERAL)
-                    .new_layout(ImageLayout::GENERAL)
-                    .src_queue_family_index(QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
-                    .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )],
-            );
-        }
-
         self.descriptors.push(descriptor);
         Ok(())
     }
@@ -1436,14 +1414,16 @@ impl Frame for VulkanFrame<'_, '_> {
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
 
-        let barrier = ImageMemoryBarrier::default()
+        let barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
             .old_layout(ImageLayout::GENERAL)
             .new_layout(ImageLayout::GENERAL)
             .src_queue_family_index(qfam)
             .dst_queue_family_index(ext_queue)
-            .src_access_mask(AccessFlags::SHADER_WRITE)
-            .dst_access_mask(AccessFlags::empty())
+            .src_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(AccessFlags2::SHADER_STORAGE_WRITE)
+            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(AccessFlags2::NONE)
             .subresource_range(
                 ImageSubresourceRange::default()
                     .aspect_mask(ImageAspectFlags::COLOR)
@@ -1452,15 +1432,10 @@ impl Frame for VulkanFrame<'_, '_> {
             );
 
         unsafe {
-            self.renderer.device.vk().cmd_pipeline_barrier(
-                buf,
-                PipelineStageFlags::COMPUTE_SHADER | PipelineStageFlags::ALL_COMMANDS,
-                PipelineStageFlags::BOTTOM_OF_PIPE,
-                DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
+            self.renderer
+                .device
+                .vk()
+                .cmd_pipeline_barrier2(buf, &DependencyInfo::default().image_memory_barriers(&[barrier]));
             self.renderer
                 .device
                 .vk()
@@ -1472,35 +1447,39 @@ impl Frame for VulkanFrame<'_, '_> {
 
         let prev_seq_no = self.renderer.seq_no;
         self.renderer.seq_no += 1;
-        let next_seq_no = [self.renderer.seq_no];
-        let wait_seq_no = [prev_seq_no];
-        let mut timeline_info = TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&next_seq_no);
-        let wait_semaphores = [self.renderer.timeline.vk];
-        let wait_stages = [PipelineStageFlags::ALL_COMMANDS];
-        let command_buffers = [buf];
-        let signal_semaphores = [self.renderer.timeline.vk];
+        let next_seq_no = self.renderer.seq_no;
 
-        let mut submit_info = SubmitInfo::default()
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores);
+        let cmd_buffer_info = [CommandBufferSubmitInfo::default().command_buffer(buf)];
+        let signal_semaphore_info = [SemaphoreSubmitInfo::default()
+            .semaphore(self.renderer.timeline.vk)
+            .value(next_seq_no)
+            .stage_mask(PipelineStageFlags2::ALL_COMMANDS)];
 
-        if prev_seq_no > 0 {
-            timeline_info = timeline_info.wait_semaphore_values(&wait_seq_no);
-            submit_info = submit_info
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages);
-        }
-        submit_info = submit_info.push_next(&mut timeline_info);
+        let wait_semaphore_info = if prev_seq_no > 0 {
+            vec![
+                SemaphoreSubmitInfo::default()
+                    .semaphore(self.renderer.timeline.vk)
+                    .value(prev_seq_no)
+                    .stage_mask(PipelineStageFlags2::ALL_COMMANDS),
+            ]
+        } else {
+            Vec::new()
+        };
+
+        let submit_info = SubmitInfo2::default()
+            .command_buffer_infos(&cmd_buffer_info)
+            .signal_semaphore_infos(&signal_semaphore_info)
+            .wait_semaphore_infos(&wait_semaphore_info);
 
         unsafe {
             self.renderer
                 .device
                 .vk()
-                .queue_submit(*self.renderer.device.queue(), &[submit_info], Fence::null())
+                .queue_submit2(*self.renderer.device.queue(), &[submit_info], Fence::null())
                 .map_err(Error::SubmitError)?;
         }
 
-        let point = next_seq_no[0];
+        let point = next_seq_no;
         let descs = std::mem::take(&mut self.descriptors);
         self.renderer.cmd_pool.store_pending_buffer(buf, point, descs);
 
@@ -1657,12 +1636,32 @@ impl VulkanFrame<'_, '_> {
 
         let fb_old_layout = self.fb.0.current_layout();
         let (fb_src_stage, fb_src_access) = if fb_needs_acquire {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else if fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags::TOP_OF_PIPE, AccessFlags::empty())
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else {
-            (PipelineStageFlags::COMPUTE_SHADER, AccessFlags::SHADER_WRITE)
+            (
+                PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::SHADER_STORAGE_WRITE,
+            )
         };
+
+        let fb_barrier = ImageMemoryBarrier2::default()
+            .image(*self.fb.0.vk())
+            .old_layout(fb_old_layout)
+            .new_layout(ImageLayout::GENERAL)
+            .src_queue_family_index(fb_src_queue)
+            .dst_queue_family_index(fb_dst_queue)
+            .src_stage_mask(fb_src_stage)
+            .src_access_mask(fb_src_access)
+            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(AccessFlags2::SHADER_STORAGE_READ | AccessFlags2::SHADER_STORAGE_WRITE)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
 
         unsafe {
             self.renderer
@@ -1682,27 +1681,9 @@ impl VulkanFrame<'_, '_> {
                 &[descriptor.vk()],
                 &[],
             );
-            self.renderer.device.vk().cmd_pipeline_barrier(
+            self.renderer.device.vk().cmd_pipeline_barrier2(
                 buf,
-                fb_src_stage,
-                PipelineStageFlags::COMPUTE_SHADER,
-                DependencyFlags::empty(),
-                &[],
-                &[],
-                &[ImageMemoryBarrier::default()
-                    .image(*self.fb.0.vk())
-                    .old_layout(fb_old_layout)
-                    .new_layout(ImageLayout::GENERAL)
-                    .src_queue_family_index(fb_src_queue)
-                    .dst_queue_family_index(fb_dst_queue)
-                    .src_access_mask(fb_src_access)
-                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )],
+                &DependencyInfo::default().image_memory_barriers(&[fb_barrier]),
             );
         }
 
@@ -1755,33 +1736,6 @@ impl VulkanFrame<'_, '_> {
                     1,
                 );
             }
-        }
-
-        unsafe {
-            self.renderer.device.vk().cmd_pipeline_barrier(
-                buf,
-                PipelineStageFlags::COMPUTE_SHADER,
-                PipelineStageFlags::COMPUTE_SHADER,
-                DependencyFlags::empty(),
-                &[MemoryBarrier::default()
-                    .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)],
-                &[],
-                &[ImageMemoryBarrier::default()
-                    .image(*self.fb.0.vk())
-                    .old_layout(ImageLayout::GENERAL)
-                    .new_layout(ImageLayout::GENERAL)
-                    .src_queue_family_index(QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
-                    .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )],
-            );
         }
 
         self.descriptors.push(descriptor);

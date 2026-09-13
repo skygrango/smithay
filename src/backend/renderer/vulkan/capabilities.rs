@@ -61,7 +61,7 @@ impl Features {
     }
 
     pub fn required_features() -> Pin<Box<Self>> {
-        let mut features = Self::new(&Version::VERSION_1_2);
+        let mut features = Self::new(&Version::VERSION_1_3);
 
         {
             let features = unsafe { features.as_mut().get_unchecked_mut() };
@@ -75,6 +75,9 @@ impl Features {
                 .features
                 .features
                 .shader_storage_image_write_without_format = 1;
+            if let Some(features_13) = features.features_13.as_mut() {
+                features_13.synchronization2 = 1;
+            }
         }
 
         features
@@ -93,6 +96,9 @@ impl Features {
         }
         if self.features.features.shader_storage_image_write_without_format == 0 {
             return Err("shader_storage_image_write_without_format");
+        }
+        if self.features_13.as_ref().map(|f| f.synchronization2).unwrap_or(0) == 0 {
+            return Err("synchronization2");
         }
 
         Ok(())
