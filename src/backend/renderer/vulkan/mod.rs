@@ -40,7 +40,7 @@ use indexmap::IndexSet;
 use std::{collections::HashMap, ffi::CStr, fmt, ptr::NonNull};
 
 use super::{Blit, BlitFrame, Color32F, HdrOutputConfig, TextureFilter, sdr_color_to_hdr, sync::SyncPoint};
-use tracing::{debug, error, info, trace, warn};
+use tracing::trace;
 
 //mod buffer;
 mod capabilities;
@@ -418,10 +418,13 @@ impl Renderer for VulkanRenderer {
             fb: framebuffer,
             transform: dst_transform,
             size: output_size,
-            last_sequence: None,
+            cmd_buffer: None,
+            descriptors: Vec::new(),
+            has_draws: false,
             _marker: std::marker::PhantomData,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
+            is_blit: false,
         })
     }
 
@@ -935,9 +938,25 @@ pub struct VulkanFrame<'frame, 'buffer> {
 
     transform: Transform,
     size: Size<i32, Physical>,
-    last_sequence: Option<u64>,
+    cmd_buffer: Option<ash::vk::CommandBuffer>,
+    descriptors: Vec<shaders::DescriptorSet>,
+    has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
+    is_blit: bool,
+}
+
+impl VulkanFrame<'_, '_> {
+    fn get_or_create_cmd_buffer(&mut self) -> Result<ash::vk::CommandBuffer, Error> {
+        if let Some(buf) = self.cmd_buffer {
+            Ok(buf)
+        } else {
+            self.renderer.cleanup()?;
+            let buf = self.renderer.cmd_pool.create_and_begin_buffer()?;
+            self.cmd_buffer = Some(buf);
+            Ok(buf)
+        }
+    }
 }
 
 impl Frame for VulkanFrame<'_, '_> {
@@ -985,11 +1004,10 @@ impl Frame for VulkanFrame<'_, '_> {
         }
         let untransformed_dst = dst;
         let dst = self.transform.transform_rect_in(dst, &self.size);
-        self.renderer.cleanup()?;
 
-        let is_hdr = self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
-
-        let buf = self.renderer.cmd_pool.create_and_begin_buffer()?;
+        let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
+        let buf = self.get_or_create_cmd_buffer()?;
+        self.has_draws = true;
         let descriptor = if is_hdr {
             self.renderer
                 .pipelines
@@ -1160,7 +1178,23 @@ impl Frame for VulkanFrame<'_, '_> {
             Transform::Flipped180 => 6,
             Transform::Flipped270 => 7,
         };
-        let is_bgr = is_bgr_format(self.fb.0.format()) as u32;
+        let is_bgr = (is_bgr_format(self.fb.0.format())
+            || matches!(
+                self.fb.0.format(),
+                vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB | vk::Format::A2R10G10B10_UNORM_PACK32
+            )
+            || self
+                .fb
+                .0
+                .drm
+                .as_ref()
+                .map(|f| {
+                    matches!(
+                        f.code,
+                        Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010
+                    )
+                })
+                .unwrap_or(false)) as u32;
         let has_alpha = texture.has_alpha() as u32;
 
         for chunk in damage.chunks(4) {
@@ -1346,11 +1380,11 @@ impl Frame for VulkanFrame<'_, '_> {
             self.renderer.device.vk().cmd_pipeline_barrier(
                 buf,
                 PipelineStageFlags::COMPUTE_SHADER,
-                PipelineStageFlags::ALL_COMMANDS,
+                PipelineStageFlags::COMPUTE_SHADER,
                 DependencyFlags::empty(),
                 &[MemoryBarrier::default()
                     .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::MEMORY_READ | AccessFlags::SHADER_READ)],
+                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)],
                 &[],
                 &[ImageMemoryBarrier::default()
                     .image(*self.fb.0.vk())
@@ -1359,13 +1393,73 @@ impl Frame for VulkanFrame<'_, '_> {
                     .src_queue_family_index(QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
                     .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::MEMORY_READ | AccessFlags::SHADER_READ)
+                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
                     .subresource_range(
                         ImageSubresourceRange::default()
                             .aspect_mask(ImageAspectFlags::COLOR)
                             .layer_count(1)
                             .level_count(1),
                     )],
+            );
+        }
+
+        self.descriptors.push(descriptor);
+        Ok(())
+    }
+
+    fn transformation(&self) -> Transform {
+        self.transform
+    }
+
+    fn output_size(&self) -> Size<i32, Physical> {
+        self.size
+    }
+
+    fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        self.renderer.wait(sync)
+    }
+
+    fn finish(mut self) -> Result<SyncPoint, Self::Error> {
+        trace!(
+            has_draws = self.has_draws,
+            has_drm = self.renderer.timeline.drm.is_some(),
+            "VulkanFrame::finish"
+        );
+        if !self.has_draws {
+            return Ok(SyncPoint::signaled());
+        }
+
+        let Some(buf) = self.cmd_buffer.take() else {
+            return Ok(SyncPoint::signaled());
+        };
+
+        let qfam = self.renderer.device.queue_family_idx();
+        let ext_queue = self.renderer.external_queue_family();
+
+        let barrier = ImageMemoryBarrier::default()
+            .image(*self.fb.0.vk())
+            .old_layout(ImageLayout::GENERAL)
+            .new_layout(ImageLayout::GENERAL)
+            .src_queue_family_index(qfam)
+            .dst_queue_family_index(ext_queue)
+            .src_access_mask(AccessFlags::SHADER_WRITE)
+            .dst_access_mask(AccessFlags::empty())
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        unsafe {
+            self.renderer.device.vk().cmd_pipeline_barrier(
+                buf,
+                PipelineStageFlags::COMPUTE_SHADER | PipelineStageFlags::ALL_COMMANDS,
+                PipelineStageFlags::BOTTOM_OF_PIPE,
+                DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
             );
             self.renderer
                 .device
@@ -1374,13 +1468,15 @@ impl Frame for VulkanFrame<'_, '_> {
                 .map_err(Error::CommandBufferError)?;
         }
 
+        self.fb.0.set_needs_acquire(true);
+
         let prev_seq_no = self.renderer.seq_no;
         self.renderer.seq_no += 1;
         let next_seq_no = [self.renderer.seq_no];
-        let mut timeline_info = TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&next_seq_no);
         let wait_seq_no = [prev_seq_no];
+        let mut timeline_info = TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&next_seq_no);
         let wait_semaphores = [self.renderer.timeline.vk];
-        let wait_stages = [PipelineStageFlags::COMPUTE_SHADER];
+        let wait_stages = [PipelineStageFlags::ALL_COMMANDS];
         let command_buffers = [buf];
         let signal_semaphores = [self.renderer.timeline.vk];
 
@@ -1404,124 +1500,43 @@ impl Frame for VulkanFrame<'_, '_> {
                 .map_err(Error::SubmitError)?;
         }
 
-        self.renderer
-            .cmd_pool
-            .store_pending_buffer(buf, next_seq_no[0], descriptor);
-        self.last_sequence = Some(next_seq_no[0]);
-        trace!(
-            seq_no = next_seq_no[0],
-            "VulkanFrame::render_texture_from_to submitted to queue"
-        );
+        let point = next_seq_no[0];
+        let descs = std::mem::take(&mut self.descriptors);
+        self.renderer.cmd_pool.store_pending_buffer(buf, point, descs);
 
-        Ok(())
-    }
+        trace!(point, "VulkanFrame::finish single command buffer submitted");
 
-    fn transformation(&self) -> Transform {
-        self.transform
-    }
-
-    fn output_size(&self) -> Size<i32, Physical> {
-        self.size
-    }
-
-    fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        self.renderer.wait(sync)
-    }
-
-    fn finish(self) -> Result<SyncPoint, Self::Error> {
-        trace!(last_sequence = ?self.last_sequence, has_drm = self.renderer.timeline.drm.is_some(), "VulkanFrame::finish");
-        if let Some(prev_seq_no) = self.last_sequence {
-            let qfam = self.renderer.device.queue_family_idx();
-            let ext_queue = self.renderer.external_queue_family();
-
-            let buf = self.renderer.cmd_pool.create_and_begin_buffer()?;
-            let barrier = ImageMemoryBarrier::default()
-                .image(*self.fb.0.vk())
-                .old_layout(ImageLayout::GENERAL)
-                .new_layout(ImageLayout::GENERAL)
-                .src_queue_family_index(qfam)
-                .dst_queue_family_index(ext_queue)
-                .src_access_mask(AccessFlags::SHADER_WRITE)
-                .dst_access_mask(AccessFlags::empty())
-                .subresource_range(
-                    ImageSubresourceRange::default()
-                        .aspect_mask(ImageAspectFlags::COLOR)
-                        .layer_count(1)
-                        .level_count(1),
-                );
-
-            unsafe {
-                self.renderer.device.vk().cmd_pipeline_barrier(
-                    buf,
-                    PipelineStageFlags::COMPUTE_SHADER | PipelineStageFlags::ALL_COMMANDS,
-                    PipelineStageFlags::BOTTOM_OF_PIPE,
-                    DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-                self.renderer
-                    .device
-                    .vk()
-                    .end_command_buffer(buf)
-                    .map_err(Error::CommandBufferError)?;
+        if let Some(timeline) = self.renderer.timeline.drm.as_ref() {
+            Ok(DrmSyncPoint {
+                timeline: timeline.clone(),
+                point,
             }
-
-            self.fb.0.set_needs_acquire(true);
-
-            self.renderer.seq_no += 1;
-            let next_seq_no = [self.renderer.seq_no];
-            let wait_seq_no = [prev_seq_no];
-            let mut timeline_info = TimelineSemaphoreSubmitInfo::default()
-                .wait_semaphore_values(&wait_seq_no)
-                .signal_semaphore_values(&next_seq_no);
-            let wait_semaphores = [self.renderer.timeline.vk];
-            let wait_stages = [PipelineStageFlags::ALL_COMMANDS];
-            let command_buffers = [buf];
-            let signal_semaphores = [self.renderer.timeline.vk];
-
-            let mut submit_info = SubmitInfo::default()
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores)
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages);
-            submit_info = submit_info.push_next(&mut timeline_info);
-
-            unsafe {
-                self.renderer
-                    .device
-                    .vk()
-                    .queue_submit(*self.renderer.device.queue(), &[submit_info], Fence::null())
-                    .map_err(Error::SubmitError)?;
-            }
-
-            self.renderer
-                .cmd_pool
-                .store_pending_buffer(buf, next_seq_no[0], None);
-
-            let point = next_seq_no[0];
-            trace!(point, "VulkanFrame::finish release barrier submitted");
-
-            if let Some(timeline) = self.renderer.timeline.drm.as_ref() {
-                Ok(DrmSyncPoint {
-                    timeline: timeline.clone(),
-                    point,
-                }
-                .into())
-            } else {
-                // TODO: vulkan syncpoint
-                while let Err(VkResult::TIMEOUT) = unsafe {
-                    self.renderer.device.vk().wait_semaphores(
-                        &SemaphoreWaitInfo::default()
-                            .semaphores(&[self.renderer.timeline.vk])
-                            .values(&[point]),
-                        u64::MAX,
-                    )
-                } {}
-                Ok(SyncPoint::signaled())
-            }
+            .into())
         } else {
+            // TODO: vulkan syncpoint
+            while let Err(VkResult::TIMEOUT) = unsafe {
+                self.renderer.device.vk().wait_semaphores(
+                    &SemaphoreWaitInfo::default()
+                        .semaphores(&[self.renderer.timeline.vk])
+                        .values(&[point]),
+                    u64::MAX,
+                )
+            } {}
             Ok(SyncPoint::signaled())
+        }
+    }
+}
+
+impl Drop for VulkanFrame<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.cmd_buffer.take() {
+            unsafe {
+                let _ = self.renderer.device.vk().device_wait_idle();
+                self.renderer
+                    .device
+                    .vk()
+                    .free_command_buffers(self.renderer.cmd_pool.vk(), &[buf]);
+            }
         }
     }
 }
@@ -1542,9 +1557,12 @@ impl Blit for VulkanRenderer {
             _marker: std::marker::PhantomData,
             transform: Transform::Normal,
             size,
-            last_sequence: None,
+            cmd_buffer: None,
+            descriptors: Vec::new(),
+            has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
+            is_blit: true,
         };
         let src_rect = Rectangle::from_loc_and_size(
             (src.loc.x as f64, src.loc.y as f64),
@@ -1606,7 +1624,8 @@ impl VulkanFrame<'_, '_> {
             color
         };
 
-        let buf = self.renderer.cmd_pool.create_and_begin_buffer()?;
+        let buf = self.get_or_create_cmd_buffer()?;
+        self.has_draws = true;
         let descriptor = self
             .renderer
             .pipelines
@@ -1742,11 +1761,11 @@ impl VulkanFrame<'_, '_> {
             self.renderer.device.vk().cmd_pipeline_barrier(
                 buf,
                 PipelineStageFlags::COMPUTE_SHADER,
-                PipelineStageFlags::ALL_COMMANDS,
+                PipelineStageFlags::COMPUTE_SHADER,
                 DependencyFlags::empty(),
                 &[MemoryBarrier::default()
                     .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::MEMORY_READ | AccessFlags::SHADER_READ)],
+                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)],
                 &[],
                 &[ImageMemoryBarrier::default()
                     .image(*self.fb.0.vk())
@@ -1755,7 +1774,7 @@ impl VulkanFrame<'_, '_> {
                     .src_queue_family_index(QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
                     .src_access_mask(AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(AccessFlags::MEMORY_READ | AccessFlags::SHADER_READ)
+                    .dst_access_mask(AccessFlags::SHADER_READ | AccessFlags::SHADER_WRITE)
                     .subresource_range(
                         ImageSubresourceRange::default()
                             .aspect_mask(ImageAspectFlags::COLOR)
@@ -1763,53 +1782,9 @@ impl VulkanFrame<'_, '_> {
                             .level_count(1),
                     )],
             );
-            self.renderer
-                .device
-                .vk()
-                .end_command_buffer(buf)
-                .map_err(Error::CommandBufferError)?;
         }
 
-        let prev_seq_no = self.renderer.seq_no;
-        self.renderer.seq_no += 1;
-        let next_seq_no = [self.renderer.seq_no];
-        let mut timeline_info = TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&next_seq_no);
-        let wait_seq_no = [prev_seq_no];
-        let wait_semaphores = [self.renderer.timeline.vk];
-        let wait_stages = [PipelineStageFlags::COMPUTE_SHADER];
-
-        let command_buffers = [buf];
-        let signal_semaphores = [self.renderer.timeline.vk];
-
-        let mut submit_info = SubmitInfo::default()
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores);
-
-        if prev_seq_no > 0 {
-            timeline_info = timeline_info.wait_semaphore_values(&wait_seq_no);
-            submit_info = submit_info
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages);
-        }
-        submit_info = submit_info.push_next(&mut timeline_info);
-
-        unsafe {
-            self.renderer
-                .device
-                .vk()
-                .queue_submit(*self.renderer.device.queue(), &[submit_info], Fence::null())
-                .map_err(Error::SubmitError)?;
-        }
-
-        self.renderer
-            .cmd_pool
-            .store_pending_buffer(buf, next_seq_no[0], descriptor);
-        self.last_sequence = Some(next_seq_no[0]);
-        trace!(
-            seq_no = next_seq_no[0],
-            "VulkanFrame::draw_color submitted to queue"
-        );
-
+        self.descriptors.push(descriptor);
         Ok(())
     }
 }
@@ -1860,19 +1835,15 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
         format: Fourcc,
         size: Size<i32, BufferCoords>,
     ) -> Result<VulkanImage, Self::Error> {
-        let usage = ImageUsageFlags::STORAGE
+        let mut usage = ImageUsageFlags::STORAGE
             | ImageUsageFlags::TRANSFER_SRC
             | ImageUsageFlags::TRANSFER_DST
             | ImageUsageFlags::SAMPLED;
-        VulkanImage::new_with_fourcc(
-            &self.device,
-            size.w as u32,
-            size.h as u32,
-            format,
-            usage,
-            false,
-        )
-        .map_err(Error::ImageError)
+        if self.device.vk_ext_host_image_copy().is_some() {
+            usage |= ImageUsageFlags::HOST_TRANSFER_EXT;
+        }
+        VulkanImage::new_with_fourcc(&self.device, size.w as u32, size.h as u32, format, usage, false)
+            .map_err(Error::ImageError)
     }
 }
 

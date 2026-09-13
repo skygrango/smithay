@@ -409,6 +409,16 @@ impl FormatSet {
     pub fn indexset(&self) -> &IndexSet<Format> {
         &self.formats
     }
+
+    /// Check if the format set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.formats.is_empty()
+    }
+
+    /// Return the number of formats in the set.
+    pub fn len(&self) -> usize {
+        self.formats.len()
+    }
 }
 
 /// A lazy iterator producing elements in the intersection of [`FormatSet`]s.

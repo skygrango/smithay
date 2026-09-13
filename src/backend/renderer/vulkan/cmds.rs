@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 pub struct CommandPool {
     device: WeakDevice,
     vk: VkCommandPool,
-    pending_buffers: VecDeque<(u64, CommandBuffer, Option<DescriptorSet>)>,
+    pending_buffers: VecDeque<(u64, CommandBuffer, Vec<DescriptorSet>)>,
 }
 
 impl CommandPool {
@@ -24,6 +24,10 @@ impl CommandPool {
             vk,
             pending_buffers: VecDeque::new(),
         }
+    }
+
+    pub fn vk(&self) -> VkCommandPool {
+        self.vk
     }
 
     pub fn create_and_begin_buffer(&self) -> Result<CommandBuffer, Error> {
@@ -55,13 +59,8 @@ impl CommandPool {
         Ok(buf)
     }
 
-    pub fn store_pending_buffer(
-        &mut self,
-        buf: CommandBuffer,
-        seq: u64,
-        desc: impl Into<Option<DescriptorSet>>,
-    ) {
-        self.pending_buffers.push_back((seq, buf, desc.into()));
+    pub fn store_pending_buffer(&mut self, buf: CommandBuffer, seq: u64, descs: Vec<DescriptorSet>) {
+        self.pending_buffers.push_back((seq, buf, descs));
     }
 
     pub fn clean_old_buffers(&mut self, seq: u64) {

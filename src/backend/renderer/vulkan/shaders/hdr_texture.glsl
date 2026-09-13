@@ -243,124 +243,133 @@ void main() {
         coord.y < params.dstRect.y || coord.y >= (params.dstRect.y + params.dstRect.w))
         return;
 
-    uvec2 outSize = imageSize(dst);
+    bool in_damage = false;
+    for (int i = 0; i < params.damageSize; i++) {
+        ivec4 rect = params.damage[i];
+        if (coord.x >= rect.x && coord.x < (rect.x + rect.z) &&
+            coord.y >= rect.y && coord.y < (rect.y + rect.w))
+        {
+            in_damage = true;
+            break;
+        }
+    }
+    if (!in_damage)
+        return;
+
     uvec2 texSize = textureSize(tex, 0);
     vec2 dstUV = (vec2(coord) - params.dstRect.xy) / params.dstRect.zw;
     vec2 srcUV = ((dstUV * params.srcRect.zw) + params.srcRect.xy) / texSize;
     vec2 uv = applyTransform(srcUV, params.srcTransform);
 
-    for (int i = 0; i < params.damageSize; i++) {
-        ivec4 rect = params.damage[i];
-
-        if (coord.x >= rect.x && coord.x < (rect.x + rect.z) &&
-            coord.y >= rect.y && coord.y < (rect.y + rect.w))
-        {
-            vec4 raw = texture(tex, uv);
-            if (params.hasAlpha == 0) {
-                raw.a = 1.0;
-            }
-
-            float src_a = raw.a;
-            vec3 raw_rgb = src_a > 0.00001 ? raw.rgb / src_a : vec3(0.0);
-            float eff_alpha = clamp(src_a * params.alpha, 0.0, 1.0);
-
-            // Conditional conversion: If source color matches destination target color space,
-            // avoid unnecessary transforms!
-            if (params.skipColorTransform != 0) {
-                if (params.targetIsSdr != 0) {
-                    vec4 color = vec4(raw_rgb * eff_alpha, eff_alpha);
-                    if (color.a < 1.0) {
-                        vec4 dstColor = imageLoad(dst, ivec2(coord));
-                        if (params.isBgr != 0) {
-                            dstColor = dstColor.bgra;
-                        }
-                        color = color + dstColor * (1.0 - color.a);
-                    }
-                    if (params.isBgr != 0) {
-                        color = color.bgra;
-                    }
-                    imageStore(dst, ivec2(coord), color);
-                    break;
-                }
-
-                // Native HDR: buffer is already BT.2020 PQ
-                vec3 out_pq;
-                if (eff_alpha >= 0.9999) {
-                    out_pq = raw_rgb;
-                } else {
-                    vec4 dstColor = imageLoad(dst, ivec2(coord));
-                    vec3 dst_pq = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
-                    vec3 dst_linear_10k = pq_to_linear_v(dst_pq);
-                    vec3 src_linear_10k = pq_to_linear_v(raw_rgb);
-                    vec3 blended_linear = src_linear_10k * eff_alpha + dst_linear_10k * (1.0 - eff_alpha);
-                    out_pq = encode_pq_v(blended_linear);
-                }
-
-                vec4 final_color = vec4(params.isBgr != 0 ? out_pq.bgr : out_pq, 1.0);
-                imageStore(dst, ivec2(coord), final_color);
-                break;
-            }
-
-            // Colorspace transform required: Convert to linear light in target primaries
-            vec3 src_linear_10k = source_to_linear_10k(raw_rgb);
-
-            if (params.targetIsSdr != 0) {
-                float inv_white = 10000.0 / clamp(params.referenceWhite, 80.0, 10000.0);
-                vec3 linear_sdr_bt2020 = src_linear_10k * inv_white;
-                vec3 rec709 = clamp(bt2020_to_rec709 * linear_sdr_bt2020, vec3(0.0), vec3(1.0));
-                vec3 out_sdr = encode_sdr_v(rec709, params.sdrGamma);
-
-                vec4 color = vec4(out_sdr * eff_alpha, eff_alpha);
-                if (color.a < 1.0) {
-                    vec4 dstColor = imageLoad(dst, ivec2(coord));
-                    if (params.isBgr != 0) {
-                        dstColor = dstColor.bgra;
-                    }
-                    color = color + dstColor * (1.0 - color.a);
-                }
-                if (params.isBgr != 0) {
-                    color = color.bgra;
-                }
-                imageStore(dst, ivec2(coord), color);
-                break;
-            }
-
-            if (params.hardwareOffload != 0) {
-                // In hardware offload mode, destination buffer stores normalized linear light
-                // where 1.0 = reference_white (CRTC GAMMA_LUT will encode to PQ).
-                float ref_white = clamp(params.referenceWhite, 80.0, 10000.0);
-                vec3 src_linear = src_linear_10k * (10000.0 / ref_white);
-
-                vec3 out_rgb;
-                if (eff_alpha >= 0.9999) {
-                    out_rgb = src_linear;
-                } else {
-                    vec4 dstColor = imageLoad(dst, ivec2(coord));
-                    vec3 dst_rgb = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
-                    out_rgb = src_linear * eff_alpha + dst_rgb * (1.0 - eff_alpha);
-                }
-
-                vec4 final_color = vec4(params.isBgr != 0 ? out_rgb.bgr : out_rgb, 1.0);
-                imageStore(dst, ivec2(coord), final_color);
-                break;
-            }
-
-            // Native HDR mode: destination buffer stores ST 2084 PQ encoded code values.
-            vec3 out_pq;
-            if (eff_alpha >= 0.9999) {
-                out_pq = encode_pq_v(src_linear_10k);
-            } else {
-                // Linear light blending: decode dst PQ to linear light, blend in linear space, encode back to PQ.
-                vec4 dstColor = imageLoad(dst, ivec2(coord));
-                vec3 dst_pq = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
-                vec3 dst_linear_10k = pq_to_linear_v(dst_pq);
-                vec3 blended_linear = src_linear_10k * eff_alpha + dst_linear_10k * (1.0 - eff_alpha);
-                out_pq = encode_pq_v(blended_linear);
-            }
-
-            vec4 final_color = vec4(params.isBgr != 0 ? out_pq.bgr : out_pq, 1.0);
-            imageStore(dst, ivec2(coord), final_color);
-            break;
-        }
+    vec4 raw = texture(tex, uv);
+    if (params.hasAlpha == 0) {
+        raw.a = 1.0;
     }
+
+    float src_a = raw.a;
+    vec3 raw_rgb = src_a > 0.00001 ? raw.rgb / src_a : vec3(0.0);
+    float eff_alpha = clamp(src_a * params.alpha, 0.0, 1.0);
+
+    // Conditional conversion: If source color matches destination target color space,
+    // avoid unnecessary transforms!
+    if (params.skipColorTransform != 0) {
+        if (params.targetIsSdr != 0) {
+            vec4 color = vec4(raw_rgb * eff_alpha, eff_alpha);
+            if (color.a < 1.0) {
+                vec4 dstColor = imageLoad(dst, ivec2(coord));
+                if (params.isBgr != 0) {
+                    dstColor = dstColor.bgra;
+                }
+                color = color + dstColor * (1.0 - color.a);
+            }
+            if (params.isBgr != 0) {
+                color = color.bgra;
+            }
+            imageStore(dst, ivec2(coord), color);
+            return;
+        }
+
+        // Native HDR: buffer is already BT.2020 PQ
+        vec3 out_pq;
+        float final_a = eff_alpha;
+        if (eff_alpha >= 0.9999) {
+            out_pq = raw_rgb;
+        } else {
+            vec4 dstColor = imageLoad(dst, ivec2(coord));
+            vec3 dst_pq = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
+            vec3 dst_linear_10k = pq_to_linear_v(dst_pq);
+            vec3 src_linear_10k = pq_to_linear_v(raw_rgb);
+            vec3 blended_linear = src_linear_10k * eff_alpha + dst_linear_10k * (1.0 - eff_alpha);
+            out_pq = encode_pq_v(blended_linear);
+            final_a = eff_alpha + dstColor.a * (1.0 - eff_alpha);
+        }
+
+        vec4 final_color = vec4(params.isBgr != 0 ? out_pq.bgr : out_pq, final_a);
+        imageStore(dst, ivec2(coord), final_color);
+        return;
+    }
+
+    // Colorspace transform required: Convert to linear light in target primaries
+    vec3 src_linear_10k = source_to_linear_10k(raw_rgb);
+
+    if (params.targetIsSdr != 0) {
+        float inv_white = 10000.0 / clamp(params.referenceWhite, 80.0, 10000.0);
+        vec3 linear_sdr_bt2020 = src_linear_10k * inv_white;
+        vec3 rec709 = clamp(bt2020_to_rec709 * linear_sdr_bt2020, vec3(0.0), vec3(1.0));
+        vec3 out_sdr = encode_sdr_v(rec709, params.sdrGamma);
+
+        vec4 color = vec4(out_sdr * eff_alpha, eff_alpha);
+        if (color.a < 1.0) {
+            vec4 dstColor = imageLoad(dst, ivec2(coord));
+            if (params.isBgr != 0) {
+                dstColor = dstColor.bgra;
+            }
+            color = color + dstColor * (1.0 - color.a);
+        }
+        if (params.isBgr != 0) {
+            color = color.bgra;
+        }
+        imageStore(dst, ivec2(coord), color);
+        return;
+    }
+
+    if (params.hardwareOffload != 0) {
+        // In hardware offload mode, destination buffer stores normalized linear light
+        // where 1.0 = reference_white (CRTC GAMMA_LUT will encode to PQ).
+        float ref_white = clamp(params.referenceWhite, 80.0, 10000.0);
+        vec3 src_linear = src_linear_10k * (10000.0 / ref_white);
+
+        vec3 out_rgb;
+        float final_a = eff_alpha;
+        if (eff_alpha >= 0.9999) {
+            out_rgb = src_linear;
+        } else {
+            vec4 dstColor = imageLoad(dst, ivec2(coord));
+            vec3 dst_rgb = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
+            out_rgb = src_linear * eff_alpha + dst_rgb * (1.0 - eff_alpha);
+            final_a = eff_alpha + dstColor.a * (1.0 - eff_alpha);
+        }
+
+        vec4 final_color = vec4(params.isBgr != 0 ? out_rgb.bgr : out_rgb, final_a);
+        imageStore(dst, ivec2(coord), final_color);
+        return;
+    }
+
+    // Native HDR mode: destination buffer stores ST 2084 PQ encoded code values.
+    vec3 out_pq;
+    float final_a = eff_alpha;
+    if (eff_alpha >= 0.9999) {
+        out_pq = encode_pq_v(src_linear_10k);
+    } else {
+        // Linear light blending: decode dst PQ to linear light, blend in linear space, encode back to PQ.
+        vec4 dstColor = imageLoad(dst, ivec2(coord));
+        vec3 dst_pq = (params.isBgr != 0) ? dstColor.bgr : dstColor.rgb;
+        vec3 dst_linear_10k = pq_to_linear_v(dst_pq);
+        vec3 blended_linear = src_linear_10k * eff_alpha + dst_linear_10k * (1.0 - eff_alpha);
+        out_pq = encode_pq_v(blended_linear);
+        final_a = eff_alpha + dstColor.a * (1.0 - eff_alpha);
+    }
+
+    vec4 final_color = vec4(params.isBgr != 0 ? out_pq.bgr : out_pq, final_a);
+    imageStore(dst, ivec2(coord), final_color);
 }
