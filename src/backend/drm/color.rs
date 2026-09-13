@@ -1405,7 +1405,10 @@ mod tests {
         let m01 = DrmColorCtm::from_s31_32(ctm.matrix[1]);
         let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
         let r0 = m00 + m01 + m02;
-        assert!((r0 - scale).abs() < 2e-6, "r0={r0} must be scale={scale} (scaled CTM)");
+        assert!(
+            (r0 - scale).abs() < 2e-6,
+            "r0={r0} must be scale={scale} (scaled CTM)"
+        );
 
         // 3. GAMMA_LUT maps linear [0.0, 1.0] to canonical PQ [0.0, 10,000 nits]
         // Entry 0 must be STRICTLY 0 (0.0 nits true black, no washed out / lifted black)

@@ -2102,7 +2102,7 @@ where
             previous_state,
             &self.surface,
             self.supports_fencing,
-            false,
+            self.surface.commit_pending(),
             allow_partial_update,
         );
         if let Err(ref test_err) = test_res {
@@ -3597,7 +3597,7 @@ where
                     self.supports_fencing,
                     plane_info.handle,
                     plane_state,
-                    false,
+                    self.surface.commit_pending(),
                 )
                 .is_ok()
         };
@@ -4218,7 +4218,7 @@ where
                     self.supports_fencing,
                     plane.handle,
                     plane_state,
-                    false,
+                    self.surface.commit_pending(),
                 )
                 .is_ok()
         };
