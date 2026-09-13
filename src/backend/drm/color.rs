@@ -554,16 +554,19 @@ impl PlaneColorConversion {
                 };
                 // SDR input is strictly in [0.0, 1.0] (no out-of-gamut negative values, no >1.0 highlights).
                 // DEGAMMA linearizes non-linear sRGB into linear [0.0, 1.0].
-                // CTM rotates Rec.709 primaries into BT.2020 primaries with row sums = 1.0, keeping values in [0.0, 1.0].
-                // GAMMA_LUT scales linear [0.0, 1.0] to PQ [0, ref_white], utilizing 100% of all LUT entries
-                // to maintain deep blacks, full contrast, and prevent washed-out visuals.
-                let ctm = DrmColorCtm::rec709_to_bt2020();
+                // CTM rotates Rec.709 primaries into BT.2020 primaries and pre-scales by
+                // (ref_white / 10,000.0) so that linear radiance maps into [0.0, 1.0], matching
+                // the ScRgbToPq pipeline.
+                // GAMMA_LUT encodes the canonical SMPTE ST 2084 PQ curve from 0.0 to 10,000 cd/m²,
+                // providing correct contrast, deep blacks, and preventing washed-out visuals.
+                let scale = (ref_white as f64) / 10000.0;
+                let ctm = DrmColorCtm::rec709_to_bt2020_scaled(scale);
                 let degamma_lut = if degamma_lut_size > 0 {
                     Some(DrmColorLut::create_srgb_degamma_lut(degamma_lut_size))
                 } else {
                     None
                 };
-                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, ref_white as f32);
+                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, 10000.0);
                 CrtcColorState {
                     degamma_lut,
                     ctm: Some(ctm),
@@ -578,16 +581,19 @@ impl PlaneColorConversion {
                 };
                 // HLG is already BT.2020 color primaries, input strictly in [0.0, 1.0].
                 // DEGAMMA converts HLG to linear [0.0, 1.0].
-                // GAMMA_LUT scales linear [0.0, 1.0] to PQ [0, ref_white].
+                // CTM scales linear radiance into [0.0, 1.0] by (ref_white / 10,000.0).
+                // GAMMA_LUT encodes canonical ST 2084 PQ.
+                let scale = (ref_white as f64) / 10000.0;
+                let ctm = DrmColorCtm::identity_scaled(scale);
                 let degamma_lut = if degamma_lut_size > 0 {
                     Some(DrmColorLut::create_hlg_degamma_lut(degamma_lut_size))
                 } else {
                     None
                 };
-                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, ref_white as f32);
+                let gamma_lut = DrmColorLut::create_pq_lut(gamma_size, 10000.0);
                 CrtcColorState {
                     degamma_lut,
-                    ctm: None,
+                    ctm: Some(ctm),
                     gamma_lut: Some(gamma_lut),
                 }
             }
@@ -667,7 +673,7 @@ impl ScanoutPlan {
     #[inline]
     pub fn requires_crtc_color_state(&self) -> Option<PlaneColorConversion> {
         match self {
-            ScanoutPlan::CrtcHardware(conv) => Some(*conv),
+            ScanoutPlan::CrtcHardware(conv) | ScanoutPlan::PlaneColorop(conv) => Some(*conv),
             _ => None,
         }
     }
@@ -1393,27 +1399,27 @@ mod tests {
         assert_eq!(degamma_lut[0].red, 0);
         assert_eq!(degamma_lut[4095].red, 65535);
 
-        // 2. CTM is unscaled Rec.709 to BT.2020 matrix (row sums = 1.0)
+        // 2. CTM is scaled Rec.709 to BT.2020 matrix (row sums = scale)
+        let scale = 335.0 / 10000.0;
         let m00 = DrmColorCtm::from_s31_32(ctm.matrix[0]);
         let m01 = DrmColorCtm::from_s31_32(ctm.matrix[1]);
         let m02 = DrmColorCtm::from_s31_32(ctm.matrix[2]);
         let r0 = m00 + m01 + m02;
-        assert!((r0 - 1.0).abs() < 2e-6, "r0={r0} must be 1.0 (unscaled CTM)");
+        assert!((r0 - scale).abs() < 2e-6, "r0={r0} must be scale={scale} (scaled CTM)");
 
-        // 3. GAMMA_LUT maps linear [0.0, 1.0] to PQ [0.0, ref_white]
+        // 3. GAMMA_LUT maps linear [0.0, 1.0] to canonical PQ [0.0, 10,000 nits]
         // Entry 0 must be STRICTLY 0 (0.0 nits true black, no washed out / lifted black)
         assert_eq!(gamma_lut[0].red, 0);
         assert_eq!(gamma_lut[0].green, 0);
         assert_eq!(gamma_lut[0].blue, 0);
 
-        // Entry 4095 must encode exactly 335 nits in PQ:
-        // encode_pq(335 / 10000) = 0.633611 -> 41524 in u16
-        let expected_white = (encode_pq(335.0 / 10000.0) * 65535.0).round() as u16;
-        assert_eq!(gamma_lut[4095].red, expected_white);
+        // Entry 4095 is 10,000 nits -> 65535
+        assert_eq!(gamma_lut[4095].red, 65535);
 
-        // Entry 1 is (1/4095) * 335 = 0.0818 nits, providing fine shadow gradations (no shadow posterization)
-        assert!(gamma_lut[1].red < 7000);
-        assert!(gamma_lut[1].red > 0);
+        // At index corresponding to 335 nits (335 / 10000 = 0.0335):
+        let idx_335 = (scale * 4095.0) as usize;
+        let expected_white = (encode_pq(335.0 / 10000.0) * 65535.0).round() as u16;
+        assert!((gamma_lut[idx_335].red as i32 - expected_white as i32).abs() < 500);
     }
 
     #[test]
