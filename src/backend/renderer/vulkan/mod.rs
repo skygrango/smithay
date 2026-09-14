@@ -72,6 +72,7 @@ pub struct VulkanRenderer {
     downscale_filter: super::TextureFilter,
     upscale_filter: super::TextureFilter,
     pub(crate) hdr_config: Option<HdrOutputConfig>,
+    pub(crate) supports_optimal_host_copy: bool,
 
     // A bunch of the previous structs contain Weak-device references.
     // So we want to drop this last for proper cleanup and avoiding accidental
@@ -247,6 +248,35 @@ impl VulkanRenderer {
                 .map_err(Error::SamplerError)?
         };
 
+        let supports_optimal_host_copy = if capabilities.contains(&Capability::HostImageCopy) {
+            let mut hic_props = vk::PhysicalDeviceHostImageCopyPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut hic_props);
+            unsafe {
+                phd.instance()
+                    .handle()
+                    .get_physical_device_properties2(phd.handle(), &mut props2)
+            };
+            if hic_props.identical_memory_type_requirements != 0 {
+                true
+            } else {
+                VulkanImage::new_with_fourcc(
+                    &device,
+                    1,
+                    1,
+                    Fourcc::Abgr8888,
+                    vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
+                    false,
+                )
+                .is_ok()
+            }
+        } else {
+            false
+        };
+        tracing::debug!(
+            supports_optimal_host_copy,
+            "Vulkan host image copy capability evaluated"
+        );
+
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
@@ -262,6 +292,7 @@ impl VulkanRenderer {
             downscale_filter: super::TextureFilter::Linear,
             upscale_filter: super::TextureFilter::Linear,
             hdr_config: None,
+            supports_optimal_host_copy,
         })
     }
 
@@ -290,16 +321,142 @@ impl VulkanRenderer {
     }
 
     pub fn cleanup(&mut self) -> Result<(), Error> {
-        let val = match unsafe {
-            self.device
-                .vk()
-                .get_semaphore_counter_value(self.timeline.vk)
-        } {
+        let val = match unsafe { self.device.vk().get_semaphore_counter_value(self.timeline.vk) } {
             Ok(val) => val,
             Err(vk::Result::ERROR_DEVICE_LOST) => return Err(Error::DeadDevice),
             Err(err) => return Err(Error::SemaphoreCounterError(err)),
         };
         self.cmd_pool.clean_old_buffers(val);
+        Ok(())
+    }
+
+    fn upload_host_memory_to_image(
+        &self,
+        image: &VulkanImage,
+        src_ptr: *const u8,
+        src_stride: usize,
+        bpp: usize,
+        region: Rectangle<i32, BufferCoords>,
+    ) -> Result<(), Error> {
+        if bpp == 0 {
+            return Err(Error::UnsupportedPixelFormat);
+        }
+
+        let image_rect = Rectangle::from_size((image.width as i32, image.height as i32).into());
+        let Some(region) = region.intersection(image_rect) else {
+            return Ok(());
+        };
+        if region.size.w <= 0 || region.size.h <= 0 {
+            return Ok(());
+        }
+
+        let device_copy = self
+            .device
+            .vk_ext_host_image_copy()
+            .ok_or(Error::MissingExtension(ash::ext::host_image_copy::NAME))?;
+
+        if image.current_layout() != ImageLayout::GENERAL {
+            unsafe {
+                device_copy
+                    .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
+                        .old_layout(image.current_layout())
+                        .new_layout(ImageLayout::GENERAL)
+                        .image(*image.vk())
+                        .subresource_range(
+                            ImageSubresourceRange::default()
+                                .aspect_mask(ImageAspectFlags::COLOR)
+                                .layer_count(1)
+                                .level_count(1),
+                        )])
+                    .map_err(Error::HostImageTransitionError)?;
+            }
+            image.set_current_layout(ImageLayout::GENERAL);
+        }
+
+        if image.is_linear() && image.mem_bits().contains(MemoryPropertyFlags::HOST_VISIBLE) {
+            let subresource = vk::ImageSubresource::default()
+                .aspect_mask(if image.tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT {
+                    ImageAspectFlags::MEMORY_PLANE_0_EXT
+                } else {
+                    ImageAspectFlags::COLOR
+                })
+                .mip_level(0)
+                .array_layer(0);
+
+            let layout = unsafe {
+                self.device
+                    .vk()
+                    .get_image_subresource_layout(*image.vk(), subresource)
+            };
+
+            let map_ptr = unsafe {
+                self.device
+                    .vk()
+                    .map_memory(image.inner.memory, 0, vk::WHOLE_SIZE, MemoryMapFlags::empty())
+                    .map_err(Error::HostImageCopyError)?
+            };
+
+            let dst_base = unsafe { (map_ptr as *mut u8).add(layout.offset as usize) };
+            let dst_pitch = layout.row_pitch as usize;
+            let copy_bytes_per_row = region.size.w as usize * bpp;
+
+            unsafe {
+                for r in 0..region.size.h as usize {
+                    let y = region.loc.y as usize + r;
+                    let x = region.loc.x as usize;
+                    let src_row = src_ptr.add(y * src_stride + x * bpp);
+                    let dst_row = dst_base.add(y * dst_pitch + x * bpp);
+                    std::ptr::copy_nonoverlapping(src_row, dst_row, copy_bytes_per_row);
+                }
+
+                if !image.mem_bits().contains(MemoryPropertyFlags::HOST_COHERENT) {
+                    let range = vk::MappedMemoryRange::default()
+                        .memory(image.inner.memory)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE);
+                    let _ = self.device.vk().flush_mapped_memory_ranges(&[range]);
+                }
+
+                self.device.vk().unmap_memory(image.inner.memory);
+            }
+        } else {
+            let host_offset = (region.loc.y as usize * src_stride) + (region.loc.x as usize * bpp);
+            let host_ptr = unsafe { src_ptr.add(host_offset) };
+
+            unsafe {
+                device_copy
+                    .copy_memory_to_image(
+                        &vk::CopyMemoryToImageInfoEXT::default()
+                            .flags(HostImageCopyFlagsEXT::empty())
+                            .dst_image(*image.vk())
+                            .dst_image_layout(ImageLayout::GENERAL)
+                            .regions(&[MemoryToImageCopyEXT::default()
+                                .host_pointer(host_ptr as *const _)
+                                .memory_row_length((src_stride / bpp) as u32)
+                                .memory_image_height(0)
+                                .image_subresource(
+                                    ImageSubresourceLayers::default()
+                                        .aspect_mask(ImageAspectFlags::COLOR)
+                                        .mip_level(0)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                )
+                                .image_offset(Offset3D {
+                                    x: region.loc.x,
+                                    y: region.loc.y,
+                                    z: 0,
+                                })
+                                .image_extent(
+                                    Extent3D::default()
+                                        .depth(1)
+                                        .width(region.size.w as u32)
+                                        .height(region.size.h as u32),
+                                )]),
+                    )
+                    .map_err(Error::HostImageCopyError)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -311,68 +468,15 @@ impl VulkanRenderer {
         stride: i32,
         region: Rectangle<i32, BufferCoords>,
     ) -> Result<(), Error> {
-        use ash::ext::host_image_copy;
+        let bpp = image
+            .drm
+            .map(|f| f.code)
+            .or_else(|| get_drm_format(image.format()))
+            .and_then(crate::backend::allocator::format::get_bpp)
+            .unwrap_or(32)
+            / 8;
 
-        if region.size.w <= 0 || region.size.h <= 0 {
-            return Ok(());
-        }
-
-        let device_copy = self
-            .device
-            .vk_ext_host_image_copy()
-            .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
-
-        let host_ptr =
-            unsafe { ptr.offset((region.loc.y as isize * stride as isize) + (region.loc.x as isize * 4)) };
-
-        unsafe {
-            device_copy
-                .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
-                    .old_layout(image.current_layout())
-                    .new_layout(ImageLayout::GENERAL)
-                    .image(*image.vk())
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )])
-                .map_err(Error::HostImageTransitionError)?;
-            device_copy
-                .copy_memory_to_image(
-                    &vk::CopyMemoryToImageInfoEXT::default()
-                        .flags(HostImageCopyFlagsEXT::empty())
-                        .dst_image(*image.vk())
-                        .dst_image_layout(ImageLayout::GENERAL)
-                        .regions(&[MemoryToImageCopyEXT::default()
-                            .host_pointer(host_ptr as *const _)
-                            .memory_row_length((stride / 4) as u32)
-                            .memory_image_height(0)
-                            .image_subresource(
-                                ImageSubresourceLayers::default()
-                                    .aspect_mask(ImageAspectFlags::COLOR)
-                                    .mip_level(0)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .image_offset(Offset3D {
-                                x: region.loc.x,
-                                y: region.loc.y,
-                                z: 0,
-                            })
-                            .image_extent(
-                                Extent3D::default()
-                                    .depth(1)
-                                    .width(region.size.w as u32)
-                                    .height(region.size.h as u32),
-                            )]),
-                )
-                .map_err(Error::HostImageCopyError)?;
-        }
-
-        image.set_current_layout(ImageLayout::GENERAL);
-
-        Ok(())
+        self.upload_host_memory_to_image(image, ptr, stride as usize, bpp, region)
     }
 }
 
@@ -467,65 +571,38 @@ impl ImportMem for VulkanRenderer {
         size: Size<i32, BufferCoords>,
         _flipped: bool, // TODO
     ) -> Result<Self::TextureId, Self::Error> {
-        use ash::ext::host_image_copy;
+        let bpp = crate::backend::allocator::format::get_bpp(format).unwrap_or(32) / 8;
+        let stride = size.w as usize * bpp;
+        if data.len() < stride * size.h as usize {
+            return Err(Error::BufferAccessError);
+        }
 
-        let device_copy = self
-            .device
-            .vk_ext_host_image_copy()
-            .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
-
+        let linear = !self.supports_optimal_host_copy;
         let image = VulkanImage::new_with_fourcc(
             &self.device,
             size.w as u32,
             size.h as u32,
             format,
             vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
-            false,
+            linear,
         )
+        .or_else(|_| {
+            if !linear {
+                VulkanImage::new_with_fourcc(
+                    &self.device,
+                    size.w as u32,
+                    size.h as u32,
+                    format,
+                    vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
+                    true,
+                )
+            } else {
+                Err(ImageError::NoMemoryAvailable)
+            }
+        })
         .map_err(Error::ImageError)?;
 
-        unsafe {
-            device_copy
-                .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
-                    .old_layout(image.current_layout())
-                    .new_layout(ImageLayout::GENERAL)
-                    .image(*image.vk())
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )])
-                .map_err(Error::HostImageTransitionError)?;
-            device_copy
-                .copy_memory_to_image(
-                    &vk::CopyMemoryToImageInfoEXT::default()
-                        .flags(HostImageCopyFlagsEXT::empty())
-                        .dst_image(*image.vk())
-                        .dst_image_layout(ImageLayout::GENERAL)
-                        .regions(&[MemoryToImageCopyEXT::default()
-                            .host_pointer(data.as_ptr() as *const _)
-                            .memory_row_length(0)
-                            .memory_image_height(0)
-                            .image_subresource(
-                                ImageSubresourceLayers::default()
-                                    .aspect_mask(ImageAspectFlags::COLOR)
-                                    .mip_level(0)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .image_offset(Offset3D::default())
-                            .image_extent(
-                                Extent3D::default()
-                                    .depth(1)
-                                    .width(size.w as u32)
-                                    .height(size.h as u32),
-                            )]),
-                )
-                .map_err(Error::HostImageCopyError)?;
-        }
-
-        image.set_current_layout(ImageLayout::GENERAL);
+        self.upload_host_memory_to_image(&image, data.as_ptr(), stride, bpp, Rectangle::from_size(size))?;
 
         Ok(image)
     }
@@ -536,65 +613,28 @@ impl ImportMem for VulkanRenderer {
         data: &[u8],
         region: Rectangle<i32, BufferCoords>,
     ) -> Result<(), Self::Error> {
-        if region.size.w <= 0 || region.size.h <= 0 {
-            return Ok(());
+        let bpp = texture
+            .drm
+            .map(|f| f.code)
+            .or_else(|| get_drm_format(texture.format()))
+            .and_then(crate::backend::allocator::format::get_bpp)
+            .unwrap_or(32)
+            / 8;
+
+        let stride = texture.width() as usize * bpp;
+        if region.loc.x < 0 || region.loc.y < 0 {
+            return Err(Error::BufferAccessError);
+        }
+        let max_y = (region.loc.y + region.size.h) as usize;
+        let max_x = (region.loc.x + region.size.w) as usize;
+        if max_x > texture.width() as usize || max_y > texture.height() as usize {
+            return Err(Error::BufferAccessError);
+        }
+        if (max_y - 1) * stride + max_x * bpp > data.len() {
+            return Err(Error::BufferAccessError);
         }
 
-        use ash::ext::host_image_copy;
-
-        let device_copy = self
-            .device
-            .vk_ext_host_image_copy()
-            .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
-
-        unsafe {
-            device_copy
-                .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
-                    .old_layout(texture.current_layout())
-                    .new_layout(ImageLayout::GENERAL)
-                    .image(*texture.vk())
-                    .subresource_range(
-                        ImageSubresourceRange::default()
-                            .aspect_mask(ImageAspectFlags::COLOR)
-                            .layer_count(1)
-                            .level_count(1),
-                    )])
-                .map_err(Error::HostImageTransitionError)?;
-            device_copy
-                .copy_memory_to_image(
-                    &vk::CopyMemoryToImageInfoEXT::default()
-                        .flags(HostImageCopyFlagsEXT::empty())
-                        .dst_image(*texture.vk())
-                        .dst_image_layout(ImageLayout::GENERAL)
-                        .regions(&[MemoryToImageCopyEXT::default()
-                            .host_pointer(data.as_ptr() as *const _)
-                            .memory_row_length(0)
-                            .memory_image_height(0)
-                            .image_subresource(
-                                ImageSubresourceLayers::default()
-                                    .aspect_mask(ImageAspectFlags::COLOR)
-                                    .mip_level(0)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .image_offset(Offset3D {
-                                x: region.loc.x,
-                                y: region.loc.y,
-                                z: 0,
-                            })
-                            .image_extent(
-                                Extent3D::default()
-                                    .depth(1)
-                                    .width(region.size.w as u32)
-                                    .height(region.size.h as u32),
-                            )]),
-                )
-                .map_err(Error::HostImageCopyError)?;
-        }
-
-        texture.set_current_layout(ImageLayout::GENERAL);
-
-        Ok(())
+        self.upload_host_memory_to_image(texture, data.as_ptr(), stride, bpp, region)
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -699,14 +739,29 @@ impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
                 }
                 texture
             } else {
+                let linear = !self.supports_optimal_host_copy;
                 let image = VulkanImage::new_with_fourcc(
                     &self.device,
                     width as u32,
                     height as u32,
                     fourcc,
                     vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
-                    false,
+                    linear,
                 )
+                .or_else(|_| {
+                    if !linear {
+                        VulkanImage::new_with_fourcc(
+                            &self.device,
+                            width as u32,
+                            height as u32,
+                            fourcc,
+                            vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
+                            true,
+                        )
+                    } else {
+                        Err(ImageError::NoMemoryAvailable)
+                    }
+                })
                 .map_err(Error::ImageError)?;
 
                 self.upload_shm_memory_to_image(&image, base_ptr, stride, Rectangle::from_size(size))?;
@@ -797,7 +852,7 @@ impl VulkanRenderer {
                 self.device.vk().get_image_subresource_layout(
                     *image.vk(),
                     vk::ImageSubresource {
-                        aspect_mask: if image.drm.is_some() {
+                        aspect_mask: if image.tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT {
                             ImageAspectFlags::MEMORY_PLANE_0_EXT
                         } else {
                             ImageAspectFlags::COLOR
@@ -886,10 +941,7 @@ impl VulkanRenderer {
                                     z: 0,
                                 })
                                 .image_extent(
-                                    Extent3D::default()
-                                        .depth(1)
-                                        .width(copy_width)
-                                        .height(copy_height),
+                                    Extent3D::default().depth(1).width(copy_width).height(copy_height),
                                 )]),
                     )
                     .map_err(Error::HostImageCopyError)?;
@@ -1134,7 +1186,10 @@ impl Frame for VulkanFrame<'_, '_> {
         } else if tex_old_layout == ImageLayout::UNDEFINED {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-            (PipelineStageFlags2::COMPUTE_SHADER, AccessFlags2::SHADER_SAMPLED_READ)
+            (
+                PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::SHADER_SAMPLED_READ,
+            )
         } else {
             (
                 PipelineStageFlags2::COMPUTE_SHADER
@@ -1277,14 +1332,17 @@ impl Frame for VulkanFrame<'_, '_> {
                 .unwrap();
 
             if is_hdr {
-                let config = self.renderer.hdr_config.unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
-                    reference_white: 203.0,
-                    max_luminance: 1000.0,
-                    sdr_gamma: 2.2,
-                    gamut_stretch: 0.0,
-                    hardware_offload: false,
-                    is_sdr: false,
-                });
+                let config =
+                    self.renderer
+                        .hdr_config
+                        .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
+                            reference_white: 203.0,
+                            max_luminance: 1000.0,
+                            sdr_gamma: 2.2,
+                            gamut_stretch: 0.0,
+                            hardware_offload: false,
+                            is_sdr: false,
+                        });
                 let mut reference_white = config.reference_white;
                 let mut sdr_gamma = config.sdr_gamma;
                 let mut gamut_stretch = config.gamut_stretch;
@@ -1528,10 +1586,11 @@ impl Frame for VulkanFrame<'_, '_> {
             .wait_semaphore_infos(&wait_semaphore_info);
 
         let submit_res = unsafe {
-            self.renderer
-                .device
-                .vk()
-                .queue_submit2(*self.renderer.device.queue(), &[submit_info], Fence::null())
+            self.renderer.device.vk().queue_submit2(
+                *self.renderer.device.queue(),
+                &[submit_info],
+                Fence::null(),
+            )
         };
 
         if let Err(err) = submit_res {
@@ -1551,7 +1610,9 @@ impl Frame for VulkanFrame<'_, '_> {
         if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
             images.push(self.fb.0.inner.clone());
         }
-        self.renderer.cmd_pool.store_pending_buffer(buf, point, descs, images);
+        self.renderer
+            .cmd_pool
+            .store_pending_buffer(buf, point, descs, images);
 
         trace!(point, "VulkanFrame::finish single command buffer submitted");
 
