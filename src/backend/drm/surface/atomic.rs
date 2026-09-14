@@ -1679,6 +1679,7 @@ impl AtomicDrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        is_swapchain: bool,
     ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -1689,7 +1690,7 @@ impl AtomicDrmSurface {
         let mut used_planes = self.used_planes.lock().unwrap();
         let pending = self.pending.read().unwrap();
 
-        debug!(current = ?*current, pending = ?*pending, ?planes, "Preparing Commit",);
+        debug!(current = ?*current, pending = ?*pending, ?planes, is_swapchain, "Preparing Commit",);
 
         // we need the differences to know, which connectors need to change properties
         let current_conns = current.connectors.clone();
@@ -1698,13 +1699,13 @@ impl AtomicDrmSurface {
 
         for conn in removed.clone() {
             if let Ok(info) = self.fd.get_connector(*conn, false) {
-                info!("Removing connector: {:?}", info.interface());
+                info!("Disconnecting connector: {:?}", info.interface());
             } else {
-                info!("Removing unknown connector");
+                info!("Disconnecting unknown connector");
             }
         }
 
-        for conn in &pending_conns {
+        for conn in pending_conns.difference(&current_conns) {
             if let Ok(info) = self.fd.get_connector(*conn, false) {
                 info!("Adding connector: {:?}", info.interface());
             } else {
@@ -1718,6 +1719,23 @@ impl AtomicDrmSurface {
 
         trace!("Testing screen config");
 
+        // Determine target CRTC color pipeline:
+        // When the primary plane is Swapchain, the frame was composited by GPU shaders
+        // (e.g. Vulkan shader converting sRGB to PQ BT.2020 directly in the swapchain framebuffer).
+        // To prevent double color conversion, the CRTC hardware pipeline must be in identity/bypass
+        // (CrtcColorBlobs::default()).
+        // When the primary plane is direct scanout, the raw client buffer requires the staged
+        // scanout hardware color pipeline (pending.crtc_color_blobs).
+        let target_blobs = if is_swapchain {
+            if pending.crtc_color_state.degamma_lut.is_some() || pending.crtc_color_state.ctm.is_some() {
+                CrtcColorBlobs::default()
+            } else {
+                pending.crtc_color_blobs.clone()
+            }
+        } else {
+            pending.crtc_color_blobs.clone()
+        };
+
         // test the new config and return the request if it would be accepted by the driver.
         let prop_mapping = self.prop_mapping.read().unwrap();
         let req = {
@@ -1727,7 +1745,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 Some(&pending.resolved_color),
-                Some(&pending.crtc_color_blobs),
+                Some(&target_blobs),
                 &pending_conns,
                 removed,
                 &*planes,
@@ -1758,6 +1776,8 @@ impl AtomicDrmSurface {
                     }
                 }
                 // Destroy old CRTC color pipeline blobs now that the commit will replace them.
+                // Do not destroy blobs that are still referenced by pending.crtc_color_blobs
+                // or target_blobs to ensure zero dangling blobs when alternating scanout/swapchain.
                 let destroy_crtc_blob = |blob: property::Value<'static>| {
                     if let property::Value::Blob(id) = blob {
                         if id != 0 {
@@ -1767,13 +1787,19 @@ impl AtomicDrmSurface {
                         }
                     }
                 };
-                if current.crtc_color_blobs.gamma_blob != pending.crtc_color_blobs.gamma_blob {
+                if current.crtc_color_blobs.gamma_blob != pending.crtc_color_blobs.gamma_blob
+                    && current.crtc_color_blobs.gamma_blob != target_blobs.gamma_blob
+                {
                     destroy_crtc_blob(current.crtc_color_blobs.gamma_blob);
                 }
-                if current.crtc_color_blobs.ctm_blob != pending.crtc_color_blobs.ctm_blob {
+                if current.crtc_color_blobs.ctm_blob != pending.crtc_color_blobs.ctm_blob
+                    && current.crtc_color_blobs.ctm_blob != target_blobs.ctm_blob
+                {
                     destroy_crtc_blob(current.crtc_color_blobs.ctm_blob);
                 }
-                if current.crtc_color_blobs.degamma_blob != pending.crtc_color_blobs.degamma_blob {
+                if current.crtc_color_blobs.degamma_blob != pending.crtc_color_blobs.degamma_blob
+                    && current.crtc_color_blobs.degamma_blob != target_blobs.degamma_blob
+                {
                     destroy_crtc_blob(current.crtc_color_blobs.degamma_blob);
                 }
 
@@ -1812,6 +1838,7 @@ impl AtomicDrmSurface {
 
         if result.is_ok() {
             *current = pending.clone();
+            current.crtc_color_blobs = target_blobs;
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);
@@ -1830,6 +1857,7 @@ impl AtomicDrmSurface {
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        is_swapchain: bool,
     ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -1838,19 +1866,39 @@ impl AtomicDrmSurface {
         let mut used_planes = self.used_planes.lock().unwrap();
         let planes = planes.into_iter().collect::<Vec<_>>();
 
+        let current = self.state.read().unwrap();
+        let pending = self.pending.read().unwrap();
+
+        // Determine target CRTC color pipeline:
+        // - Swapchain frames are composited by the GPU (e.g. Vulkan/GLES shaders with HDR
+        //   color transformations already applied into the swapchain framebuffer). To prevent
+        //   double color conversion, the CRTC hardware pipeline must be in bypass (CrtcColorBlobs::default()).
+        // - Direct scanout frames present raw client buffers on the primary plane, and therefore
+        //   require the staged hardware color management pipeline (pending.crtc_color_blobs).
+        let target_blobs = if is_swapchain {
+            if pending.crtc_color_state.degamma_lut.is_some() || pending.crtc_color_state.ctm.is_some() {
+                CrtcColorBlobs::default()
+            } else {
+                pending.crtc_color_blobs.clone()
+            }
+        } else {
+            pending.crtc_color_blobs.clone()
+        };
+
+        let blobs_changed = target_blobs != current.crtc_color_blobs;
+
         // page flips work just like commits with fewer parameters..
         let prop_mapping = self.prop_mapping.read().unwrap();
-        // Connector color properties and CRTC color pipeline blobs are deliberately omitted
-        // (`None`): the kernel latches them from the last full commit, and re-emitting them on
-        // every flip would make the kernel re-run its modeset checks and potentially cause
-        // sinks to renegotiate infoframes.
+        // Connector color properties are deliberately omitted: the kernel latches them from the last full commit.
+        // CRTC color pipeline blobs are only submitted when they change (e.g. switching between
+        // swapchain bypass and direct scanout hardware color management).
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
-            self.state.read().unwrap().vrr,
+            current.vrr,
             None,
-            None,
+            if blobs_changed { Some(&target_blobs) } else { None },
             [],
             [],
             &*planes,
@@ -1859,7 +1907,10 @@ impl AtomicDrmSurface {
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
         // indicating a problem in our assumptions.
-        trace!(?planes, "Queueing page flip: {:?}", req);
+        trace!(
+            ?planes,
+            blobs_changed, is_swapchain, "Queueing page flip: {:?}", req
+        );
         let res = self
             .fd
             .atomic_commit(
@@ -1879,6 +1930,11 @@ impl AtomicDrmSurface {
             });
 
         if res.is_ok() {
+            if blobs_changed {
+                drop(current);
+                drop(pending);
+                self.state.write().unwrap().crtc_color_blobs = target_blobs;
+            }
             for plane in planes.iter() {
                 if plane.config.is_some() {
                     used_planes.insert(plane.handle);

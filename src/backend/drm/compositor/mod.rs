@@ -739,9 +739,15 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
-        surface.commit(
+        let is_swapchain = self
+            .plane_state(surface.plane())
+            .and_then(|state| state.config.as_ref())
+            .map(|config| matches!(config.buffer.buffer, ScanoutBuffer::Swapchain(_)))
+            .unwrap_or(true);
+        surface.commit_with_swapchain(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            is_swapchain,
         )
     }
 
@@ -754,9 +760,15 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         event: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
-        surface.page_flip(
+        let is_swapchain = self
+            .plane_state(surface.plane())
+            .and_then(|state| state.config.as_ref())
+            .map(|config| matches!(config.buffer.buffer, ScanoutBuffer::Swapchain(_)))
+            .unwrap_or(true);
+        surface.page_flip_with_swapchain(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            is_swapchain,
         )
     }
 

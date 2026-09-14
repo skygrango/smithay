@@ -621,8 +621,19 @@ impl DrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.commit_with_swapchain(planes, event, true)
+    }
+
+    /// Commit the pending state with explicit knowledge of whether the primary plane is Swapchain.
+    #[profiling::function]
+    pub fn commit_with_swapchain<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+        is_swapchain: bool,
+    ) -> Result<(), Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.commit(planes, event, is_swapchain),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
                 surf.commit(fb, event)
@@ -643,8 +654,19 @@ impl DrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.page_flip_with_swapchain(planes, event, true)
+    }
+
+    /// Page-flip the underlying [`crtc`](drm::control::crtc) with explicit knowledge of whether the primary plane is Swapchain.
+    #[profiling::function]
+    pub fn page_flip_with_swapchain<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+        is_swapchain: bool,
+    ) -> Result<(), Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event, is_swapchain),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
                 surf.page_flip(fb, event)
