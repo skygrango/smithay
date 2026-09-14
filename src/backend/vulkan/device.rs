@@ -175,6 +175,7 @@ impl Device {
             queue_idx: queue_index as u32,
 
             context: ContextId::new(),
+            allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
         })))
     }
 
@@ -229,6 +230,26 @@ impl Device {
     pub fn context(&self) -> ContextId<VulkanImage> {
         self.0.context.clone()
     }
+
+    pub(crate) fn suballocate_memory(
+        &self,
+        size: vk::DeviceSize,
+        alignment: vk::DeviceSize,
+        memory_type_index: u32,
+    ) -> Result<(vk::DeviceMemory, vk::DeviceSize), vk::Result> {
+        let mut alloc = self.0.allocator.lock().unwrap();
+        unsafe { alloc.allocate(&self.0.vk, size, alignment, memory_type_index) }
+    }
+
+    pub(crate) fn free_suballocation(
+        &self,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+    ) {
+        let mut alloc = self.0.allocator.lock().unwrap();
+        unsafe { alloc.free(&self.0.vk, memory, offset, size) }
+    }
 }
 
 impl WeakDevice {
@@ -254,6 +275,7 @@ struct InnerDevice {
     queue_idx: u32,
 
     context: ContextId<VulkanImage>,
+    allocator: std::sync::Mutex<super::allocator::VulkanSuballocator>,
 }
 
 impl fmt::Debug for InnerDevice {
@@ -265,6 +287,7 @@ impl fmt::Debug for InnerDevice {
 impl Drop for InnerDevice {
     fn drop(&mut self) {
         unsafe {
+            self.allocator.lock().unwrap().destroy(&self.vk);
             self.vk.destroy_device(None);
         }
     }

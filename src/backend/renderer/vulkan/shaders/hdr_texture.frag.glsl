@@ -5,6 +5,13 @@ layout(location = 0) out vec4 outColor;
 
 layout(binding = 0) uniform sampler2D tex;
 
+// Specialization constants:
+// 0: Generic (runtime checks via push constants)
+// 1: Passthrough (skipColorTransform = 1)
+// 2: SdrToHdr (SDR sRGB/Rec709 -> HDR BT.2020)
+// 3: PqToHdr (PQ BT.2020 -> HDR BT.2020 with tone mapping)
+layout(constant_id = 0) const uint SPEC_MODE = 0u;
+
 layout(push_constant, std140) uniform PushConstants {
     vec4 dstRect;
     vec2 screenSize;
@@ -169,12 +176,12 @@ vec3 tonemap_ictcp(vec3 linear_10k) {
 }
 
 vec3 source_to_linear_10k(vec3 raw_rgb) {
-    if (params.inputIsPq != 0) {
+    if (SPEC_MODE == 3u || (SPEC_MODE == 0u && params.inputIsPq != 0)) {
         vec3 linear_10k = pq_to_linear_v(raw_rgb);
         float ref_scale = clamp(params.referenceWhite, 80.0, 10000.0) / max(params.contentReference, 80.0);
         linear_10k *= ref_scale;
         return tonemap_ictcp(linear_10k);
-    } else if (params.inputIsHlg != 0) {
+    } else if (SPEC_MODE == 0u && params.inputIsHlg != 0) {
         vec3 scene = vec3(
             hlg_to_scene(raw_rgb.r),
             hlg_to_scene(raw_rgb.g),
@@ -188,9 +195,9 @@ vec3 source_to_linear_10k(vec3 raw_rgb) {
     } else {
         vec3 linear_input = decode_sdr_v(raw_rgb, params.sdrGamma);
         vec3 linear_bt2020;
-        if (params.inputPrimaries == 1) {
+        if (SPEC_MODE == 0u && params.inputPrimaries == 1) {
             linear_bt2020 = p3_to_bt2020 * linear_input;
-        } else if (params.inputPrimaries == 2) {
+        } else if (SPEC_MODE == 0u && params.inputPrimaries == 2) {
             linear_bt2020 = linear_input;
         } else {
             linear_bt2020 = mix(rec709_to_bt2020 * linear_input, linear_input, clamp(params.gamutStretch, 0.0, 1.0));
@@ -262,7 +269,8 @@ void main() {
     vec3 raw_rgb = src_a > 0.00001 ? raw.rgb / src_a : vec3(0.0);
     float eff_alpha = clamp(src_a * params.alpha, 0.0, 1.0);
 
-    if (params.skipColorTransform != 0) {
+    bool skip_transform = (SPEC_MODE == 1u) || (SPEC_MODE == 0u && params.skipColorTransform != 0);
+    if (skip_transform) {
         if (params.targetIsSdr != 0) {
             outColor = vec4(raw_rgb * eff_alpha, eff_alpha);
             return;

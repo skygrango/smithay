@@ -458,7 +458,12 @@ impl VulkanRenderer {
             let map_ptr = unsafe {
                 self.device
                     .vk()
-                    .map_memory(image.inner.memory, 0, vk::WHOLE_SIZE, MemoryMapFlags::empty())
+                    .map_memory(
+                        image.inner.memory,
+                        image.inner.memory_offset,
+                        layout.size,
+                        MemoryMapFlags::empty(),
+                    )
                     .map_err(Error::HostImageCopyError)?
             };
 
@@ -478,8 +483,8 @@ impl VulkanRenderer {
                 if !image.mem_bits().contains(MemoryPropertyFlags::HOST_COHERENT) {
                     let range = vk::MappedMemoryRange::default()
                         .memory(image.inner.memory)
-                        .offset(0)
-                        .size(vk::WHOLE_SIZE);
+                        .offset(image.inner.memory_offset)
+                        .size(layout.size);
                     let _ = self.device.vk().flush_mapped_memory_ranges(&[range]);
                 }
 
@@ -653,7 +658,7 @@ impl ImportMem for VulkanRenderer {
             vk::ImageUsageFlags::HOST_TRANSFER_EXT | vk::ImageUsageFlags::SAMPLED,
             linear,
         )
-        .or_else(|_| {
+        .or_else(|err| {
             if !linear {
                 VulkanImage::new_with_fourcc(
                     &self.device,
@@ -664,7 +669,7 @@ impl ImportMem for VulkanRenderer {
                     true,
                 )
             } else {
-                Err(ImageError::NoMemoryAvailable)
+                Err(err)
             }
         })
         .map_err(Error::ImageError)?;
@@ -935,7 +940,7 @@ impl VulkanRenderer {
                     .vk()
                     .map_memory(
                         image.inner.memory,
-                        layout.offset,
+                        image.inner.memory_offset + layout.offset,
                         layout.size,
                         MemoryMapFlags::empty(),
                     )
@@ -1432,6 +1437,160 @@ fn is_bgr_format(_format: vk::Format) -> bool {
     false
 }
 
+pub(crate) fn calculate_damage_scissors(
+    damage: &[Rectangle<i32, Physical>],
+    untransformed_dst: Rectangle<i32, Physical>,
+    transform: Transform,
+    screen_size: &Size<i32, Physical>,
+    fb_width: u32,
+    fb_height: u32,
+) -> Vec<vk::Rect2D> {
+    if damage.is_empty() {
+        return Vec::new();
+    }
+
+    let dest_size: Size<i32, Physical> = Size::new(fb_width as i32, fb_height as i32);
+    let mut raw_rects: Vec<Rectangle<i32, Physical>> = Vec::with_capacity(damage.len());
+
+    for &rect in damage {
+        let mut r = rect;
+        r.loc += untransformed_dst.loc;
+        let Some(intersection) = r.intersection(untransformed_dst) else {
+            continue;
+        };
+        let r = transform.transform_rect_in(intersection, screen_size);
+        let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
+        let clamped_size = r
+            .size
+            .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
+
+        if clamped_size.w > 0 && clamped_size.h > 0 {
+            raw_rects.push(Rectangle::new(constrained_loc, clamped_size));
+        }
+    }
+
+    if raw_rects.len() <= 1 {
+        return raw_rects
+            .into_iter()
+            .map(|r| vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: r.loc.x,
+                    y: r.loc.y,
+                },
+                extent: vk::Extent2D {
+                    width: r.size.w as u32,
+                    height: r.size.h as u32,
+                },
+            })
+            .collect();
+    }
+
+    // Coalesce / merge rectangles:
+    let mut merged = raw_rects;
+    loop {
+        let mut changed = false;
+        let mut i = 0;
+        while i < merged.len() {
+            let mut j = i + 1;
+            while j < merged.len() {
+                let a = merged[i];
+                let b = merged[j];
+
+                // 1. If A contains B, drop B
+                if a.contains_rect(b) {
+                    merged.swap_remove(j);
+                    changed = true;
+                    continue;
+                }
+                // 2. If B contains A, replace A with B, drop B
+                if b.contains_rect(a) {
+                    merged[i] = b;
+                    merged.swap_remove(j);
+                    changed = true;
+                    continue;
+                }
+                // 3. Exact horizontal strip merge: same x & w, touching or overlapping in y
+                let can_merge_vertically = a.loc.x == b.loc.x
+                    && a.size.w == b.size.w
+                    && ((a.loc.y + a.size.h >= b.loc.y && b.loc.y + b.size.h >= a.loc.y)
+                        || a.loc.y + a.size.h == b.loc.y
+                        || b.loc.y + b.size.h == a.loc.y);
+
+                if can_merge_vertically {
+                    let y1 = a.loc.y.min(b.loc.y);
+                    let y2 = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
+                    merged[i].loc.y = y1;
+                    merged[i].size.h = y2 - y1;
+                    merged.swap_remove(j);
+                    changed = true;
+                    continue;
+                }
+
+                // 4. Exact vertical strip merge: same y & h, touching or overlapping in x
+                let can_merge_horizontally = a.loc.y == b.loc.y
+                    && a.size.h == b.size.h
+                    && ((a.loc.x + a.size.w >= b.loc.x && b.loc.x + b.size.w >= a.loc.x)
+                        || a.loc.x + a.size.w == b.loc.x
+                        || b.loc.x + b.size.w == a.loc.x);
+
+                if can_merge_horizontally {
+                    let x1 = a.loc.x.min(b.loc.x);
+                    let x2 = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
+                    merged[i].loc.x = x1;
+                    merged[i].size.w = x2 - x1;
+                    merged.swap_remove(j);
+                    changed = true;
+                    continue;
+                }
+
+                // 5. Greedy bounding-box merge if excess area is <= 15%
+                let min_x = a.loc.x.min(b.loc.x);
+                let min_y = a.loc.y.min(b.loc.y);
+                let max_x = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
+                let max_y = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
+                let union_area = (max_x - min_x) as i64 * (max_y - min_y) as i64;
+                let area_a = a.size.w as i64 * a.size.h as i64;
+                let area_b = b.size.w as i64 * b.size.h as i64;
+                let inter_area = a
+                    .intersection(b)
+                    .map(|inter| inter.size.w as i64 * inter.size.h as i64)
+                    .unwrap_or(0);
+                let true_covered_area = area_a + area_b - inter_area;
+
+                if union_area <= true_covered_area + (true_covered_area * 15 / 100) {
+                    merged[i].loc.x = min_x;
+                    merged[i].loc.y = min_y;
+                    merged[i].size.w = max_x - min_x;
+                    merged[i].size.h = max_y - min_y;
+                    merged.swap_remove(j);
+                    changed = true;
+                    continue;
+                }
+
+                j += 1;
+            }
+            i += 1;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|r| vk::Rect2D {
+            offset: vk::Offset2D {
+                x: r.loc.x,
+                y: r.loc.y,
+            },
+            extent: vk::Extent2D {
+                width: r.size.w as u32,
+                height: r.size.h as u32,
+            },
+        })
+        .collect()
+}
+
 pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
     fb: &'frame mut VulkanFramebuffer,
@@ -1915,56 +2074,6 @@ impl Frame for VulkanFrame<'_, '_> {
             .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&tex_image_info)];
 
-        let fb_format = self.fb.0.format();
-        let format_pipelines = self
-            .renderer
-            .pipelines
-            .get_or_create_format_pipelines(fb_format)?;
-        let should_blend = texture.has_alpha() || alpha < 1.0;
-
-        let (layout, pipeline) = if is_hdr {
-            (
-                *self.renderer.pipelines.hdr_tex_pipeline_layout(),
-                if should_blend {
-                    format_pipelines.hdr_tex_blend_pipeline
-                } else {
-                    format_pipelines.hdr_tex_pipeline
-                },
-            )
-        } else {
-            (
-                *self.renderer.pipelines.tex_pipeline_layout(),
-                if should_blend {
-                    format_pipelines.tex_blend_pipeline
-                } else {
-                    format_pipelines.tex_pipeline
-                },
-            )
-        };
-
-        unsafe {
-            self.renderer
-                .device
-                .vk()
-                .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
-            if let Some(push) = push_descriptor {
-                push.cmd_push_descriptor_set(buf, PipelineBindPoint::GRAPHICS, layout, 0, &descriptor_update);
-            } else {
-                self.renderer
-                    .device
-                    .vk()
-                    .update_descriptor_sets(&descriptor_update, &[]);
-                self.renderer.device.vk().cmd_bind_descriptor_sets(
-                    buf,
-                    PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[descriptor.as_ref().unwrap().vk()],
-                    &[],
-                );
-            }
-        }
-
         let src_rect = Rectangle::new(
             Point::new(src.loc.x as f32, src.loc.y as f32),
             Size::new(src.size.w as f32, src.size.h as f32),
@@ -1987,8 +2096,15 @@ impl Frame for VulkanFrame<'_, '_> {
         };
 
         let has_alpha = texture.has_alpha() as u32;
+        let should_blend = texture.has_alpha() || alpha < 1.0;
 
-        if is_hdr {
+        let fb_format = self.fb.0.format();
+        let format_pipelines = self
+            .renderer
+            .pipelines
+            .get_or_create_format_pipelines(fb_format)?;
+
+        let (layout, pipeline, hdr_push_constants) = if is_hdr {
             let config =
                 self.renderer
                     .hdr_config
@@ -2099,13 +2215,77 @@ impl Frame for VulkanFrame<'_, '_> {
                 _pad1: 0,
             };
 
+            let chosen_pipeline = if should_blend {
+                if skip_color_transform != 0 {
+                    format_pipelines.hdr_passthrough_blend_pipeline
+                } else if input_is_pq != 0 {
+                    format_pipelines.hdr_pq_blend_pipeline
+                } else if input_is_hlg == 0 && input_primaries == 0 {
+                    format_pipelines.hdr_sdr_blend_pipeline
+                } else {
+                    format_pipelines.hdr_tex_blend_pipeline
+                }
+            } else {
+                if skip_color_transform != 0 {
+                    format_pipelines.hdr_passthrough_pipeline
+                } else if input_is_pq != 0 {
+                    format_pipelines.hdr_pq_pipeline
+                } else if input_is_hlg == 0 && input_primaries == 0 {
+                    format_pipelines.hdr_sdr_pipeline
+                } else {
+                    format_pipelines.hdr_tex_pipeline
+                }
+            };
+
+            (
+                *self.renderer.pipelines.hdr_tex_pipeline_layout(),
+                chosen_pipeline,
+                Some(push_constants),
+            )
+        } else {
+            let chosen_pipeline = if should_blend {
+                format_pipelines.tex_blend_pipeline
+            } else {
+                format_pipelines.tex_pipeline
+            };
+            (
+                *self.renderer.pipelines.tex_pipeline_layout(),
+                chosen_pipeline,
+                None,
+            )
+        };
+
+        unsafe {
+            self.renderer
+                .device
+                .vk()
+                .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
+            if let Some(push) = push_descriptor {
+                push.cmd_push_descriptor_set(buf, PipelineBindPoint::GRAPHICS, layout, 0, &descriptor_update);
+            } else {
+                self.renderer
+                    .device
+                    .vk()
+                    .update_descriptor_sets(&descriptor_update, &[]);
+                self.renderer.device.vk().cmd_bind_descriptor_sets(
+                    buf,
+                    PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[descriptor.as_ref().unwrap().vk()],
+                    &[],
+                );
+            }
+        }
+
+        if let Some(hdr_pc) = hdr_push_constants {
             unsafe {
                 self.renderer.device.vk().cmd_push_constants(
                     buf,
                     layout,
                     ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
                     0,
-                    bytemuck::bytes_of(&push_constants),
+                    bytemuck::bytes_of(&hdr_pc),
                 );
             }
         } else {
@@ -2131,34 +2311,16 @@ impl Frame for VulkanFrame<'_, '_> {
             }
         }
 
-        for &rect in damage {
-            let mut r = rect;
-            r.loc += untransformed_dst.loc;
-            let Some(intersection) = r.intersection(untransformed_dst) else {
-                continue;
-            };
-            let r = self.transform.transform_rect_in(intersection, &self.size);
-            let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
-            let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
-            let clamped_size = r
-                .size
-                .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
+        let scissors = calculate_damage_scissors(
+            damage,
+            untransformed_dst,
+            self.transform,
+            &self.size,
+            self.fb.width(),
+            self.fb.height(),
+        );
 
-            if clamped_size.w <= 0 || clamped_size.h <= 0 {
-                continue;
-            }
-
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: constrained_loc.x,
-                    y: constrained_loc.y,
-                },
-                extent: vk::Extent2D {
-                    width: clamped_size.w as u32,
-                    height: clamped_size.h as u32,
-                },
-            };
-
+        for scissor in scissors {
             unsafe {
                 self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
                 self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
@@ -2471,34 +2633,16 @@ impl VulkanFrame<'_, '_> {
             );
         }
 
-        for &rect in damage {
-            let mut r = rect;
-            r.loc += untransformed_dst.loc;
-            let Some(intersection) = r.intersection(untransformed_dst) else {
-                continue;
-            };
-            let r = self.transform.transform_rect_in(intersection, &self.size);
-            let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
-            let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
-            let clamped_size = r
-                .size
-                .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
+        let scissors = calculate_damage_scissors(
+            damage,
+            untransformed_dst,
+            self.transform,
+            &self.size,
+            self.fb.width(),
+            self.fb.height(),
+        );
 
-            if clamped_size.w <= 0 || clamped_size.h <= 0 {
-                continue;
-            }
-
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: constrained_loc.x,
-                    y: constrained_loc.y,
-                },
-                extent: vk::Extent2D {
-                    width: clamped_size.w as u32,
-                    height: clamped_size.h as u32,
-                },
-            };
-
+        for scissor in scissors {
             unsafe {
                 self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
                 self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
@@ -2729,5 +2873,49 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_damage_scissors_coalescing() {
+        let dst = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let screen_size = Size::new(1920, 1080);
+
+        // 1. Empty damage
+        let scissors = calculate_damage_scissors(&[], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert!(scissors.is_empty());
+
+        // 2. Adjacent horizontal damage
+        let d1 = Rectangle::new((0, 0).into(), (50, 100).into());
+        let d2 = Rectangle::new((50, 0).into(), (50, 100).into());
+        let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert_eq!(scissors.len(), 1);
+        assert_eq!(scissors[0].offset.x, 0);
+        assert_eq!(scissors[0].offset.y, 0);
+        assert_eq!(scissors[0].extent.width, 100);
+        assert_eq!(scissors[0].extent.height, 100);
+
+        // 3. Adjacent vertical damage
+        let d1 = Rectangle::new((10, 0).into(), (100, 50).into());
+        let d2 = Rectangle::new((10, 50).into(), (100, 50).into());
+        let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert_eq!(scissors.len(), 1);
+        assert_eq!(scissors[0].offset.x, 10);
+        assert_eq!(scissors[0].offset.y, 0);
+        assert_eq!(scissors[0].extent.width, 100);
+        assert_eq!(scissors[0].extent.height, 100);
+
+        // 4. Contained damage
+        let d1 = Rectangle::new((0, 0).into(), (200, 200).into());
+        let d2 = Rectangle::new((10, 10).into(), (50, 50).into());
+        let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert_eq!(scissors.len(), 1);
+        assert_eq!(scissors[0].extent.width, 200);
+        assert_eq!(scissors[0].extent.height, 200);
+
+        // 5. Disjoint damage
+        let d1 = Rectangle::new((0, 0).into(), (20, 20).into());
+        let d2 = Rectangle::new((500, 500).into(), (20, 20).into());
+        let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert_eq!(scissors.len(), 2);
     }
 }

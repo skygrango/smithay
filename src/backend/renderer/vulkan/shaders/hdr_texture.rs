@@ -20,6 +20,11 @@ pub static HDR_TEX_SIZES: LazyLock<[DescriptorPoolSize; 1]> = LazyLock::new(|| {
         .descriptor_count(1)]
 });
 
+pub const SPEC_MODE_GENERIC: u32 = 0;
+pub const SPEC_MODE_PASSTHROUGH: u32 = 1;
+pub const SPEC_MODE_SDR: u32 = 2;
+pub const SPEC_MODE_PQ: u32 = 3;
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, NoUninit)]
 pub struct HdrTexPushConstants {

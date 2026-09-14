@@ -74,6 +74,7 @@ use ash::{Entry, vk};
 use libc::c_void;
 use tracing::{error, info, trace, warn};
 
+pub mod allocator;
 pub mod device;
 pub mod format;
 pub mod image;

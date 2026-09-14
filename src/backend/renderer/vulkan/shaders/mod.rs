@@ -16,7 +16,13 @@ use self::clear::*;
 pub use self::descriptor::DescriptorSet;
 use self::hdr_texture::*;
 use self::texture::*;
-pub use self::{clear::ClearPushConstants, hdr_texture::HdrTexPushConstants, texture::TexPushConstants};
+pub use self::{
+    clear::ClearPushConstants,
+    hdr_texture::{
+        HdrTexPushConstants, SPEC_MODE_GENERIC, SPEC_MODE_PASSTHROUGH, SPEC_MODE_PQ, SPEC_MODE_SDR,
+    },
+    texture::TexPushConstants,
+};
 
 pub const QUAD_VERT_SHADER: &[u8] =
     include_bytes_aligned!(32, concat!(env!("OUT_DIR"), "/vk/quad.vert.glsl"));
@@ -35,6 +41,12 @@ pub struct FormatPipelines {
     pub tex_blend_pipeline: Pipeline,
     pub hdr_tex_pipeline: Pipeline,
     pub hdr_tex_blend_pipeline: Pipeline,
+    pub hdr_passthrough_pipeline: Pipeline,
+    pub hdr_passthrough_blend_pipeline: Pipeline,
+    pub hdr_sdr_pipeline: Pipeline,
+    pub hdr_sdr_blend_pipeline: Pipeline,
+    pub hdr_pq_pipeline: Pipeline,
+    pub hdr_pq_blend_pipeline: Pipeline,
 }
 
 #[derive(Debug)]
@@ -240,10 +252,50 @@ impl Pipelines {
             .name(c"main")
             .module(self.tex_frag);
 
+        let spec_entry = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(std::mem::size_of::<u32>())];
+
+        let spec_generic_data = SPEC_MODE_GENERIC.to_ne_bytes();
+        let spec_generic = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_generic_data);
         let hdr_tex_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.hdr_tex_frag);
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_generic);
+
+        let spec_passthrough_data = SPEC_MODE_PASSTHROUGH.to_ne_bytes();
+        let spec_passthrough = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_passthrough_data);
+        let hdr_passthrough_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_passthrough);
+
+        let spec_sdr_data = SPEC_MODE_SDR.to_ne_bytes();
+        let spec_sdr = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_sdr_data);
+        let hdr_sdr_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_sdr);
+
+        let spec_pq_data = SPEC_MODE_PQ.to_ne_bytes();
+        let spec_pq = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_pq_data);
+        let hdr_pq_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_pq);
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -282,6 +334,18 @@ impl Pipelines {
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
         let mut r5 =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r6 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r7 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r8 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r9 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r10 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
+        let mut r11 =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_attachment_formats);
 
         let opaque_attachment = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(false)
@@ -304,6 +368,9 @@ impl Pipelines {
         let clear_stages = [vertex_stage, clear_stage];
         let tex_stages = [vertex_stage, tex_stage];
         let hdr_tex_stages = [vertex_stage, hdr_tex_stage];
+        let hdr_passthrough_stages = [vertex_stage, hdr_passthrough_stage];
+        let hdr_sdr_stages = [vertex_stage, hdr_sdr_stage];
+        let hdr_pq_stages = [vertex_stage, hdr_pq_stage];
 
         let base_ci = vk::GraphicsPipelineCreateInfo::default()
             .vertex_input_state(&vertex_input)
@@ -338,16 +405,52 @@ impl Pipelines {
                 .stages(&tex_stages)
                 .color_blend_state(&alpha_blend_state)
                 .layout(self.tex_layout),
-            // 4: hdr_tex opaque
+            // 4: hdr_tex opaque (generic fallback)
             base_ci
                 .push_next(&mut r4)
                 .stages(&hdr_tex_stages)
                 .color_blend_state(&opaque_blend_state)
                 .layout(self.hdr_tex_layout),
-            // 5: hdr_tex blend
+            // 5: hdr_tex blend (generic fallback)
             base_ci
                 .push_next(&mut r5)
                 .stages(&hdr_tex_stages)
+                .color_blend_state(&alpha_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 6: hdr_passthrough opaque
+            base_ci
+                .push_next(&mut r6)
+                .stages(&hdr_passthrough_stages)
+                .color_blend_state(&opaque_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 7: hdr_passthrough blend
+            base_ci
+                .push_next(&mut r7)
+                .stages(&hdr_passthrough_stages)
+                .color_blend_state(&alpha_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 8: hdr_sdr opaque
+            base_ci
+                .push_next(&mut r8)
+                .stages(&hdr_sdr_stages)
+                .color_blend_state(&opaque_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 9: hdr_sdr blend
+            base_ci
+                .push_next(&mut r9)
+                .stages(&hdr_sdr_stages)
+                .color_blend_state(&alpha_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 10: hdr_pq opaque
+            base_ci
+                .push_next(&mut r10)
+                .stages(&hdr_pq_stages)
+                .color_blend_state(&opaque_blend_state)
+                .layout(self.hdr_tex_layout),
+            // 11: hdr_pq blend
+            base_ci
+                .push_next(&mut r11)
+                .stages(&hdr_pq_stages)
                 .color_blend_state(&alpha_blend_state)
                 .layout(self.hdr_tex_layout),
         ];
@@ -372,6 +475,12 @@ impl Pipelines {
             tex_blend_pipeline: pipelines[3],
             hdr_tex_pipeline: pipelines[4],
             hdr_tex_blend_pipeline: pipelines[5],
+            hdr_passthrough_pipeline: pipelines[6],
+            hdr_passthrough_blend_pipeline: pipelines[7],
+            hdr_sdr_pipeline: pipelines[8],
+            hdr_sdr_blend_pipeline: pipelines[9],
+            hdr_pq_pipeline: pipelines[10],
+            hdr_pq_blend_pipeline: pipelines[11],
         };
 
         self.format_pipelines.insert(format, format_pipelines);
@@ -410,6 +519,14 @@ impl Drop for Pipelines {
                     device.vk().destroy_pipeline(p.tex_blend_pipeline, None);
                     device.vk().destroy_pipeline(p.hdr_tex_pipeline, None);
                     device.vk().destroy_pipeline(p.hdr_tex_blend_pipeline, None);
+                    device.vk().destroy_pipeline(p.hdr_passthrough_pipeline, None);
+                    device
+                        .vk()
+                        .destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
+                    device.vk().destroy_pipeline(p.hdr_sdr_pipeline, None);
+                    device.vk().destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
+                    device.vk().destroy_pipeline(p.hdr_pq_pipeline, None);
+                    device.vk().destroy_pipeline(p.hdr_pq_blend_pipeline, None);
                 }
                 device.vk().destroy_shader_module(self.quad_vert, None);
                 device.vk().destroy_shader_module(self.clear_frag, None);

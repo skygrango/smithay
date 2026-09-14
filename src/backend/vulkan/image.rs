@@ -267,6 +267,9 @@ impl VulkanImage {
                     })?
             },
             memory: vk::DeviceMemory::null(),
+            memory_offset: 0,
+            suballocated: false,
+            allocation_size: 0,
             device: device.downgrade(),
             view: None,
             current_layout: std::sync::atomic::AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
@@ -319,9 +322,16 @@ impl VulkanImage {
             })
             .transpose()?;
 
-        // Allocate image memory
-        let memory_reqs = unsafe { device.vk().get_image_memory_requirements(inner.image) };
-        // TODO: Memory type index
+        // Allocate image memory with dedicated requirements query
+        let mut dedicated_reqs = vk::MemoryDedicatedRequirements::default();
+        let mut mem_reqs2 = vk::MemoryRequirements2::default().push_next(&mut dedicated_reqs);
+        let image_mem_req_info = vk::ImageMemoryRequirementsInfo2::default().image(inner.image);
+        unsafe {
+            device
+                .vk()
+                .get_image_memory_requirements2(&image_mem_req_info, &mut mem_reqs2);
+        }
+        let memory_reqs = mem_reqs2.memory_requirements;
         let mut alloc_create_info = vk::MemoryAllocateInfo::default().allocation_size(memory_reqs.size);
 
         let mut mem_bits = None;
@@ -422,57 +432,119 @@ impl VulkanImage {
             return Err(Error::NoMemoryAvailable);
         };
 
+        let is_dedicated = modifiers.is_some()
+            || dmabuf.is_some()
+            || inner.dmabuf_exportable
+            || vk_usage.contains(ImageUsageFlags::COLOR_ATTACHMENT)
+            || dedicated_reqs.requires_dedicated_allocation != 0
+            || dedicated_reqs.prefers_dedicated_allocation != 0;
+
         let mut import_memory_info: vk::ImportMemoryFdInfoKHR<'_>;
         let mut memory_export_info: vk::ExportMemoryAllocateInfo<'_>;
         let mut memory_dedicated_info: vk::MemoryDedicatedAllocateInfo<'_>;
 
-        if modifiers.is_some() || dmabuf.is_some() {
+        if is_dedicated {
             memory_dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(inner.image);
             alloc_create_info = alloc_create_info.push_next(&mut memory_dedicated_info);
-        }
 
-        if inner.dmabuf_exportable && dmabuf.is_none() {
-            memory_export_info = vk::ExportMemoryAllocateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            alloc_create_info = alloc_create_info.push_next(&mut memory_export_info);
-        }
+            if inner.dmabuf_exportable && dmabuf.is_none() {
+                memory_export_info = vk::ExportMemoryAllocateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                alloc_create_info = alloc_create_info.push_next(&mut memory_export_info);
+            }
 
-        if let Some(dmabuf) = dmabuf {
-            // TODO: Distinct planes. See `new_from_dmabuf`
-            let handle = dmabuf.handles().next().unwrap();
+            if let Some(dmabuf) = dmabuf {
+                let handle = dmabuf.handles().next().unwrap();
+                import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                    .fd(handle
+                        .try_clone_to_owned()
+                        .map_err(Error::DmabufFdError)?
+                        .into_raw_fd());
+                alloc_create_info = alloc_create_info.push_next(&mut import_memory_info);
+            }
 
-            import_memory_info = vk::ImportMemoryFdInfoKHR::default()
-                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(handle
-                    .try_clone_to_owned()
-                    .map_err(Error::DmabufFdError)?
-                    .into_raw_fd());
-            alloc_create_info = alloc_create_info.push_next(&mut import_memory_info);
-        }
+            unsafe {
+                inner.memory = device
+                    .vk()
+                    .allocate_memory(&alloc_create_info, None)
+                    .map_err(|err| {
+                        tracing::error!(
+                            "VulkanImage::new_internal dedicated allocate_memory failed: {:?}, size={}, type_index={}",
+                            err,
+                            alloc_create_info.allocation_size,
+                            alloc_create_info.memory_type_index
+                        );
+                        Error::VulkanAllocate(err)
+                    })?;
+                inner.memory_offset = 0;
+                inner.suballocated = false;
+                inner.allocation_size = memory_reqs.size;
 
-        unsafe {
-            // Allocate memory for the image.
-            // TODO: In case of error close the fd in import_memory_info
-            inner.memory = device
-                .vk()
-                .allocate_memory(&alloc_create_info, None)
-                .map_err(|err| {
-                    tracing::error!(
-                        "VulkanImage::new_internal: allocate_memory failed: {:?}, size={}, type_index={}",
-                        err,
-                        alloc_create_info.allocation_size,
-                        alloc_create_info.memory_type_index
-                    );
-                    Error::VulkanAllocate(err)
-                })?;
-            // Finally bind the memory to the image
-            device
-                .vk()
-                .bind_image_memory(inner.image, inner.memory, 0)
-                .map_err(|err| {
-                    tracing::error!("VulkanImage::new_internal: bind_image_memory failed: {:?}", err);
-                    Error::VulkanBind(err)
-                })?;
+                device
+                    .vk()
+                    .bind_image_memory(inner.image, inner.memory, 0)
+                    .map_err(|err| {
+                        tracing::error!("VulkanImage::new_internal: bind_image_memory failed: {:?}", err);
+                        Error::VulkanBind(err)
+                    })?;
+            }
+        } else {
+            let suballoc_res = device.suballocate_memory(
+                memory_reqs.size,
+                memory_reqs.alignment,
+                alloc_create_info.memory_type_index,
+            );
+
+            match suballoc_res {
+                Ok((memory, memory_offset)) => {
+                    inner.memory = memory;
+                    inner.memory_offset = memory_offset;
+                    inner.suballocated = true;
+                    inner.allocation_size = memory_reqs.size;
+
+                    unsafe {
+                        device
+                            .vk()
+                            .bind_image_memory(inner.image, inner.memory, memory_offset)
+                            .map_err(|err| {
+                                tracing::error!(
+                                    "VulkanImage::new_internal: bind_image_memory (suballocated) failed: {:?}",
+                                    err
+                                );
+                                Error::VulkanBind(err)
+                            })?;
+                    }
+                }
+                Err(_) => unsafe {
+                    inner.memory = device
+                            .vk()
+                            .allocate_memory(&alloc_create_info, None)
+                            .map_err(|err| {
+                                tracing::error!(
+                                    "VulkanImage::new_internal: fallback direct allocate_memory failed: {:?}, size={}, type_index={}",
+                                    err,
+                                    alloc_create_info.allocation_size,
+                                    alloc_create_info.memory_type_index
+                                );
+                                Error::VulkanAllocate(err)
+                            })?;
+                    inner.memory_offset = 0;
+                    inner.suballocated = false;
+                    inner.allocation_size = memory_reqs.size;
+
+                    device
+                        .vk()
+                        .bind_image_memory(inner.image, inner.memory, 0)
+                        .map_err(|err| {
+                            tracing::error!(
+                                "VulkanImage::new_internal: fallback bind_image_memory failed: {:?}",
+                                err
+                            );
+                            Error::VulkanBind(err)
+                        })?;
+                },
+            }
         }
 
         if vk_usage.contains(vk::ImageUsageFlags::SAMPLED)
@@ -605,6 +677,14 @@ impl VulkanImage {
     pub fn dmabuf_exportable(&self) -> bool {
         self.inner.dmabuf_exportable
     }
+
+    pub fn memory_offset(&self) -> vk::DeviceSize {
+        self.inner.memory_offset
+    }
+
+    pub fn is_suballocated(&self) -> bool {
+        self.inner.suballocated
+    }
 }
 
 #[derive(Debug)]
@@ -612,6 +692,9 @@ pub(crate) struct ImageInner {
     pub(crate) image: vk::Image,
     // might be a null handle
     pub(crate) memory: vk::DeviceMemory,
+    pub(crate) memory_offset: vk::DeviceSize,
+    pub(crate) suballocated: bool,
+    pub(crate) allocation_size: vk::DeviceSize,
     pub(crate) device: WeakDevice,
     pub(crate) view: Option<vk::ImageView>,
     pub(crate) current_layout: std::sync::atomic::AtomicI32,
@@ -630,7 +713,13 @@ impl Drop for ImageInner {
                     vk.destroy_image_view(*view, None);
                 }
                 vk.destroy_image(self.image, None);
-                vk.free_memory(self.memory, None);
+                if self.memory != vk::DeviceMemory::null() {
+                    if self.suballocated {
+                        device.free_suballocation(self.memory, self.memory_offset, self.allocation_size);
+                    } else {
+                        vk.free_memory(self.memory, None);
+                    }
+                }
             }
         }
     }
