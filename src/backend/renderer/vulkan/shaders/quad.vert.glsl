@@ -5,6 +5,8 @@ layout(location = 0) out vec2 v_pos;
 layout(push_constant, std140) uniform PushConstants {
     vec4 dstRect;
     vec2 screenSize;
+    float depth;
+    float _pad;
 } params;
 
 const vec2 positions[6] = vec2[](
@@ -21,5 +23,5 @@ void main() {
     v_pos = pos;
     vec2 pixelPos = params.dstRect.xy + pos * params.dstRect.zw;
     vec2 ndc = (pixelPos / params.screenSize) * 2.0 - 1.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(ndc, params.depth, 1.0);
 }

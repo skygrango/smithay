@@ -547,16 +547,29 @@ impl VulkanImage {
             }
         }
 
+        let is_depth = vk_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            || vk_format == vk::Format::D16_UNORM
+            || vk_format == vk::Format::D32_SFLOAT
+            || vk_format == vk::Format::D24_UNORM_S8_UINT;
+
         if vk_usage.contains(vk::ImageUsageFlags::SAMPLED)
             || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
             || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            || is_depth
         {
+            let aspect_mask = if is_depth {
+                vk::ImageAspectFlags::DEPTH
+            } else {
+                vk::ImageAspectFlags::COLOR
+            };
+
             let info = vk::ImageViewCreateInfo::default()
                 .image(inner.image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(vk_format)
                 .components(
-                    if vk_usage.contains(vk::ImageUsageFlags::STORAGE)
+                    if is_depth
+                        || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
                         || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                     {
                         vk::ComponentMapping {
@@ -571,7 +584,7 @@ impl VulkanImage {
                 )
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .aspect_mask(aspect_mask)
                         .level_count(1)
                         .layer_count(1),
                 );
@@ -684,6 +697,11 @@ impl VulkanImage {
 
     pub fn is_suballocated(&self) -> bool {
         self.inner.suballocated
+    }
+
+    /// Export the image as a DMA-BUF if exportable.
+    pub fn export(&self) -> Result<Dmabuf, crate::backend::allocator::vulkan::ExportError> {
+        crate::backend::allocator::dmabuf::AsDmabuf::export(self)
     }
 }
 

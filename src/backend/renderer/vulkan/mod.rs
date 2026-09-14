@@ -80,6 +80,9 @@ impl MemoryBudgetInfo {
     }
 }
 
+mod lut3d;
+use lut3d::{Lut3dTexture, generate_ictcp_tonemap_lut, generate_identity_lut};
+
 #[derive(Debug)]
 pub struct VulkanRenderer {
     capabilities: Vec<Capability>,
@@ -88,6 +91,7 @@ pub struct VulkanRenderer {
     pipelines: Pipelines,
     cmd_pool: cmds::CommandPool,
     texture_sampler: vk::Sampler,
+    pub(crate) lut3d: Option<Lut3dTexture>,
 
     seq_no: u64,
     timeline: sync::VulkanTimeline,
@@ -112,6 +116,9 @@ impl Drop for VulkanRenderer {
             let _ = self.device.vk().device_wait_idle();
             self.cmd_pool.clean_old_buffers(u64::MAX);
             self.dmabuf_cache.clear();
+            if let Some(mut lut) = self.lut3d.take() {
+                lut.destroy(&self.device);
+            }
             self.device.vk().destroy_sampler(self.texture_sampler, None);
         }
     }
@@ -305,6 +312,9 @@ impl VulkanRenderer {
             "Vulkan host image copy capability evaluated"
         );
 
+        // Trilinear 3D LUT is disabled in favor of analytical HDR precision / tetrahedral interpolation
+        let lut3d = None;
+
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
@@ -313,6 +323,7 @@ impl VulkanRenderer {
             pipelines,
             cmd_pool,
             texture_sampler: sampler,
+            lut3d,
             seq_no: 0,
             node,
             timeline,
@@ -374,7 +385,28 @@ impl VulkanRenderer {
         }
     }
 
+    pub fn update_3d_lut(&mut self, ref_white: f32, max_content: f32, max_dest: f32) {
+        let params = (ref_white as u32, max_content as u32, max_dest as u32);
+        if let Some(lut) = self.lut3d.as_ref() {
+            if lut.params == params {
+                return;
+            }
+        }
+        let data = generate_ictcp_tonemap_lut(33, ref_white, 203.0, max_content, max_dest);
+        if let Ok(new_lut) = Lut3dTexture::new(&self.device, &data, 33, params) {
+            if let Some(mut old) = self.lut3d.take() {
+                unsafe {
+                    old.destroy(&self.device);
+                }
+            }
+            self.lut3d = Some(new_lut);
+        }
+    }
+
     pub fn set_hdr_output(&mut self, config: Option<HdrOutputConfig>) {
+        if let Some(c) = config {
+            self.update_3d_lut(c.reference_white, c.max_luminance, c.max_luminance);
+        }
         self.hdr_config = config;
     }
 
@@ -609,6 +641,9 @@ impl Renderer for VulkanRenderer {
             active_color_description: None,
             is_blit: false,
             rendering: false,
+            depth_enabled: false,
+            current_depth: 0.0,
+            depth_image: None,
         })
     }
 
@@ -1606,9 +1641,31 @@ pub struct VulkanFrame<'frame, 'buffer> {
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
     is_blit: bool,
     rendering: bool,
+    pub(crate) depth_enabled: bool,
+    pub(crate) current_depth: f32,
+    pub(crate) depth_image: Option<VulkanImage>,
 }
 
 impl VulkanFrame<'_, '_> {
+    pub fn set_depth_enabled(&mut self, enabled: bool) {
+        if self.depth_enabled != enabled && self.rendering {
+            self.end_rendering();
+        }
+        self.depth_enabled = enabled;
+    }
+
+    pub fn depth_enabled(&self) -> bool {
+        self.depth_enabled
+    }
+
+    pub fn set_current_depth(&mut self, depth: f32) {
+        self.current_depth = depth.clamp(0.0, 1.0);
+    }
+
+    pub fn current_depth(&self) -> f32 {
+        self.current_depth
+    }
+
     fn get_or_create_cmd_buffer(&mut self) -> Result<ash::vk::CommandBuffer, Error> {
         if let Some(buf) = self.cmd_buffer {
             Ok(buf)
@@ -1688,7 +1745,7 @@ impl VulkanFrame<'_, '_> {
             .store_op(vk::AttachmentStoreOp::STORE);
 
         let color_attachments = [color_attachment];
-        let rendering_info = vk::RenderingInfo::default()
+        let mut rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
@@ -1698,6 +1755,70 @@ impl VulkanFrame<'_, '_> {
             })
             .layer_count(1)
             .color_attachments(&color_attachments);
+
+        let depth_attachment;
+        if self.depth_enabled {
+            let width = (self.size.w as u32).max(1);
+            let height = (self.size.h as u32).max(1);
+            let needs_alloc = self
+                .depth_image
+                .as_ref()
+                .map_or(true, |img| img.width() != width || img.height() != height);
+            if needs_alloc {
+                let img = VulkanImage::new(
+                    &self.renderer.device,
+                    width,
+                    height,
+                    vk::Format::D16_UNORM,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                    false,
+                )?;
+                self.depth_image = Some(img);
+            }
+
+            let depth_img = self.depth_image.as_ref().unwrap();
+            let depth_old_layout = depth_img.current_layout();
+            let depth_barrier = ImageMemoryBarrier2::default()
+                .image(*depth_img.vk())
+                .old_layout(depth_old_layout)
+                .new_layout(ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .src_stage_mask(PipelineStageFlags2::NONE)
+                .src_access_mask(AccessFlags2::NONE)
+                .dst_stage_mask(
+                    PipelineStageFlags2::EARLY_FRAGMENT_TESTS | PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                        | AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
+                )
+                .subresource_range(
+                    ImageSubresourceRange::default()
+                        .aspect_mask(ImageAspectFlags::DEPTH)
+                        .layer_count(1)
+                        .level_count(1),
+                );
+            unsafe {
+                self.renderer.device.vk().cmd_pipeline_barrier2(
+                    buf,
+                    &DependencyInfo::default().image_memory_barriers(&[depth_barrier]),
+                );
+            }
+            depth_img.set_current_layout(ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+
+            depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(*depth_img.vk_view().unwrap())
+                .image_layout(ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                })
+                .store_op(vk::AttachmentStoreOp::DONT_CARE);
+
+            rendering_info = rendering_info.depth_attachment(&depth_attachment);
+        }
 
         unsafe {
             self.renderer
@@ -2062,17 +2183,58 @@ impl Frame for VulkanFrame<'_, '_> {
             .image_view(*view)
             .sampler(self.renderer.texture_sampler)];
 
+        let lut3d_view = self
+            .renderer
+            .lut3d
+            .as_ref()
+            .map(|l| l.view)
+            .unwrap_or(vk::ImageView::null());
+        let lut3d_sampler = self
+            .renderer
+            .lut3d
+            .as_ref()
+            .map(|l| l.sampler)
+            .unwrap_or(self.renderer.texture_sampler);
+        let lut3d_image_info = [DescriptorImageInfo::default()
+            .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(lut3d_view)
+            .sampler(lut3d_sampler)];
+
         let dst_set = descriptor
             .as_ref()
             .map(|d| d.vk())
             .unwrap_or(vk::DescriptorSet::null());
-        let descriptor_update = [vk::WriteDescriptorSet::default()
+
+        let descriptor_update_hdr = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_count(1)
+                .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&tex_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(dst_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_count(1)
+                .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&lut3d_image_info),
+        ];
+
+        let descriptor_update_sdr = [vk::WriteDescriptorSet::default()
             .dst_set(dst_set)
             .dst_binding(0)
             .dst_array_element(0)
             .descriptor_count(1)
             .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&tex_image_info)];
+
+        let descriptor_update: &[vk::WriteDescriptorSet<'_>] = if is_hdr {
+            &descriptor_update_hdr
+        } else {
+            &descriptor_update_sdr
+        };
 
         let src_rect = Rectangle::new(
             Point::new(src.loc.x as f32, src.loc.y as f32),
@@ -2102,7 +2264,13 @@ impl Frame for VulkanFrame<'_, '_> {
         let format_pipelines = self
             .renderer
             .pipelines
-            .get_or_create_format_pipelines(fb_format)?;
+            .get_or_create_format_pipelines(fb_format, self.depth_enabled)?;
+
+        let depth_val = if self.depth_enabled {
+            self.current_depth
+        } else {
+            0.0
+        };
 
         let (layout, pipeline, hdr_push_constants) = if is_hdr {
             let config =
@@ -2195,7 +2363,8 @@ impl Frame for VulkanFrame<'_, '_> {
             let push_constants = HdrTexPushConstants {
                 dst_rect,
                 screen_size,
-                _pad0: [0.0, 0.0],
+                depth: depth_val,
+                _pad0: 0.0,
                 src_rect,
                 src_transform: src_transform_val,
                 alpha,
@@ -2261,12 +2430,12 @@ impl Frame for VulkanFrame<'_, '_> {
                 .vk()
                 .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
             if let Some(push) = push_descriptor {
-                push.cmd_push_descriptor_set(buf, PipelineBindPoint::GRAPHICS, layout, 0, &descriptor_update);
+                push.cmd_push_descriptor_set(buf, PipelineBindPoint::GRAPHICS, layout, 0, descriptor_update);
             } else {
                 self.renderer
                     .device
                     .vk()
-                    .update_descriptor_sets(&descriptor_update, &[]);
+                    .update_descriptor_sets(descriptor_update, &[]);
                 self.renderer.device.vk().cmd_bind_descriptor_sets(
                     buf,
                     PipelineBindPoint::GRAPHICS,
@@ -2292,7 +2461,8 @@ impl Frame for VulkanFrame<'_, '_> {
             let push_constants = TexPushConstants {
                 dst_rect,
                 screen_size,
-                _pad0: [0.0, 0.0],
+                depth: depth_val,
+                _pad0: 0.0,
                 src_rect,
                 src_transform: src_transform_val,
                 alpha,
@@ -2523,6 +2693,9 @@ impl Blit for VulkanRenderer {
             active_color_description: None,
             is_blit: true,
             rendering: false,
+            depth_enabled: false,
+            current_depth: 0.0,
+            depth_image: None,
         };
         if frame.can_copy_image(&from.0, src, dst) {
             frame.copy_image_from_to(&from.0, src, dst)?;
@@ -2592,7 +2765,7 @@ impl VulkanFrame<'_, '_> {
         let format_pipelines = self
             .renderer
             .pipelines
-            .get_or_create_format_pipelines(fb_format)?;
+            .get_or_create_format_pipelines(fb_format, self.depth_enabled)?;
         let pipeline = if should_blend && color.a() < 1.0 {
             format_pipelines.clear_blend_pipeline
         } else {
@@ -2616,10 +2789,17 @@ impl VulkanFrame<'_, '_> {
         );
         let screen_size = [self.size.w as f32, self.size.h as f32];
 
+        let depth_val = if self.depth_enabled {
+            self.current_depth
+        } else {
+            0.0
+        };
+
         let push_constants = ClearPushConstants {
             dst_rect,
             screen_size,
-            _pad: [0.0, 0.0],
+            depth: depth_val,
+            _pad: 0.0,
             color: color.components(),
         };
 
@@ -2917,5 +3097,21 @@ mod test {
         let d2 = Rectangle::new((500, 500).into(), (20, 20).into());
         let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
         assert_eq!(scissors.len(), 2);
+    }
+
+    #[test]
+    fn test_push_constants_memory_layout() {
+        use super::shaders::{ClearPushConstants, HdrTexPushConstants, TexPushConstants};
+
+        // Push constant blocks must have 16-byte alignment and fit in 128 bytes
+        assert_eq!(align_of::<ClearPushConstants>(), 16);
+        assert_eq!(size_of::<ClearPushConstants>(), 48);
+
+        assert_eq!(align_of::<TexPushConstants>(), 16);
+        assert_eq!(size_of::<TexPushConstants>(), 64);
+
+        assert_eq!(align_of::<HdrTexPushConstants>(), 16);
+        assert_eq!(size_of::<HdrTexPushConstants>(), 112);
+        assert!(size_of::<HdrTexPushConstants>() <= 128);
     }
 }

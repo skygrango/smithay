@@ -24,7 +24,8 @@ pub static TEX_SIZES: LazyLock<[DescriptorPoolSize; 1]> = LazyLock::new(|| {
 pub struct TexPushConstants {
     pub dst_rect: Rectangle<f32, Physical>,
     pub screen_size: [f32; 2],
-    pub _pad0: [f32; 2],
+    pub depth: f32,
+    pub _pad0: f32,
     pub src_rect: Rectangle<f32, Buffer>,
     pub src_transform: u32,
     pub alpha: f32,

@@ -4,18 +4,21 @@ layout(location = 0) in vec2 v_pos;
 layout(location = 0) out vec4 outColor;
 
 layout(binding = 0) uniform sampler2D tex;
+layout(binding = 1) uniform sampler3D lut3d;
 
 // Specialization constants:
 // 0: Generic (runtime checks via push constants)
 // 1: Passthrough (skipColorTransform = 1)
 // 2: SdrToHdr (SDR sRGB/Rec709 -> HDR BT.2020)
 // 3: PqToHdr (PQ BT.2020 -> HDR BT.2020 with tone mapping)
+// 4: Lut3d (Hardware 3D LUT sampling)
 layout(constant_id = 0) const uint SPEC_MODE = 0u;
 
 layout(push_constant, std140) uniform PushConstants {
     vec4 dstRect;
     vec2 screenSize;
-    vec2 _pad0;
+    float depth;
+    float _pad0;
     vec4 srcRect;
     uint srcTransform;
     float alpha;
@@ -243,6 +246,58 @@ float optical_alpha_pq(float a, float ref_white) {
     return clamp(pq_lum / max(pq_white, 0.001), 0.0, 1.0);
 }
 
+// Tetrahedral interpolation decomposes each cube cell into 6 tetrahedra along the diagonal (R=G=B).
+// This guarantees that the neutral axis (gray ramp) is strictly preserved without hue shifts or
+// trilinear interpolation cubic artifacts in wide-gamut HDR spaces.
+vec3 tetrahedral_sample(sampler3D lut, vec3 color, float lut_size) {
+    vec3 p = clamp(color, 0.0, 1.0) * (lut_size - 1.0);
+    ivec3 p0 = ivec3(floor(p));
+    vec3 f = p - vec3(p0);
+    int max_coord = int(lut_size) - 1;
+    ivec3 p1 = min(p0 + ivec3(1), ivec3(max_coord));
+    p0 = min(p0, ivec3(max_coord));
+
+    vec3 c000 = texelFetch(lut, p0, 0).rgb;
+    vec3 c111 = texelFetch(lut, p1, 0).rgb;
+    vec3 c1, c2;
+
+    if (f.r >= f.g) {
+        if (f.g >= f.b) {
+            // f.r >= f.g >= f.b (Tetrahedron 1)
+            c1 = texelFetch(lut, ivec3(p1.x, p0.y, p0.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p1.x, p1.y, p0.z), 0).rgb;
+            return c000 * (1.0 - f.r) + c1 * (f.r - f.g) + c2 * (f.g - f.b) + c111 * f.b;
+        } else if (f.r >= f.b) {
+            // f.r >= f.b > f.g (Tetrahedron 2)
+            c1 = texelFetch(lut, ivec3(p1.x, p0.y, p0.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p1.x, p0.y, p1.z), 0).rgb;
+            return c000 * (1.0 - f.r) + c1 * (f.r - f.b) + c2 * (f.b - f.g) + c111 * f.g;
+        } else {
+            // f.b > f.r >= f.g (Tetrahedron 5)
+            c1 = texelFetch(lut, ivec3(p0.x, p0.y, p1.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p1.x, p0.y, p1.z), 0).rgb;
+            return c000 * (1.0 - f.b) + c1 * (f.b - f.r) + c2 * (f.r - f.g) + c111 * f.g;
+        }
+    } else {
+        if (f.b >= f.g) {
+            // f.b >= f.g > f.r (Tetrahedron 6)
+            c1 = texelFetch(lut, ivec3(p0.x, p0.y, p1.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p0.x, p1.y, p1.z), 0).rgb;
+            return c000 * (1.0 - f.b) + c1 * (f.b - f.g) + c2 * (f.g - f.r) + c111 * f.r;
+        } else if (f.b >= f.r) {
+            // f.g > f.b >= f.r (Tetrahedron 4)
+            c1 = texelFetch(lut, ivec3(p0.x, p1.y, p0.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p0.x, p1.y, p1.z), 0).rgb;
+            return c000 * (1.0 - f.g) + c1 * (f.g - f.b) + c2 * (f.b - f.r) + c111 * f.r;
+        } else {
+            // f.g > f.r > f.b (Tetrahedron 3)
+            c1 = texelFetch(lut, ivec3(p0.x, p1.y, p0.z), 0).rgb;
+            c2 = texelFetch(lut, ivec3(p1.x, p1.y, p0.z), 0).rgb;
+            return c000 * (1.0 - f.g) + c1 * (f.g - f.r) + c2 * (f.r - f.b) + c111 * f.b;
+        }
+    }
+}
+
 void main() {
     uvec2 texSize = textureSize(tex, 0);
     vec4 raw;
@@ -277,6 +332,17 @@ void main() {
         }
         float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite);
         outColor = vec4(raw_rgb * opt_a, opt_a);
+        return;
+    }
+
+    if (SPEC_MODE == 4u) {
+        vec3 mapped_rgb = tetrahedral_sample(lut3d, raw_rgb, 33.0);
+        if (params.targetIsSdr != 0) {
+            outColor = vec4(mapped_rgb * eff_alpha, eff_alpha);
+        } else {
+            float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite);
+            outColor = vec4(mapped_rgb * opt_a, opt_a);
+        }
         return;
     }
 

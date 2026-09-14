@@ -7,30 +7,39 @@ use crate::utils::{Buffer, Physical, Rectangle};
 
 pub const HDR_TEX_SHADER: &[u8] =
     include_bytes_aligned!(32, concat!(env!("OUT_DIR"), "/vk/hdr_texture.frag.glsl"));
-pub static HDR_TEX_BINDINGS: LazyLock<[DescriptorSetLayoutBinding<'static>; 1]> = LazyLock::new(|| {
-    [DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .stage_flags(ShaderStageFlags::FRAGMENT)
-        .descriptor_count(1)]
+pub static HDR_TEX_BINDINGS: LazyLock<[DescriptorSetLayoutBinding<'static>; 2]> = LazyLock::new(|| {
+    [
+        DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .stage_flags(ShaderStageFlags::FRAGMENT)
+            .descriptor_count(1),
+        DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .stage_flags(ShaderStageFlags::FRAGMENT)
+            .descriptor_count(1),
+    ]
 });
 pub static HDR_TEX_SIZES: LazyLock<[DescriptorPoolSize; 1]> = LazyLock::new(|| {
     [DescriptorPoolSize::default()
         .ty(DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1)]
+        .descriptor_count(2)]
 });
 
 pub const SPEC_MODE_GENERIC: u32 = 0;
 pub const SPEC_MODE_PASSTHROUGH: u32 = 1;
 pub const SPEC_MODE_SDR: u32 = 2;
 pub const SPEC_MODE_PQ: u32 = 3;
+pub const SPEC_MODE_LUT3D: u32 = 4;
 
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, NoUninit)]
 pub struct HdrTexPushConstants {
     pub dst_rect: Rectangle<f32, Physical>,
     pub screen_size: [f32; 2],
-    pub _pad0: [f32; 2],
+    pub depth: f32,
+    pub _pad0: f32,
     pub src_rect: Rectangle<f32, Buffer>,
     pub src_transform: u32,
     pub alpha: f32,

@@ -1428,9 +1428,7 @@ mod tests {
     #[test]
     fn test_print_hardware_color_support() {
         use crate::backend::allocator::format::FormatSet;
-        use crate::backend::drm::color::{
-            CrtcColorCapabilities, DrmScanoutCapabilities, PlaneColorConversion, ScanoutPlan,
-        };
+        use crate::backend::drm::color::{CrtcColorCapabilities, DrmScanoutCapabilities, ScanoutPlan};
         use crate::backend::drm::device::DrmDeviceFd;
         use crate::utils::DeviceFd;
         use crate::wayland::color::management::{ImageDescription, TransferFunction};

@@ -15,6 +15,7 @@ pub static CLEAR_SIZES: LazyLock<[DescriptorPoolSize; 0]> = LazyLock::new(|| [])
 pub struct ClearPushConstants {
     pub dst_rect: Rectangle<f32, Physical>,
     pub screen_size: [f32; 2],
-    pub _pad: [f32; 2],
+    pub depth: f32,
+    pub _pad: f32,
     pub color: [f32; 4],
 }
