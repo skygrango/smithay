@@ -95,6 +95,7 @@ fn vulkan_compile() {
     options.add_macro_definition("EP", Some("main"));
     options.set_optimization_level(shaderc::OptimizationLevel::Performance);
 
+    println!("cargo::rerun-if-changed=src/backend/renderer/vulkan/shaders");
     for entry in std::fs::read_dir(Path::new("src/backend/renderer/vulkan/shaders"))
         .expect("Unable to find vulkan shader dir.")
         .filter_map(Result::ok)
@@ -117,13 +118,15 @@ fn vulkan_compile() {
                 continue;
             };
 
-            let bin = match compiler.compile_into_spirv(
-                &src,
-                shaderc::ShaderKind::Compute,
-                &file_name,
-                "main",
-                Some(&options),
-            ) {
+            let kind = if file_name.ends_with(".vert.glsl") {
+                shaderc::ShaderKind::Vertex
+            } else if file_name.ends_with(".frag.glsl") {
+                shaderc::ShaderKind::Fragment
+            } else {
+                shaderc::ShaderKind::Compute
+            };
+
+            let bin = match compiler.compile_into_spirv(&src, kind, &file_name, "main", Some(&options)) {
                 Ok(bin) => bin,
                 Err(err) => {
                     println!(

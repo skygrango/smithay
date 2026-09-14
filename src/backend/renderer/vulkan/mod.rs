@@ -55,6 +55,31 @@ pub use self::shaders::Error as PipelineError;
 use self::shaders::Pipelines;
 pub use self::sync::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudgetInfo {
+    pub heap_budget: [vk::DeviceSize; vk::MAX_MEMORY_HEAPS],
+    pub heap_usage: [vk::DeviceSize; vk::MAX_MEMORY_HEAPS],
+}
+
+impl MemoryBudgetInfo {
+    pub fn total_budget(&self) -> vk::DeviceSize {
+        self.heap_budget.iter().copied().sum()
+    }
+
+    pub fn total_usage(&self) -> vk::DeviceSize {
+        self.heap_usage.iter().copied().sum()
+    }
+
+    pub fn usage_ratio(&self) -> f32 {
+        let budget = self.total_budget();
+        if budget == 0 {
+            0.0
+        } else {
+            self.total_usage() as f32 / budget as f32
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VulkanRenderer {
     capabilities: Vec<Capability>,
@@ -195,6 +220,9 @@ impl VulkanRenderer {
         capabilities.extend(Capability::supports_export_timeline(phd));
         capabilities.extend(Capability::supports_host_image_copy(phd));
         capabilities.extend(Capability::supports_queue_family_foreign(phd));
+        capabilities.extend(Capability::supports_push_descriptor(phd));
+        capabilities.extend(Capability::supports_memory_budget(phd));
+        capabilities.extend(Capability::supports_dynamic_rendering(phd));
 
         // Get extensions
         let extensions = Capability::as_extensions(&capabilities);
@@ -302,6 +330,40 @@ impl VulkanRenderer {
 
     pub fn supports_optimal_host_copy(&self) -> bool {
         self.supports_optimal_host_copy
+    }
+
+    pub fn supports_push_descriptor(&self) -> bool {
+        self.capabilities.contains(&Capability::PushDescriptor)
+    }
+
+    pub fn supports_memory_budget(&self) -> bool {
+        self.capabilities.contains(&Capability::MemoryBudget)
+    }
+
+    pub fn supports_dynamic_rendering(&self) -> bool {
+        self.capabilities.contains(&Capability::DynamicRendering)
+    }
+
+    pub fn memory_budget(&self) -> Option<MemoryBudgetInfo> {
+        if !self.supports_memory_budget() {
+            return None;
+        }
+
+        let mut budget_prop = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut mem_prop2 = vk::PhysicalDeviceMemoryProperties2::default();
+        mem_prop2.p_next = &mut budget_prop as *mut _ as *mut _;
+
+        unsafe {
+            self.phd
+                .instance()
+                .handle()
+                .get_physical_device_memory_properties2(self.phd.handle(), &mut mem_prop2);
+        }
+
+        Some(MemoryBudgetInfo {
+            heap_budget: budget_prop.heap_budget,
+            heap_usage: budget_prop.heap_usage,
+        })
     }
 
     pub fn external_queue_family(&self) -> u32 {
@@ -541,6 +603,7 @@ impl Renderer for VulkanRenderer {
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
             is_blit: false,
+            rendering: false,
         })
     }
 
@@ -1383,6 +1446,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
     is_blit: bool,
+    rendering: bool,
 }
 
 impl VulkanFrame<'_, '_> {
@@ -1394,6 +1458,117 @@ impl VulkanFrame<'_, '_> {
             let buf = self.renderer.cmd_pool.create_and_begin_buffer()?;
             self.cmd_buffer = Some(buf);
             Ok(buf)
+        }
+    }
+
+    fn ensure_rendering(&mut self) -> Result<ash::vk::CommandBuffer, Error> {
+        let buf = self.get_or_create_cmd_buffer()?;
+        if self.rendering {
+            return Ok(buf);
+        }
+
+        let qfam = self.renderer.device.queue_family_idx();
+        let ext_queue = self.renderer.external_queue_family();
+
+        let fb_needs_acquire = self.fb.0.needs_acquire();
+        let (fb_src_queue, fb_dst_queue) = if fb_needs_acquire {
+            (ext_queue, qfam)
+        } else {
+            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
+        };
+
+        let fb_old_layout = self.fb.0.current_layout();
+        let (fb_src_stage, fb_src_access) = if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else if fb_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+        } else {
+            (
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
+            )
+        };
+
+        let fb_barrier = ImageMemoryBarrier2::default()
+            .image(*self.fb.0.vk())
+            .old_layout(fb_old_layout)
+            .new_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(fb_src_queue)
+            .dst_queue_family_index(fb_dst_queue)
+            .src_stage_mask(fb_src_stage)
+            .src_access_mask(fb_src_access)
+            .dst_stage_mask(PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(AccessFlags2::COLOR_ATTACHMENT_READ | AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        unsafe {
+            self.renderer.device.vk().cmd_pipeline_barrier2(
+                buf,
+                &DependencyInfo::default().image_memory_barriers(&[fb_barrier]),
+            );
+        }
+
+        self.fb
+            .0
+            .set_current_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        self.fb.0.set_needs_acquire(false);
+
+        let view = self.fb.0.vk_view().unwrap();
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(*view)
+            .image_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE);
+
+        let color_attachments = [color_attachment];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: self.size.w as u32,
+                    height: self.size.h as u32,
+                },
+            })
+            .layer_count(1)
+            .color_attachments(&color_attachments);
+
+        unsafe {
+            self.renderer
+                .device
+                .vk()
+                .cmd_begin_rendering(buf, &rendering_info);
+
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.size.w as f32,
+                height: self.size.h as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.renderer.device.vk().cmd_set_viewport(buf, 0, &[viewport]);
+        }
+
+        self.rendering = true;
+        Ok(buf)
+    }
+
+    fn end_rendering(&mut self) {
+        if self.rendering {
+            if let Some(buf) = self.cmd_buffer {
+                unsafe {
+                    self.renderer.device.vk().cmd_end_rendering(buf);
+                }
+            }
+            self.rendering = false;
         }
     }
 
@@ -1423,6 +1598,7 @@ impl VulkanFrame<'_, '_> {
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
     ) -> Result<(), Error> {
+        self.end_rendering();
         let cmd_buffer = self.get_or_create_cmd_buffer()?;
 
         let qfam = self.renderer.device.queue_family_idx();
@@ -1632,84 +1808,12 @@ impl Frame for VulkanFrame<'_, '_> {
         let dst = self.transform.transform_rect_in(dst, &self.size);
 
         let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
-        let buf = self.get_or_create_cmd_buffer()?;
         self.has_draws = true;
         if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
             self.images.push(texture.inner.clone());
         }
-        let descriptor = if is_hdr {
-            self.renderer
-                .pipelines
-                .alloc_descriptor_set(shaders::BuiltinShader::HdrTexture)?
-        } else {
-            self.renderer
-                .pipelines
-                .alloc_descriptor_set(shaders::BuiltinShader::Texture)?
-        };
-
-        // SAFETY: If we were able to bind it, it has a view
-        let view = self.fb.0.vk_view().unwrap();
-        let fb_image_info = [DescriptorImageInfo::default()
-            .image_layout(ImageLayout::GENERAL)
-            .image_view(*view)];
-
-        let view = texture
-            .vk_view()
-            .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
-        let tex_image_info = [DescriptorImageInfo::default()
-            .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(*view)
-            .sampler(self.renderer.texture_sampler)];
-
-        let descriptor_update = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor.vk())
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_count(1)
-                .descriptor_type(DescriptorType::STORAGE_IMAGE)
-                .image_info(&fb_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor.vk())
-                .dst_binding(1)
-                .dst_array_element(0)
-                .descriptor_count(1)
-                .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&tex_image_info),
-        ];
-        let (layout, pipeline) = if is_hdr {
-            (
-                *self.renderer.pipelines.hdr_tex_pipeline_layout(),
-                *self.renderer.pipelines.hdr_tex_pipeline(),
-            )
-        } else {
-            (
-                *self.renderer.pipelines.tex_pipeline_layout(),
-                *self.renderer.pipelines.tex_pipeline(),
-            )
-        };
-
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
-
-        let fb_needs_acquire = self.fb.0.needs_acquire();
-        let (fb_src_queue, fb_dst_queue) = if fb_needs_acquire {
-            (ext_queue, qfam)
-        } else {
-            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
-        };
-
-        let fb_old_layout = self.fb.0.current_layout();
-        let (fb_src_stage, fb_src_access) = if fb_needs_acquire {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else {
-            (
-                PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::SHADER_STORAGE_WRITE,
-            )
-        };
 
         let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
         let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
@@ -1719,93 +1823,147 @@ impl Frame for VulkanFrame<'_, '_> {
         };
 
         let tex_old_layout = texture.current_layout();
-        let (tex_src_stage, tex_src_access) = if tex_needs_acquire {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if tex_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        let needs_tex_barrier = tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+        if needs_tex_barrier {
+            if self.rendering {
+                self.end_rendering();
+            }
+            let buf = self.get_or_create_cmd_buffer()?;
+
+            let (tex_src_stage, tex_src_access) =
+                if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
+                    (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+                } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                    (
+                        PipelineStageFlags2::FRAGMENT_SHADER,
+                        AccessFlags2::SHADER_SAMPLED_READ,
+                    )
+                } else {
+                    (
+                        PipelineStageFlags2::COMPUTE_SHADER
+                            | PipelineStageFlags2::ALL_TRANSFER
+                            | PipelineStageFlags2::HOST,
+                        AccessFlags2::SHADER_STORAGE_WRITE
+                            | AccessFlags2::TRANSFER_WRITE
+                            | AccessFlags2::HOST_WRITE,
+                    )
+                };
+
+            let tex_barrier = ImageMemoryBarrier2::default()
+                .image(*texture.vk())
+                .old_layout(tex_old_layout)
+                .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(tex_src_queue)
+                .dst_queue_family_index(tex_dst_queue)
+                .src_stage_mask(tex_src_stage)
+                .src_access_mask(tex_src_access)
+                .dst_stage_mask(PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
+                .subresource_range(
+                    ImageSubresourceRange::default()
+                        .aspect_mask(ImageAspectFlags::COLOR)
+                        .layer_count(1)
+                        .level_count(1),
+                );
+
+            unsafe {
+                self.renderer.device.vk().cmd_pipeline_barrier2(
+                    buf,
+                    &DependencyInfo::default().image_memory_barriers(&[tex_barrier]),
+                );
+            }
+
+            texture.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            texture.set_needs_acquire(false);
+        }
+
+        let buf = self.ensure_rendering()?;
+
+        let push_descriptor = self.renderer.device.vk_khr_push_descriptor();
+        let descriptor = if push_descriptor.is_none() {
+            Some(if is_hdr {
+                self.renderer
+                    .pipelines
+                    .alloc_descriptor_set(shaders::BuiltinShader::HdrTexture)?
+            } else {
+                self.renderer
+                    .pipelines
+                    .alloc_descriptor_set(shaders::BuiltinShader::Texture)?
+            })
+        } else {
+            None
+        };
+
+        let view = texture
+            .vk_view()
+            .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
+        let tex_image_info = [DescriptorImageInfo::default()
+            .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(*view)
+            .sampler(self.renderer.texture_sampler)];
+
+        let dst_set = descriptor
+            .as_ref()
+            .map(|d| d.vk())
+            .unwrap_or(vk::DescriptorSet::null());
+        let descriptor_update = [vk::WriteDescriptorSet::default()
+            .dst_set(dst_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_count(1)
+            .descriptor_type(DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&tex_image_info)];
+
+        let fb_format = self.fb.0.format();
+        let format_pipelines = self
+            .renderer
+            .pipelines
+            .get_or_create_format_pipelines(fb_format)?;
+        let should_blend = texture.has_alpha() || alpha < 1.0;
+
+        let (layout, pipeline) = if is_hdr {
             (
-                PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::SHADER_SAMPLED_READ,
+                *self.renderer.pipelines.hdr_tex_pipeline_layout(),
+                if should_blend {
+                    format_pipelines.hdr_tex_blend_pipeline
+                } else {
+                    format_pipelines.hdr_tex_pipeline
+                },
             )
         } else {
             (
-                PipelineStageFlags2::COMPUTE_SHADER
-                    | PipelineStageFlags2::ALL_TRANSFER
-                    | PipelineStageFlags2::HOST,
-                AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::TRANSFER_WRITE | AccessFlags2::HOST_WRITE,
+                *self.renderer.pipelines.tex_pipeline_layout(),
+                if should_blend {
+                    format_pipelines.tex_blend_pipeline
+                } else {
+                    format_pipelines.tex_pipeline
+                },
             )
         };
-
-        let fb_barrier = ImageMemoryBarrier2::default()
-            .image(*self.fb.0.vk())
-            .old_layout(fb_old_layout)
-            .new_layout(ImageLayout::GENERAL)
-            .src_queue_family_index(fb_src_queue)
-            .dst_queue_family_index(fb_dst_queue)
-            .src_stage_mask(fb_src_stage)
-            .src_access_mask(fb_src_access)
-            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(AccessFlags2::SHADER_STORAGE_READ | AccessFlags2::SHADER_STORAGE_WRITE)
-            .subresource_range(
-                ImageSubresourceRange::default()
-                    .aspect_mask(ImageAspectFlags::COLOR)
-                    .layer_count(1)
-                    .level_count(1),
-            );
-
-        let needs_tex_barrier = tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-        let tex_barrier = ImageMemoryBarrier2::default()
-            .image(*texture.vk())
-            .old_layout(tex_old_layout)
-            .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(tex_src_queue)
-            .dst_queue_family_index(tex_dst_queue)
-            .src_stage_mask(tex_src_stage)
-            .src_access_mask(tex_src_access)
-            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
-            .subresource_range(
-                ImageSubresourceRange::default()
-                    .aspect_mask(ImageAspectFlags::COLOR)
-                    .layer_count(1)
-                    .level_count(1),
-            );
 
         unsafe {
             self.renderer
                 .device
                 .vk()
-                .update_descriptor_sets(&descriptor_update, &[]);
-            self.renderer
-                .device
-                .vk()
-                .cmd_bind_pipeline(buf, PipelineBindPoint::COMPUTE, pipeline);
-            self.renderer.device.vk().cmd_bind_descriptor_sets(
-                buf,
-                PipelineBindPoint::COMPUTE,
-                layout,
-                0,
-                &[descriptor.vk()],
-                &[],
-            );
-            if needs_tex_barrier {
-                self.renderer.device.vk().cmd_pipeline_barrier2(
-                    buf,
-                    &DependencyInfo::default().image_memory_barriers(&[fb_barrier, tex_barrier]),
-                );
+                .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
+            if let Some(push) = push_descriptor {
+                push.cmd_push_descriptor_set(buf, PipelineBindPoint::GRAPHICS, layout, 0, &descriptor_update);
             } else {
-                self.renderer.device.vk().cmd_pipeline_barrier2(
+                self.renderer
+                    .device
+                    .vk()
+                    .update_descriptor_sets(&descriptor_update, &[]);
+                self.renderer.device.vk().cmd_bind_descriptor_sets(
                     buf,
-                    &DependencyInfo::default().image_memory_barriers(&[fb_barrier]),
+                    PipelineBindPoint::GRAPHICS,
+                    layout,
+                    0,
+                    &[descriptor.as_ref().unwrap().vk()],
+                    &[],
                 );
             }
         }
-
-        self.fb.0.set_current_layout(ImageLayout::GENERAL);
-        self.fb.0.set_needs_acquire(false);
-        texture.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        texture.set_needs_acquire(false);
 
         let src_rect = Rectangle::new(
             Point::new(src.loc.x as f32, src.loc.y as f32),
@@ -1815,6 +1973,8 @@ impl Frame for VulkanFrame<'_, '_> {
             Point::new(dst.loc.x as f32, dst.loc.y as f32),
             Size::new(dst.size.w as f32, dst.size.h as f32),
         );
+        let screen_size = [self.size.w as f32, self.size.h as f32];
+
         let src_transform_val = match src_transform {
             Transform::Normal => 0,
             Transform::_90 => 1,
@@ -1826,225 +1986,188 @@ impl Frame for VulkanFrame<'_, '_> {
             Transform::Flipped270 => 7,
         };
 
-        let is_bgr = 0u32;
         let has_alpha = texture.has_alpha() as u32;
 
-        for chunk in damage.chunks(4) {
-            let damage_rects_vec: Vec<Rectangle<i32, Physical>> = chunk
-                .iter()
-                .flat_map(|rect| {
-                    let mut rect = *rect;
-                    rect.loc += untransformed_dst.loc;
-                    rect.intersection(untransformed_dst)
-                })
-                .map(|rect| {
-                    let rect = self.transform.transform_rect_in(rect, &self.size);
-                    let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
-                    let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest_size));
-                    let rect_clamped_size = rect
-                        .size
-                        .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
+        if is_hdr {
+            let config =
+                self.renderer
+                    .hdr_config
+                    .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
+                        reference_white: 203.0,
+                        max_luminance: 1000.0,
+                        sdr_gamma: 2.2,
+                        gamut_stretch: 0.0,
+                        hardware_offload: false,
+                        is_sdr: false,
+                    });
+            let mut reference_white = config.reference_white;
+            let mut sdr_gamma = config.sdr_gamma;
+            let mut gamut_stretch = config.gamut_stretch;
+            let mut max_content_luminance = config.reference_white;
+            let max_destination_luminance = config.max_luminance;
+            let hardware_offload = config.hardware_offload as u32;
+            let target_is_sdr = config.is_sdr as u32;
 
-                    Rectangle::new(rect_constrained_loc, rect_clamped_size)
-                })
-                .collect();
+            let mut input_is_pq = 0u32;
+            let mut input_is_hlg = 0u32;
+            let mut input_primaries = 0u32;
+            let mut skip_color_transform = 0u32;
+            let mut content_reference = 203.0f32;
 
-            let mut min_x = i32::MAX;
-            let mut min_y = i32::MAX;
-            let mut max_x = i32::MIN;
-            let mut max_y = i32::MIN;
+            #[cfg(feature = "wayland_frontend")]
+            if let Some(desc) = self.active_color_description.as_ref() {
+                use crate::wayland::color::management::{Primaries, TransferFunction};
+                if desc.is_pq_bt2020() {
+                    input_is_pq = 1;
+                    input_primaries = 2;
+                    content_reference = desc.luminances.map(|(_, _, r)| r.max(80) as f32).unwrap_or(203.0);
+                    max_content_luminance = desc
+                        .luminances
+                        .map(|(_, m, _)| m as f32)
+                        .or_else(|| desc.max_cll.map(|v| v as f32))
+                        .or_else(|| desc.mastering_luminance.map(|(_, m)| m as f32))
+                        .unwrap_or(1000.0);
 
-            for rect in &damage_rects_vec {
-                if rect.size.w > 0 && rect.size.h > 0 {
-                    min_x = min_x.min(rect.loc.x);
-                    min_y = min_y.min(rect.loc.y);
-                    max_x = max_x.max(rect.loc.x + rect.size.w);
-                    max_y = max_y.max(rect.loc.y + rect.size.h);
-                }
-            }
-
-            if min_x >= max_x || min_y >= max_y {
-                continue;
-            }
-
-            let dispatch_offset = [min_x, min_y];
-            let dispatch_w = (max_x - min_x) as u32;
-            let dispatch_h = (max_y - min_y) as u32;
-
-            let damage_rects: [Rectangle<i32, Physical>; 4] = damage_rects_vec
-                .into_iter()
-                .chain(std::iter::repeat_with(Rectangle::zero))
-                .take(4)
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
-
-            if is_hdr {
-                let config =
-                    self.renderer
-                        .hdr_config
-                        .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
-                            reference_white: 203.0,
-                            max_luminance: 1000.0,
-                            sdr_gamma: 2.2,
-                            gamut_stretch: 0.0,
-                            hardware_offload: false,
-                            is_sdr: false,
-                        });
-                let mut reference_white = config.reference_white;
-                let mut sdr_gamma = config.sdr_gamma;
-                let mut gamut_stretch = config.gamut_stretch;
-                let mut max_content_luminance = config.reference_white;
-                let max_destination_luminance = config.max_luminance;
-                let mut hardware_offload = config.hardware_offload as u32;
-                let target_is_sdr = config.is_sdr as u32;
-
-                let mut input_is_pq = 0u32;
-                let mut input_is_hlg = 0u32;
-                let mut input_primaries = 0u32;
-                let mut skip_color_transform = 0u32;
-                let mut content_reference = 203.0f32;
-
-                #[cfg(feature = "wayland_frontend")]
-                if let Some(desc) = self.active_color_description.as_ref() {
-                    use crate::wayland::color::management::{Primaries, TransferFunction};
-                    if desc.is_pq_bt2020() {
-                        input_is_pq = 1;
-                        input_primaries = 2;
-                        content_reference =
-                            desc.luminances.map(|(_, _, r)| r.max(80) as f32).unwrap_or(203.0);
-                        max_content_luminance = desc
-                            .luminances
-                            .map(|(_, m, _)| m as f32)
-                            .or_else(|| desc.max_cll.map(|v| v as f32))
-                            .or_else(|| desc.mastering_luminance.map(|(_, m)| m as f32))
-                            .unwrap_or(1000.0);
-
-                        // If target is HDR (not SDR) and not hardware offload, and content is display-referred or fits destination:
-                        // Passthrough directly without unnecessary color transforms!
-                        if !config.is_sdr
-                            && !config.hardware_offload
-                            && (desc.windows_bt2100 || max_content_luminance <= config.max_luminance * 1.01)
-                            && (content_reference - config.reference_white).abs() < 1.0
-                        {
-                            skip_color_transform = 1;
-                        }
-                    } else if desc.transfer == TransferFunction::Hlg {
-                        input_is_hlg = 1;
-                        input_primaries = 2;
-                        content_reference =
-                            desc.luminances.map(|(_, _, r)| r.max(80) as f32).unwrap_or(203.0);
-                        max_content_luminance = desc
-                            .luminances
-                            .map(|(_, m, _)| m as f32)
-                            .or_else(|| desc.max_cll.map(|v| v as f32))
-                            .or_else(|| desc.mastering_luminance.map(|(_, m)| m as f32))
-                            .unwrap_or(1000.0);
-                    } else if desc.windows_scrgb || desc.transfer == TransferFunction::ExtLinear {
-                        reference_white = 80.0;
-                        sdr_gamma = 1.0;
-                        gamut_stretch = 0.0;
-                        max_content_luminance = config.max_luminance;
-                        content_reference = 203.0;
-                    } else {
-                        sdr_gamma = match desc.transfer {
-                            TransferFunction::Bt1886 => 2.4,
-                            TransferFunction::Gamma22 => 2.2,
-                            TransferFunction::CompoundPower24 | TransferFunction::Srgb => 0.0,
-                            _ => config.sdr_gamma,
-                        };
-                        input_primaries = match desc.primaries.named {
-                            Some(Primaries::DisplayP3) => 1,
-                            Some(Primaries::Bt2020) => 2,
-                            _ => 0,
-                        };
-                        if input_primaries > 0 {
-                            gamut_stretch = 0.0;
-                        }
-                        if config.is_sdr && input_primaries == 0 && sdr_gamma == 0.0 {
-                            skip_color_transform = 1;
-                        }
+                    if !config.is_sdr
+                        && !config.hardware_offload
+                        && (desc.windows_bt2100 || max_content_luminance <= config.max_luminance * 1.01)
+                        && (content_reference - config.reference_white).abs() < 1.0
+                    {
+                        skip_color_transform = 1;
                     }
+                } else if desc.transfer == TransferFunction::Hlg {
+                    input_is_hlg = 1;
+                    input_primaries = 2;
+                    content_reference = desc.luminances.map(|(_, _, r)| r.max(80) as f32).unwrap_or(203.0);
+                    max_content_luminance = desc
+                        .luminances
+                        .map(|(_, m, _)| m as f32)
+                        .or_else(|| desc.max_cll.map(|v| v as f32))
+                        .or_else(|| desc.mastering_luminance.map(|(_, m)| m as f32))
+                        .unwrap_or(1000.0);
+                } else if desc.windows_scrgb || desc.transfer == TransferFunction::ExtLinear {
+                    reference_white = 80.0;
+                    sdr_gamma = 1.0;
+                    gamut_stretch = 0.0;
+                    max_content_luminance = config.max_luminance;
+                    content_reference = 203.0;
                 } else {
-                    // Untagged SDR surface
-                    if config.is_sdr && sdr_gamma == 0.0 {
+                    sdr_gamma = match desc.transfer {
+                        TransferFunction::Bt1886 => 2.4,
+                        TransferFunction::Gamma22 => 2.2,
+                        TransferFunction::CompoundPower24 | TransferFunction::Srgb => 0.0,
+                        _ => config.sdr_gamma,
+                    };
+                    input_primaries = match desc.primaries.named {
+                        Some(Primaries::DisplayP3) => 1,
+                        Some(Primaries::Bt2020) => 2,
+                        _ => 0,
+                    };
+                    if input_primaries > 0 {
+                        gamut_stretch = 0.0;
+                    }
+                    if config.is_sdr && input_primaries == 0 && sdr_gamma == 0.0 {
                         skip_color_transform = 1;
                     }
                 }
-
-                let push_constants = HdrTexPushConstants {
-                    src_rect,
-                    dst_rect,
-                    src_transform: src_transform_val,
-                    alpha,
-                    damage_size: chunk.len() as u32,
-                    is_bgr,
-                    has_alpha,
-                    reference_white,
-                    sdr_gamma,
-                    gamut_stretch,
-                    max_content_luminance,
-                    max_destination_luminance,
-                    hardware_offload,
-                    target_is_sdr,
-                    input_is_pq,
-                    input_is_hlg,
-                    input_primaries,
-                    skip_color_transform,
-                    content_reference,
-                    _pad0: 0,
-                    offset: dispatch_offset,
-                    damage: damage_rects,
-                };
-
-                unsafe {
-                    self.renderer.device.vk().cmd_push_constants(
-                        buf,
-                        layout,
-                        ShaderStageFlags::COMPUTE,
-                        0,
-                        bytemuck::bytes_of(&push_constants),
-                    );
-                    self.renderer.device.vk().cmd_dispatch(
-                        buf,
-                        (dispatch_w as f64 / 8.).ceil() as u32,
-                        (dispatch_h as f64 / 8.).ceil() as u32,
-                        1,
-                    );
-                }
             } else {
-                let push_constants = TexPushConstants {
-                    src_rect,
-                    dst_rect,
-                    src_transform: src_transform_val,
-                    alpha,
-                    damage_size: chunk.len() as u32,
-                    is_bgr,
-                    has_alpha,
-                    _padding0: 0,
-                    offset: dispatch_offset,
-                    damage: damage_rects,
-                };
-
-                unsafe {
-                    self.renderer.device.vk().cmd_push_constants(
-                        buf,
-                        layout,
-                        ShaderStageFlags::COMPUTE,
-                        0,
-                        bytemuck::bytes_of(&push_constants),
-                    );
-                    self.renderer.device.vk().cmd_dispatch(
-                        buf,
-                        (dispatch_w as f64 / 8.).ceil() as u32,
-                        (dispatch_h as f64 / 8.).ceil() as u32,
-                        1,
-                    );
+                if config.is_sdr && sdr_gamma == 0.0 {
+                    skip_color_transform = 1;
                 }
+            }
+
+            let push_constants = HdrTexPushConstants {
+                dst_rect,
+                screen_size,
+                _pad0: [0.0, 0.0],
+                src_rect,
+                src_transform: src_transform_val,
+                alpha,
+                has_alpha,
+                reference_white,
+                sdr_gamma,
+                gamut_stretch,
+                max_content_luminance,
+                max_destination_luminance,
+                hardware_offload,
+                target_is_sdr,
+                input_is_pq,
+                input_is_hlg,
+                input_primaries,
+                skip_color_transform,
+                content_reference,
+                _pad1: 0,
+            };
+
+            unsafe {
+                self.renderer.device.vk().cmd_push_constants(
+                    buf,
+                    layout,
+                    ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&push_constants),
+                );
+            }
+        } else {
+            let push_constants = TexPushConstants {
+                dst_rect,
+                screen_size,
+                _pad0: [0.0, 0.0],
+                src_rect,
+                src_transform: src_transform_val,
+                alpha,
+                has_alpha,
+                _pad1: 0,
+            };
+
+            unsafe {
+                self.renderer.device.vk().cmd_push_constants(
+                    buf,
+                    layout,
+                    ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&push_constants),
+                );
             }
         }
 
-        self.descriptors.push(descriptor);
+        for &rect in damage {
+            let mut r = rect;
+            r.loc += untransformed_dst.loc;
+            let Some(intersection) = r.intersection(untransformed_dst) else {
+                continue;
+            };
+            let r = self.transform.transform_rect_in(intersection, &self.size);
+            let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
+            let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
+            let clamped_size = r
+                .size
+                .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
+
+            if clamped_size.w <= 0 || clamped_size.h <= 0 {
+                continue;
+            }
+
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: constrained_loc.x,
+                    y: constrained_loc.y,
+                },
+                extent: vk::Extent2D {
+                    width: clamped_size.w as u32,
+                    height: clamped_size.h as u32,
+                },
+            };
+
+            unsafe {
+                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
+                self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
+            }
+        }
+
+        if let Some(descriptor) = descriptor {
+            self.descriptors.push(descriptor);
+        }
         Ok(())
     }
 
@@ -2070,6 +2193,8 @@ impl Frame for VulkanFrame<'_, '_> {
             return Ok(SyncPoint::signaled());
         }
 
+        self.end_rendering();
+
         let Some(buf) = self.cmd_buffer.take() else {
             return Ok(SyncPoint::signaled());
         };
@@ -2077,14 +2202,27 @@ impl Frame for VulkanFrame<'_, '_> {
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
 
+        let current_layout = self.fb.0.current_layout();
+        let (src_stage, src_access) = if current_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+        } else {
+            (
+                PipelineStageFlags2::COMPUTE_SHADER | PipelineStageFlags2::ALL_TRANSFER,
+                AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::TRANSFER_WRITE,
+            )
+        };
+
         let barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
-            .old_layout(ImageLayout::GENERAL)
+            .old_layout(current_layout)
             .new_layout(ImageLayout::GENERAL)
             .src_queue_family_index(qfam)
             .dst_queue_family_index(ext_queue)
-            .src_stage_mask(PipelineStageFlags2::COMPUTE_SHADER | PipelineStageFlags2::ALL_TRANSFER)
-            .src_access_mask(AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::TRANSFER_WRITE)
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
             .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(AccessFlags2::NONE)
             .subresource_range(
@@ -2222,6 +2360,7 @@ impl Blit for VulkanRenderer {
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
             is_blit: true,
+            rendering: false,
         };
         if frame.can_copy_image(&from.0, src, dst) {
             frame.copy_image_from_to(&from.0, src, dst)?;
@@ -2287,179 +2426,93 @@ impl VulkanFrame<'_, '_> {
             color
         };
 
-        let buf = self.get_or_create_cmd_buffer()?;
-        self.has_draws = true;
-        let descriptor = self
+        let fb_format = self.fb.0.format();
+        let format_pipelines = self
             .renderer
             .pipelines
-            .alloc_descriptor_set(shaders::BuiltinShader::Clear)?;
-        // SAFETY: If we were able to bind it, it has a view
-        let view = self.fb.0.vk_view().unwrap();
-
-        let image_info = [DescriptorImageInfo::default()
-            .image_layout(ImageLayout::GENERAL)
-            .image_view(*view)];
-        let descriptor_update = [vk::WriteDescriptorSet::default()
-            .dst_set(descriptor.vk())
-            .dst_binding(0)
-            .dst_array_element(0)
-            .descriptor_count(1)
-            .descriptor_type(DescriptorType::STORAGE_IMAGE)
-            .image_info(&image_info)];
+            .get_or_create_format_pipelines(fb_format)?;
+        let pipeline = if should_blend && color.a() < 1.0 {
+            format_pipelines.clear_blend_pipeline
+        } else {
+            format_pipelines.clear_pipeline
+        };
         let layout = *self.renderer.pipelines.clear_pipeline_layout();
 
-        let qfam = self.renderer.device.queue_family_idx();
-        let ext_queue = self.renderer.external_queue_family();
-
-        let fb_needs_acquire = self.fb.0.needs_acquire();
-        let (fb_src_queue, fb_dst_queue) = if fb_needs_acquire {
-            (ext_queue, qfam)
-        } else {
-            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
-        };
-
-        let fb_old_layout = self.fb.0.current_layout();
-        let (fb_src_stage, fb_src_access) = if fb_needs_acquire {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else {
-            (
-                PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::SHADER_STORAGE_WRITE,
-            )
-        };
-
-        let fb_barrier = ImageMemoryBarrier2::default()
-            .image(*self.fb.0.vk())
-            .old_layout(fb_old_layout)
-            .new_layout(ImageLayout::GENERAL)
-            .src_queue_family_index(fb_src_queue)
-            .dst_queue_family_index(fb_dst_queue)
-            .src_stage_mask(fb_src_stage)
-            .src_access_mask(fb_src_access)
-            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(AccessFlags2::SHADER_STORAGE_READ | AccessFlags2::SHADER_STORAGE_WRITE)
-            .subresource_range(
-                ImageSubresourceRange::default()
-                    .aspect_mask(ImageAspectFlags::COLOR)
-                    .layer_count(1)
-                    .level_count(1),
-            );
+        let buf = self.ensure_rendering()?;
+        self.has_draws = true;
 
         unsafe {
             self.renderer
                 .device
                 .vk()
-                .update_descriptor_sets(&descriptor_update, &[]);
-            self.renderer.device.vk().cmd_bind_pipeline(
+                .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
+        }
+
+        let dst_rect = Rectangle::new(
+            Point::new(_dst.loc.x as f32, _dst.loc.y as f32),
+            Size::new(_dst.size.w as f32, _dst.size.h as f32),
+        );
+        let screen_size = [self.size.w as f32, self.size.h as f32];
+
+        let push_constants = ClearPushConstants {
+            dst_rect,
+            screen_size,
+            _pad: [0.0, 0.0],
+            color: color.components(),
+        };
+
+        unsafe {
+            self.renderer.device.vk().cmd_push_constants(
                 buf,
-                PipelineBindPoint::COMPUTE,
-                *self.renderer.pipelines.clear_pipeline(),
-            );
-            self.renderer.device.vk().cmd_bind_descriptor_sets(
-                buf,
-                PipelineBindPoint::COMPUTE,
                 layout,
+                ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
                 0,
-                &[descriptor.vk()],
-                &[],
-            );
-            self.renderer.device.vk().cmd_pipeline_barrier2(
-                buf,
-                &DependencyInfo::default().image_memory_barriers(&[fb_barrier]),
+                bytemuck::bytes_of(&push_constants),
             );
         }
 
-        self.fb.0.set_current_layout(ImageLayout::GENERAL);
-        self.fb.0.set_needs_acquire(false);
+        for &rect in damage {
+            let mut r = rect;
+            r.loc += untransformed_dst.loc;
+            let Some(intersection) = r.intersection(untransformed_dst) else {
+                continue;
+            };
+            let r = self.transform.transform_rect_in(intersection, &self.size);
+            let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
+            let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
+            let clamped_size = r
+                .size
+                .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
 
-        for chunk in damage.chunks(5) {
-            let rects_vec: Vec<Rectangle<i32, Physical>> = chunk
-                .iter()
-                .flat_map(|rect| {
-                    let mut rect = *rect;
-                    rect.loc += untransformed_dst.loc;
-                    rect.intersection(untransformed_dst)
-                })
-                .map(|rect| {
-                    let rect = self.transform.transform_rect_in(rect, &self.size);
-                    let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
-                    let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest_size));
-                    let rect_clamped_size = rect
-                        .size
-                        .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
-
-                    Rectangle::new(rect_constrained_loc, rect_clamped_size)
-                })
-                .collect();
-
-            let mut min_x = i32::MAX;
-            let mut min_y = i32::MAX;
-            let mut max_x = i32::MIN;
-            let mut max_y = i32::MIN;
-
-            for rect in &rects_vec {
-                if rect.size.w > 0 && rect.size.h > 0 {
-                    min_x = min_x.min(rect.loc.x);
-                    min_y = min_y.min(rect.loc.y);
-                    max_x = max_x.max(rect.loc.x + rect.size.w);
-                    max_y = max_y.max(rect.loc.y + rect.size.h);
-                }
-            }
-
-            if min_x >= max_x || min_y >= max_y {
+            if clamped_size.w <= 0 || clamped_size.h <= 0 {
                 continue;
             }
 
-            let dispatch_offset = [min_x, min_y];
-            let dispatch_w = (max_x - min_x) as u32;
-            let dispatch_h = (max_y - min_y) as u32;
-
-            let rects: [Rectangle<i32, Physical>; 5] = rects_vec
-                .into_iter()
-                .chain(std::iter::repeat_with(Rectangle::zero))
-                .take(5)
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
-
-            let push_constants = ClearPushConstants {
-                color: color.components(),
-                blend: should_blend as u32,
-                size: chunk.len() as u32,
-                is_bgr: is_bgr_format(self.fb.0.format()) as u32,
-                _padding0: 0,
-                offset: dispatch_offset,
-                _padding1: [0; 2],
-                rects,
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: constrained_loc.x,
+                    y: constrained_loc.y,
+                },
+                extent: vk::Extent2D {
+                    width: clamped_size.w as u32,
+                    height: clamped_size.h as u32,
+                },
             };
 
             unsafe {
-                self.renderer.device.vk().cmd_push_constants(
-                    buf,
-                    layout,
-                    ShaderStageFlags::COMPUTE,
-                    0,
-                    bytemuck::bytes_of(&push_constants),
-                );
-                self.renderer.device.vk().cmd_dispatch(
-                    buf,
-                    (dispatch_w as f64 / 8.).ceil() as u32,
-                    (dispatch_h as f64 / 8.).ceil() as u32,
-                    1,
-                );
+                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
+                self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
             }
         }
 
-        self.descriptors.push(descriptor);
         Ok(())
     }
 }
 
 impl Bind<VulkanImage> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut VulkanImage) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        if target.vk_usage().contains(ImageUsageFlags::STORAGE)
+        if target.vk_usage().contains(ImageUsageFlags::COLOR_ATTACHMENT)
+            || target.vk_usage().contains(ImageUsageFlags::STORAGE)
             || target.vk_usage().contains(ImageUsageFlags::TRANSFER_DST)
         {
             Ok(VulkanFramebuffer(target.clone()))
@@ -2478,7 +2531,10 @@ impl Bind<VulkanImage> for VulkanRenderer {
                 for prop in props {
                     if prop
                         .drm_format_modifier_tiling_features
-                        .contains(FormatFeatureFlags::STORAGE_IMAGE)
+                        .contains(FormatFeatureFlags::COLOR_ATTACHMENT)
+                        || prop
+                            .drm_format_modifier_tiling_features
+                            .contains(FormatFeatureFlags::STORAGE_IMAGE)
                     {
                         set.insert(Format {
                             code: *fourcc,
@@ -2505,7 +2561,8 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
         format: Fourcc,
         size: Size<i32, BufferCoords>,
     ) -> Result<VulkanImage, Self::Error> {
-        let mut usage = ImageUsageFlags::STORAGE
+        let mut usage = ImageUsageFlags::COLOR_ATTACHMENT
+            | ImageUsageFlags::STORAGE
             | ImageUsageFlags::TRANSFER_SRC
             | ImageUsageFlags::TRANSFER_DST
             | ImageUsageFlags::SAMPLED;
@@ -2525,8 +2582,10 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
                     "VulkanRenderer::create_buffer optimal tiling failed ({:?}), falling back to linear",
                     err
                 );
-                let mut linear_usage =
-                    ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST | ImageUsageFlags::SAMPLED;
+                let mut linear_usage = ImageUsageFlags::COLOR_ATTACHMENT
+                    | ImageUsageFlags::TRANSFER_SRC
+                    | ImageUsageFlags::TRANSFER_DST
+                    | ImageUsageFlags::SAMPLED;
                 if self.device.vk_ext_host_image_copy().is_some() {
                     linear_usage |= ImageUsageFlags::HOST_TRANSFER_EXT;
                 }
@@ -2567,7 +2626,8 @@ impl Bind<Dmabuf> for VulkanRenderer {
                 let res = VulkanImage::new_from_dmabuf(
                     &self.device,
                     target,
-                    ImageUsageFlags::STORAGE
+                    ImageUsageFlags::COLOR_ATTACHMENT
+                        | ImageUsageFlags::STORAGE
                         | ImageUsageFlags::TRANSFER_SRC
                         | ImageUsageFlags::TRANSFER_DST
                         | ImageUsageFlags::SAMPLED,
@@ -2576,13 +2636,14 @@ impl Bind<Dmabuf> for VulkanRenderer {
                     Ok(img) => img,
                     Err(err) => {
                         tracing::warn!(
-                            "VulkanRenderer::bind dmabuf with STORAGE failed ({:?}), retrying without STORAGE for transfer/render-target fallback",
+                            "VulkanRenderer::bind dmabuf with STORAGE failed ({:?}), retrying with COLOR_ATTACHMENT/TRANSFER",
                             err
                         );
                         VulkanImage::new_from_dmabuf(
                             &self.device,
                             target,
-                            ImageUsageFlags::TRANSFER_SRC
+                            ImageUsageFlags::COLOR_ATTACHMENT
+                                | ImageUsageFlags::TRANSFER_SRC
                                 | ImageUsageFlags::TRANSFER_DST
                                 | ImageUsageFlags::SAMPLED,
                         )
@@ -2613,7 +2674,10 @@ impl Bind<Dmabuf> for VulkanRenderer {
                 for prop in props {
                     if prop
                         .drm_format_modifier_tiling_features
-                        .contains(FormatFeatureFlags::STORAGE_IMAGE)
+                        .contains(FormatFeatureFlags::COLOR_ATTACHMENT)
+                        || prop
+                            .drm_format_modifier_tiling_features
+                            .contains(FormatFeatureFlags::STORAGE_IMAGE)
                     {
                         set.insert(Format {
                             code: *fourcc,

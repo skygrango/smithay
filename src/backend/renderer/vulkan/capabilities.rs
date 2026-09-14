@@ -21,6 +21,9 @@ pub enum Capability {
     HostImageCopy,
     ExportTimeline,
     QueueFamilyForeign,
+    PushDescriptor,
+    MemoryBudget,
+    DynamicRendering,
 }
 
 pub struct Features {
@@ -77,6 +80,7 @@ impl Features {
                 .shader_storage_image_write_without_format = 1;
             if let Some(features_13) = features.features_13.as_mut() {
                 features_13.synchronization2 = 1;
+                features_13.dynamic_rendering = 1;
             }
         }
 
@@ -99,6 +103,15 @@ impl Features {
         }
         if self.features_13.as_ref().map(|f| f.synchronization2).unwrap_or(0) == 0 {
             return Err("synchronization2");
+        }
+        if self
+            .features_13
+            .as_ref()
+            .map(|f| f.dynamic_rendering)
+            .unwrap_or(0)
+            == 0
+        {
+            return Err("dynamic_rendering");
         }
 
         Ok(())
@@ -166,6 +179,37 @@ impl Capability {
         Some(Capability::QueueFamilyForeign)
     }
 
+    pub fn supports_push_descriptor(phd: &PhysicalDevice) -> Option<Capability> {
+        if !phd.has_device_extension(khr::push_descriptor::NAME) {
+            return None;
+        }
+
+        Some(Capability::PushDescriptor)
+    }
+
+    pub fn supports_memory_budget(phd: &PhysicalDevice) -> Option<Capability> {
+        if !phd.has_device_extension(ext::memory_budget::NAME) {
+            return None;
+        }
+
+        Some(Capability::MemoryBudget)
+    }
+
+    pub fn supports_dynamic_rendering(phd: &PhysicalDevice) -> Option<Capability> {
+        let features = Features::supported_features(phd);
+        if features
+            .features_13
+            .as_ref()
+            .map(|f| f.dynamic_rendering)
+            .unwrap_or(0)
+            == 1
+        {
+            Some(Capability::DynamicRendering)
+        } else {
+            None
+        }
+    }
+
     pub fn supports_dmabuf_memory(phd: &PhysicalDevice) -> Option<Capability> {
         for ext in [
             khr::external_memory_fd::NAME,
@@ -191,6 +235,9 @@ impl Capability {
                 Capability::HostImageCopy => &[ext::host_image_copy::NAME],
                 Capability::ExportTimeline => &[khr::external_semaphore_fd::NAME],
                 Capability::QueueFamilyForeign => &[ext::queue_family_foreign::NAME],
+                Capability::PushDescriptor => &[khr::push_descriptor::NAME],
+                Capability::MemoryBudget => &[ext::memory_budget::NAME],
+                Capability::DynamicRendering => &[] as &'static [&CStr],
             })
             .copied()
             .collect()

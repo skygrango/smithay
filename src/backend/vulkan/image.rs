@@ -475,22 +475,28 @@ impl VulkanImage {
                 })?;
         }
 
-        if vk_usage.contains(vk::ImageUsageFlags::SAMPLED) || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
+        if vk_usage.contains(vk::ImageUsageFlags::SAMPLED)
+            || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
+            || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         {
             let info = vk::ImageViewCreateInfo::default()
                 .image(inner.image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(vk_format)
-                .components(if vk_usage.contains(vk::ImageUsageFlags::STORAGE) {
-                    vk::ComponentMapping {
-                        r: vk::ComponentSwizzle::IDENTITY,
-                        g: vk::ComponentSwizzle::IDENTITY,
-                        b: vk::ComponentSwizzle::IDENTITY,
-                        a: vk::ComponentSwizzle::IDENTITY,
-                    }
-                } else {
-                    component_mapping_for_format(vk_format, has_alpha)
-                })
+                .components(
+                    if vk_usage.contains(vk::ImageUsageFlags::STORAGE)
+                        || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    {
+                        vk::ComponentMapping {
+                            r: vk::ComponentSwizzle::IDENTITY,
+                            g: vk::ComponentSwizzle::IDENTITY,
+                            b: vk::ComponentSwizzle::IDENTITY,
+                            a: vk::ComponentSwizzle::IDENTITY,
+                        }
+                    } else {
+                        component_mapping_for_format(vk_format, has_alpha)
+                    },
+                )
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)

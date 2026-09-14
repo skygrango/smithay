@@ -146,6 +146,14 @@ impl Device {
         } else {
             None
         };
+        let khr_push_descriptor = if extensions.iter().any(|ext| ext == &khr::push_descriptor::NAME) {
+            Some(khr::push_descriptor::Device::new(
+                phd.instance().handle(),
+                &device,
+            ))
+        } else {
+            None
+        };
 
         Ok(Device(Arc::new(InnerDevice {
             vk: device,
@@ -153,6 +161,7 @@ impl Device {
             khr_external_memory_fd,
             ext_image_drm_format_modifier,
             ext_host_image_copy,
+            khr_push_descriptor,
 
             mem_properties,
             formats: phd.drm_formats(),
@@ -187,6 +196,10 @@ impl Device {
 
     pub fn vk_ext_host_image_copy(&self) -> Option<&ext::host_image_copy::Device> {
         self.0.ext_host_image_copy.as_ref()
+    }
+
+    pub fn vk_khr_push_descriptor(&self) -> Option<&khr::push_descriptor::Device> {
+        self.0.khr_push_descriptor.as_ref()
     }
 
     pub fn memory_properties(&self) -> &PhysicalDeviceMemoryProperties {
@@ -230,6 +243,7 @@ struct InnerDevice {
     khr_external_memory_fd: Option<khr::external_memory_fd::Device>,
     ext_image_drm_format_modifier: Option<ext::image_drm_format_modifier::Device>,
     ext_host_image_copy: Option<ext::host_image_copy::Device>,
+    khr_push_descriptor: Option<khr::push_descriptor::Device>,
 
     mem_properties: PhysicalDeviceMemoryProperties,
     formats: super::FormatList,
