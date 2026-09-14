@@ -4388,24 +4388,21 @@ where
     let bo_format = bo.format().code;
     let bo_stride = bo.stride();
 
-    let mut copy_to_bo = |src, src_stride, src_height| {
-        if src_stride == bo_stride as i32 {
-            bo.write(src).is_ok()
-        } else {
-            let res = bo.map_mut(0, 0, cursor_size.w as u32, cursor_size.h as u32, |mbo| {
-                let dst = mbo.buffer_mut();
-                for row in 0..src_height {
-                    let src_row_start = (row * src_stride) as usize;
-                    let src_row_end = src_row_start + src_stride as usize;
-                    let src_row = &src[src_row_start..src_row_end];
-                    let dst_row_start = (row * bo_stride as i32) as usize;
-                    let dst_row_end = dst_row_start + src_stride as usize;
-                    let dst_row = &mut dst[dst_row_start..dst_row_end];
-                    dst_row.copy_from_slice(src_row);
-                }
-            });
-            res.is_ok()
-        }
+    let mut copy_to_bo = |src: &[u8], src_stride: i32, src_height: i32| {
+        let res = bo.map_mut(0, 0, cursor_size.w as u32, cursor_size.h as u32, |mbo| {
+            let dst = mbo.buffer_mut();
+            dst.fill(0);
+            for row in 0..src_height {
+                let src_row_start = (row * src_stride) as usize;
+                let src_row_end = src_row_start + src_stride as usize;
+                let src_row = &src[src_row_start..src_row_end];
+                let dst_row_start = (row * bo_stride as i32) as usize;
+                let dst_row_end = dst_row_start + src_stride as usize;
+                let dst_row = &mut dst[dst_row_start..dst_row_end];
+                dst_row.copy_from_slice(src_row);
+            }
+        });
+        res.is_ok()
     };
 
     match underlying_storage {

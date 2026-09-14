@@ -81,7 +81,7 @@ impl MemoryBudgetInfo {
 }
 
 mod lut3d;
-use lut3d::{Lut3dTexture, generate_ictcp_tonemap_lut, generate_identity_lut};
+use lut3d::{Lut3dTexture, generate_ictcp_tonemap_lut};
 
 #[derive(Debug)]
 pub struct VulkanRenderer {
