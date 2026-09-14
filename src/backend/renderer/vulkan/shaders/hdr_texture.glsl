@@ -257,11 +257,22 @@ void main() {
         return;
 
     uvec2 texSize = textureSize(tex, 0);
-    vec2 dstUV = (vec2(coord) - params.dstRect.xy) / params.dstRect.zw;
-    vec2 srcUV = ((dstUV * params.srcRect.zw) + params.srcRect.xy) / texSize;
-    vec2 uv = applyTransform(srcUV, params.srcTransform);
-
-    vec4 raw = texture(tex, uv);
+    vec4 raw;
+    bool is1to1 = (params.srcTransform == 0) &&
+                  (abs(params.srcRect.z - params.dstRect.z) < 0.001) &&
+                  (abs(params.srcRect.w - params.dstRect.w) < 0.001) &&
+                  (abs(params.srcRect.x - floor(params.srcRect.x)) < 0.001) &&
+                  (abs(params.srcRect.y - floor(params.srcRect.y)) < 0.001);
+    if (is1to1) {
+        ivec2 srcCoord = ivec2(coord) - ivec2(round(params.dstRect.xy)) + ivec2(round(params.srcRect.xy));
+        srcCoord = clamp(srcCoord, ivec2(0), ivec2(texSize) - ivec2(1));
+        raw = texelFetch(tex, srcCoord, 0);
+    } else {
+        vec2 dstUV = (vec2(coord) + vec2(0.5) - params.dstRect.xy) / params.dstRect.zw;
+        vec2 srcUV = ((dstUV * params.srcRect.zw) + params.srcRect.xy) / vec2(texSize);
+        vec2 uv = applyTransform(srcUV, params.srcTransform);
+        raw = texture(tex, uv);
+    }
     if (params.hasAlpha == 0) {
         raw.a = 1.0;
     }

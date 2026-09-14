@@ -1912,10 +1912,28 @@ impl MultiTexture {
         <A::Device as ApiDevice>::Renderer: ImportDma,
     {
         let mut tex = self.0.lock().unwrap();
+        let target_id = renderer.context_id().erased();
         if let Some(GpuSingleTexture::Dma { texture, dmabuf, .. }) =
-            tex.textures.get_mut(&renderer.context_id().erased())
+            tex.textures.get_mut(&target_id)
         {
             *texture = Box::new(renderer.import_dmabuf(dmabuf, None)?) as Box<_>;
+        } else {
+            let dmabuf_opt = tex.textures.values().find_map(|t| match t {
+                GpuSingleTexture::Dma { dmabuf, .. } => Some(dmabuf.clone()),
+                _ => None,
+            });
+            if let Some(dmabuf) = dmabuf_opt {
+                trace!(?target_id, "Importing dmabuf on new device in reimport");
+                let new_tex = renderer.import_dmabuf(&dmabuf, None)?;
+                tex.textures.insert(
+                    target_id,
+                    GpuSingleTexture::Dma {
+                        texture: Box::new(new_tex) as Box<_>,
+                        dmabuf,
+                        sync: None,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -2132,11 +2150,11 @@ where
                 .render_texture_from_to(&texture, src, dst, damage, opaque_regions, src_transform, alpha)
                 .map_err(Error::Render)
         } else {
-            warn!(
-                "Failed to render texture {:?}, import for wrong devices {:?}? {:?}",
-                Arc::as_ptr(&texture.0),
-                self.node,
-                texture.0.lock().unwrap(),
+            tracing::error!(
+                ptr = ?Arc::as_ptr(&texture.0),
+                target_node = ?self.node,
+                tex_state = ?texture.0.lock().unwrap(),
+                "Failed to render MultiTexture: no valid texture on target GPU device"
             );
             Ok(())
         }

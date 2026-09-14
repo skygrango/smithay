@@ -258,7 +258,13 @@ impl VulkanImage {
                 device
                     .vk()
                     .create_image(&image_create_info, None)
-                    .map_err(Error::VulkanImage)?
+                    .map_err(|err| {
+                        tracing::error!(
+                            "VulkanImage::new_internal: create_image failed: {:?}, width={}, height={}, vk_format={:?}, vk_usage={:?}, tiling={:?}",
+                            err, width, height, vk_format, vk_usage, tiling
+                        );
+                        Error::VulkanImage(err)
+                    })?
             },
             memory: vk::DeviceMemory::null(),
             device: device.downgrade(),
@@ -319,18 +325,62 @@ impl VulkanImage {
         let mut alloc_create_info = vk::MemoryAllocateInfo::default().allocation_size(memory_reqs.size);
 
         let mut mem_bits = None;
-        for (i, types) in device
-            .memory_properties()
-            .memory_types_as_slice()
-            .iter()
-            .enumerate()
-        {
-            if (memory_reqs.memory_type_bits & (1 << i)) != 0
-                && types.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
+        if linear {
+            let mut best_index = None;
+            let mut best_flags = MemoryPropertyFlags::empty();
+            for (i, types) in device
+                .memory_properties()
+                .memory_types_as_slice()
+                .iter()
+                .enumerate()
             {
-                alloc_create_info = alloc_create_info.memory_type_index(i as u32);
-                mem_bits = Some(types.property_flags.clone());
-                break;
+                if (memory_reqs.memory_type_bits & (1 << i)) != 0
+                    && types.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
+                {
+                    let flags = types.property_flags;
+                    if flags.contains(
+                        MemoryPropertyFlags::HOST_VISIBLE
+                            | MemoryPropertyFlags::HOST_COHERENT
+                            | MemoryPropertyFlags::DEVICE_LOCAL,
+                    ) {
+                        best_index = Some(i as u32);
+                        best_flags = flags;
+                        break;
+                    } else if flags.contains(
+                        MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+                    ) {
+                        if best_index.is_none()
+                            || !best_flags.contains(MemoryPropertyFlags::HOST_COHERENT)
+                        {
+                            best_index = Some(i as u32);
+                            best_flags = flags;
+                        }
+                    } else if best_index.is_none() {
+                        best_index = Some(i as u32);
+                        best_flags = flags;
+                    }
+                }
+            }
+            if let Some(index) = best_index {
+                alloc_create_info = alloc_create_info.memory_type_index(index);
+                mem_bits = Some(best_flags);
+            }
+        }
+
+        if mem_bits.is_none() {
+            for (i, types) in device
+                .memory_properties()
+                .memory_types_as_slice()
+                .iter()
+                .enumerate()
+            {
+                if (memory_reqs.memory_type_bits & (1 << i)) != 0
+                    && types.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
+                {
+                    alloc_create_info = alloc_create_info.memory_type_index(i as u32);
+                    mem_bits = Some(types.property_flags.clone());
+                    break;
+                }
             }
         }
 
@@ -350,6 +400,17 @@ impl VulkanImage {
         }
 
         let Some(mem_bits) = mem_bits else {
+            if width > 1 || height > 1 {
+                tracing::error!(
+                    "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
+                    width, height, fourcc, vk_format, vk_usage, linear, tiling, memory_reqs.memory_type_bits
+                );
+            } else {
+                tracing::debug!(
+                    "VulkanImage::new_internal probe NoMemoryAvailable: vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
+                    vk_usage, linear, tiling, memory_reqs.memory_type_bits
+                );
+            }
             return Err(Error::NoMemoryAvailable);
         };
 
@@ -387,12 +448,21 @@ impl VulkanImage {
             inner.memory = device
                 .vk()
                 .allocate_memory(&alloc_create_info, None)
-                .map_err(Error::VulkanAllocate)?;
+                .map_err(|err| {
+                    tracing::error!(
+                        "VulkanImage::new_internal: allocate_memory failed: {:?}, size={}, type_index={}",
+                        err, alloc_create_info.allocation_size, alloc_create_info.memory_type_index
+                    );
+                    Error::VulkanAllocate(err)
+                })?;
             // Finally bind the memory to the image
             device
                 .vk()
                 .bind_image_memory(inner.image, inner.memory, 0)
-                .map_err(Error::VulkanBind)?;
+                .map_err(|err| {
+                    tracing::error!("VulkanImage::new_internal: bind_image_memory failed: {:?}", err);
+                    Error::VulkanBind(err)
+                })?;
         }
 
         if vk_usage.contains(vk::ImageUsageFlags::SAMPLED) || vk_usage.contains(vk::ImageUsageFlags::STORAGE)

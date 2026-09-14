@@ -10,7 +10,7 @@ use crate::{
         renderer::{
             Bind, Blit, Color32F, Frame, Renderer,
             damage::OutputDamageTracker,
-            element::{Element, Id, RenderElement, RenderElementStates},
+            element::{Element, Id, RenderElement, RenderElementStates, UnderlyingStorage},
             sync::SyncPoint,
             utils::{CommitCounter, DamageSet, DamageSnapshot, OpaqueRegions},
         },
@@ -322,9 +322,21 @@ where
                 Some((sync.clone(), dmabuf, geometry))
             }
             PrimaryPlaneElement::Element(e) => {
-                elements_to_render.push(*e);
-                opaque_regions.extend(e.opaque_regions(scale));
-                None
+                let dmabuf: Option<Dmabuf> = e.underlying_storage(renderer).and_then(|storage| match storage {
+                    #[cfg(feature = "wayland_frontend")]
+                    UnderlyingStorage::Wayland(b) => crate::wayland::dmabuf::get_dmabuf(b).ok().cloned(),
+                    _ => None,
+                });
+                if let Some(dmabuf) = dmabuf {
+                    let size = dmabuf.size();
+                    let geometry = Rectangle::from_size(size.to_logical(1, Transform::Normal).to_physical(1));
+                    opaque_regions.push(geometry);
+                    Some((SyncPoint::default(), dmabuf, geometry))
+                } else {
+                    elements_to_render.push(*e);
+                    opaque_regions.extend(e.opaque_regions(scale));
+                    None
+                }
             }
         };
 
