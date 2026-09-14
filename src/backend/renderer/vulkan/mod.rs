@@ -988,94 +988,6 @@ impl VulkanRenderer {
                 image.clone(),
                 self.device.downgrade(),
             ))
-        } else if image.vk_usage().contains(ImageUsageFlags::HOST_TRANSFER_EXT)
-            && self.device.vk_ext_host_image_copy().is_some()
-        {
-            use ash::ext::host_image_copy;
-
-            let device_copy = self
-                .device
-                .vk_ext_host_image_copy()
-                .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
-            let res = (|| -> Result<VulkanMapping, Error> {
-                unsafe {
-                    if self.seq_no > 0 {
-                        let _ = self.device.vk().wait_semaphores(
-                            &ash::vk::SemaphoreWaitInfo::default()
-                                .semaphores(&[self.timeline.vk])
-                                .values(&[self.seq_no]),
-                            10_000_000_000,
-                        );
-                    }
-                    device_copy
-                        .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
-                            .old_layout(image.current_layout())
-                            .new_layout(ImageLayout::GENERAL)
-                            .image(*image.vk())
-                            .subresource_range(
-                                ImageSubresourceRange::default()
-                                    .aspect_mask(ImageAspectFlags::COLOR)
-                                    .layer_count(1)
-                                    .level_count(1),
-                            )])
-                        .map_err(Error::HostImageTransitionError)?;
-
-                    let bpp = match format {
-                        Fourcc::Abgr2101010
-                        | Fourcc::Xbgr2101010
-                        | Fourcc::Argb2101010
-                        | Fourcc::Xrgb2101010 => 4usize,
-                        Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8usize,
-                        _ => 4usize,
-                    };
-                    let copy_width = (region.size.w as u32).min(image.width()).max(1);
-                    let copy_height = (region.size.h as u32).min(image.height()).max(1);
-                    let offset_x = region.loc.x.max(0);
-                    let offset_y = region.loc.y.max(0);
-                    let stride = copy_width as usize * bpp;
-                    let size = stride * copy_height as usize;
-                    let mut data = vec![0u8; size];
-                    device_copy
-                        .copy_image_to_memory(
-                            &vk::CopyImageToMemoryInfoEXT::default()
-                                .flags(HostImageCopyFlagsEXT::empty())
-                                .src_image(*image.vk())
-                                .src_image_layout(ImageLayout::GENERAL)
-                                .regions(&[ImageToMemoryCopyEXT::default()
-                                    .host_pointer(data.as_mut_ptr() as *mut _)
-                                    .memory_image_height(copy_height)
-                                    .memory_row_length(copy_width)
-                                    .image_subresource(
-                                        ImageSubresourceLayers::default()
-                                            .aspect_mask(ImageAspectFlags::COLOR)
-                                            .mip_level(0)
-                                            .base_array_layer(0)
-                                            .layer_count(1),
-                                    )
-                                    .image_offset(Offset3D {
-                                        x: offset_x,
-                                        y: offset_y,
-                                        z: 0,
-                                    })
-                                    .image_extent(
-                                        Extent3D::default().depth(1).width(copy_width).height(copy_height),
-                                    )]),
-                        )
-                        .map_err(Error::HostImageCopyError)?;
-
-                    Ok(VulkanMapping::Copied(data, image.clone()))
-                }
-            })();
-
-            match res {
-                Ok(mapping) => Ok(mapping),
-                Err(err) => {
-                    tracing::warn!(
-                        "copy_image_to_memory failed ({err:?}), falling back to staging buffer copy"
-                    );
-                    self.copy_image_via_staging_buffer(image, region, format)
-                }
-            }
         } else {
             self.copy_image_via_staging_buffer(image, region, format)
         }
@@ -1494,13 +1406,12 @@ pub(crate) fn calculate_damage_scissors(
             continue;
         };
         let r = transform.transform_rect_in(intersection, screen_size);
-        let constrained_loc = r.loc.constrain(Rectangle::from_size(dest_size));
-        let clamped_size = r
-            .size
-            .clamp((0, 0), (dest_size.to_point() - constrained_loc).to_size());
+        let Some(clipped) = r.intersection(Rectangle::from_size(dest_size)) else {
+            continue;
+        };
 
-        if clamped_size.w > 0 && clamped_size.h > 0 {
-            raw_rects.push(Rectangle::new(constrained_loc, clamped_size));
+        if clipped.size.w > 0 && clipped.size.h > 0 {
+            raw_rects.push(clipped);
         }
     }
 
@@ -1520,7 +1431,7 @@ pub(crate) fn calculate_damage_scissors(
             .collect();
     }
 
-    // Coalesce / merge rectangles:
+    // Coalesce / merge rectangles (lossless exact merges only):
     let mut merged = raw_rects;
     loop {
         let mut changed = false;
@@ -1573,30 +1484,6 @@ pub(crate) fn calculate_damage_scissors(
                     let x2 = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
                     merged[i].loc.x = x1;
                     merged[i].size.w = x2 - x1;
-                    merged.swap_remove(j);
-                    changed = true;
-                    continue;
-                }
-
-                // 5. Greedy bounding-box merge if excess area is <= 15%
-                let min_x = a.loc.x.min(b.loc.x);
-                let min_y = a.loc.y.min(b.loc.y);
-                let max_x = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
-                let max_y = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
-                let union_area = (max_x - min_x) as i64 * (max_y - min_y) as i64;
-                let area_a = a.size.w as i64 * a.size.h as i64;
-                let area_b = b.size.w as i64 * b.size.h as i64;
-                let inter_area = a
-                    .intersection(b)
-                    .map(|inter| inter.size.w as i64 * inter.size.h as i64)
-                    .unwrap_or(0);
-                let true_covered_area = area_a + area_b - inter_area;
-
-                if union_area <= true_covered_area + (true_covered_area * 15 / 100) {
-                    merged[i].loc.x = min_x;
-                    merged[i].loc.y = min_y;
-                    merged[i].size.w = max_x - min_x;
-                    merged[i].size.h = max_y - min_y;
                     merged.swap_remove(j);
                     changed = true;
                     continue;
@@ -1744,13 +1631,18 @@ impl VulkanFrame<'_, '_> {
             .load_op(vk::AttachmentLoadOp::LOAD)
             .store_op(vk::AttachmentStoreOp::STORE);
 
+        let fb_width = self.fb.0.width();
+        let fb_height = self.fb.0.height();
+        let render_width = (self.size.w as u32).min(fb_width);
+        let render_height = (self.size.h as u32).min(fb_height);
+
         let color_attachments = [color_attachment];
         let mut rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
-                    width: self.size.w as u32,
-                    height: self.size.h as u32,
+                    width: render_width,
+                    height: render_height,
                 },
             })
             .layer_count(1)
@@ -1758,8 +1650,8 @@ impl VulkanFrame<'_, '_> {
 
         let depth_attachment;
         if self.depth_enabled {
-            let width = (self.size.w as u32).max(1);
-            let height = (self.size.h as u32).max(1);
+            let width = render_width.max(1);
+            let height = render_height.max(1);
             let needs_alloc = self
                 .depth_image
                 .as_ref()
@@ -1829,8 +1721,8 @@ impl VulkanFrame<'_, '_> {
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: self.size.w as f32,
-                height: self.size.h as f32,
+                width: render_width as f32,
+                height: render_height as f32,
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
@@ -2087,7 +1979,13 @@ impl Frame for VulkanFrame<'_, '_> {
         let untransformed_dst = dst;
         let dst = self.transform.transform_rect_in(dst, &self.size);
 
-        let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
+        // Use the HDR shader pipeline whenever hdr_config is present (even with is_sdr=true).
+        // When is_sdr=true, target_is_sdr=1 makes the shader output sRGB-encoded values, which is
+        // what consumers like OBS expect. With the old logic (!c.is_sdr), setting is_sdr=true
+        // caused the pipeline to use the raw non-HDR passthrough, copying PQ-encoded framebuffer
+        // data directly into the screencopy buffer without any sRGB conversion — causing washed-out
+        // images in OBS.
+        let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some();
         self.has_draws = true;
         if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
             self.images.push(texture.inner.clone());
@@ -2704,7 +2602,15 @@ impl Blit for VulkanRenderer {
                 (src.loc.x as f64, src.loc.y as f64),
                 (src.size.w as f64, src.size.h as f64),
             );
-            frame.render_texture_from_to(&from.0, src_rect, dst, &[dst], &[], Transform::Normal, 1.0)?;
+            frame.render_texture_from_to(
+                &from.0,
+                src_rect,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                &[],
+                Transform::Normal,
+                1.0,
+            )?;
         }
         frame.finish()
     }
@@ -3095,6 +3001,29 @@ mod test {
         // 5. Disjoint damage
         let d1 = Rectangle::new((0, 0).into(), (20, 20).into());
         let d2 = Rectangle::new((500, 500).into(), (20, 20).into());
+        let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
+        assert_eq!(scissors.len(), 2);
+
+        // 6. Negative coordinate clipping without displacement
+        let offscreen_dst = Rectangle::new((-50, -50).into(), (100, 100).into());
+        let d_local = Rectangle::new((0, 0).into(), (100, 100).into());
+        let scissors = calculate_damage_scissors(
+            &[d_local],
+            offscreen_dst,
+            Transform::Normal,
+            &screen_size,
+            1920,
+            1080,
+        );
+        assert_eq!(scissors.len(), 1);
+        assert_eq!(scissors[0].offset.x, 0);
+        assert_eq!(scissors[0].offset.y, 0);
+        assert_eq!(scissors[0].extent.width, 50);
+        assert_eq!(scissors[0].extent.height, 50);
+
+        // 7. Small gap between damaged areas should NOT be lossily merged into a bounding box
+        let d1 = Rectangle::new((10, 10).into(), (100, 20).into());
+        let d2 = Rectangle::new((10, 35).into(), (100, 20).into()); // 5px gap in y
         let scissors = calculate_damage_scissors(&[d1, d2], dst, Transform::Normal, &screen_size, 1920, 1080);
         assert_eq!(scissors.len(), 2);
     }

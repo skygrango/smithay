@@ -2148,12 +2148,21 @@ where
                 .render_texture_from_to(&texture, src, dst, damage, opaque_regions, src_transform, alpha)
                 .map_err(Error::Render)
         } else {
-            tracing::error!(
-                ptr = ?Arc::as_ptr(&texture.0),
-                target_node = ?self.node,
-                tex_state = ?texture.0.lock().unwrap(),
-                "Failed to render MultiTexture: no valid texture on target GPU device"
-            );
+            let tex_lock = texture.0.lock().unwrap();
+            if tex_lock.textures.is_empty() {
+                tracing::trace!(
+                    ptr = ?Arc::as_ptr(&texture.0),
+                    target_node = ?self.node,
+                    "Skipping render of MultiTexture: surface was destroyed or textures cleared"
+                );
+            } else {
+                tracing::warn!(
+                    ptr = ?Arc::as_ptr(&texture.0),
+                    target_node = ?self.node,
+                    tex_state = ?*tex_lock,
+                    "Failed to render MultiTexture: no valid texture on target GPU device"
+                );
+            }
             Ok(())
         }
     }
