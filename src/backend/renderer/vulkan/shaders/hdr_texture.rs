@@ -51,7 +51,6 @@ pub struct HdrTexPushConstants {
     pub skip_color_transform: u32,
     pub content_reference: f32,
     pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub offset: [i32; 2],
     pub damage: [Rectangle<i32, Physical>; 4],
 }

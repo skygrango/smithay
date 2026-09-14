@@ -35,8 +35,7 @@ layout(push_constant, std140) uniform PushConstants {
 
     float contentReference;
     uint _pad0;
-    uint _pad1;
-    uint _pad2;
+    ivec2 offset;
 
     ivec4 damage[4];
 } params;
@@ -237,7 +236,14 @@ vec2 applyTransform(vec2 uv, uint transform) {
 }
 
 void main() {
-    uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
+    ivec2 signedCoord = ivec2(gl_GlobalInvocationID.xy) + params.offset;
+    if (signedCoord.x < 0 || signedCoord.y < 0)
+        return;
+    uvec2 coord = uvec2(signedCoord);
+    uvec2 outSize = imageSize(dst);
+
+    if (coord.x >= outSize.x || coord.y >= outSize.y)
+        return;
 
     if (coord.x < params.dstRect.x || coord.x >= (params.dstRect.x + params.dstRect.z) ||
         coord.y < params.dstRect.y || coord.y >= (params.dstRect.y + params.dstRect.w))

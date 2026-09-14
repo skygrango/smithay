@@ -300,6 +300,10 @@ impl VulkanRenderer {
         &self.device
     }
 
+    pub fn supports_optimal_host_copy(&self) -> bool {
+        self.supports_optimal_host_copy
+    }
+
     pub fn external_queue_family(&self) -> u32 {
         if self.capabilities.contains(&Capability::QueueFamilyForeign) {
             vk::QUEUE_FAMILY_FOREIGN_EXT
@@ -963,7 +967,9 @@ impl VulkanRenderer {
             match res {
                 Ok(mapping) => Ok(mapping),
                 Err(err) => {
-                    tracing::warn!("copy_image_to_memory failed ({err:?}), falling back to staging buffer copy");
+                    tracing::warn!(
+                        "copy_image_to_memory failed ({err:?}), falling back to staging buffer copy"
+                    );
                     self.copy_image_via_staging_buffer(image, region, format)
                 }
             }
@@ -979,10 +985,7 @@ impl VulkanRenderer {
         format: Fourcc,
     ) -> Result<VulkanMapping, Error> {
         let bpp = match format {
-            Fourcc::Abgr2101010
-            | Fourcc::Xbgr2101010
-            | Fourcc::Argb2101010
-            | Fourcc::Xrgb2101010 => 4usize,
+            Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => 4usize,
             Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8usize,
             _ => 4usize,
         };
@@ -1010,9 +1013,17 @@ impl VulkanRenderer {
 
         let mut mem_type_index = None;
         let mut is_coherent = false;
-        for (i, mem_type) in self.device.memory_properties().memory_types_as_slice().iter().enumerate() {
+        for (i, mem_type) in self
+            .device
+            .memory_properties()
+            .memory_types_as_slice()
+            .iter()
+            .enumerate()
+        {
             if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                && mem_type.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
+                && mem_type
+                    .property_flags
+                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
             {
                 mem_type_index = Some(i as u32);
                 is_coherent = true;
@@ -1020,9 +1031,17 @@ impl VulkanRenderer {
             }
         }
         if mem_type_index.is_none() {
-            for (i, mem_type) in self.device.memory_properties().memory_types_as_slice().iter().enumerate() {
+            for (i, mem_type) in self
+                .device
+                .memory_properties()
+                .memory_types_as_slice()
+                .iter()
+                .enumerate()
+            {
                 if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                    && mem_type.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
+                    && mem_type
+                        .property_flags
+                        .contains(MemoryPropertyFlags::HOST_VISIBLE)
                 {
                     mem_type_index = Some(i as u32);
                     is_coherent = false;
@@ -1032,7 +1051,9 @@ impl VulkanRenderer {
         }
 
         let Some(mem_type_index) = mem_type_index else {
-            unsafe { self.device.vk().destroy_buffer(staging_buffer, None); }
+            unsafe {
+                self.device.vk().destroy_buffer(staging_buffer, None);
+            }
             return Err(Error::ImageError(ImageError::NoMemoryAvailable));
         };
 
@@ -1043,12 +1064,18 @@ impl VulkanRenderer {
         let staging_memory = match unsafe { self.device.vk().allocate_memory(&alloc_info, None) } {
             Ok(mem) => mem,
             Err(err) => {
-                unsafe { self.device.vk().destroy_buffer(staging_buffer, None); }
+                unsafe {
+                    self.device.vk().destroy_buffer(staging_buffer, None);
+                }
                 return Err(Error::ImageError(ImageError::VulkanAllocate(err)));
             }
         };
 
-        if let Err(err) = unsafe { self.device.vk().bind_buffer_memory(staging_buffer, staging_memory, 0) } {
+        if let Err(err) = unsafe {
+            self.device
+                .vk()
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+        } {
             unsafe {
                 self.device.vk().destroy_buffer(staging_buffer, None);
                 self.device.vk().free_memory(staging_memory, None);
@@ -1092,15 +1119,14 @@ impl VulkanRenderer {
         };
 
         let old_layout = image.current_layout();
-        let (tex_src_stage, tex_src_access) =
-            if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
-                (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-            } else {
-                (
-                    PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                    AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
-                )
-            };
+        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else {
+            (
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
+            )
+        };
 
         let img_barrier = ImageMemoryBarrier2::default()
             .image(*image.vk())
@@ -1185,7 +1211,10 @@ impl VulkanRenderer {
                 buf,
                 &DependencyInfo::default().image_memory_barriers(&[restore_barrier]),
             );
-            self.device.vk().end_command_buffer(buf).map_err(Error::CommandBufferError)?;
+            self.device
+                .vk()
+                .end_command_buffer(buf)
+                .map_err(Error::CommandBufferError)?;
         }
         image.set_current_layout(restore_layout);
 
@@ -1193,12 +1222,10 @@ impl VulkanRenderer {
         let next_seq_no = self.seq_no + 1;
         let prev_seq_no = self.seq_no;
 
-        let signal_semaphore_info = [
-            SemaphoreSubmitInfo::default()
-                .semaphore(self.timeline.vk)
-                .value(next_seq_no)
-                .stage_mask(PipelineStageFlags2::ALL_COMMANDS),
-        ];
+        let signal_semaphore_info = [SemaphoreSubmitInfo::default()
+            .semaphore(self.timeline.vk)
+            .value(next_seq_no)
+            .stage_mask(PipelineStageFlags2::ALL_COMMANDS)];
 
         let wait_semaphore_info = if prev_seq_no > 0 {
             vec![
@@ -1217,11 +1244,9 @@ impl VulkanRenderer {
             .wait_semaphore_infos(&wait_semaphore_info);
 
         let submit_res = unsafe {
-            self.device.vk().queue_submit2(
-                *self.device.queue(),
-                &[submit_info],
-                Fence::null(),
-            )
+            self.device
+                .vk()
+                .queue_submit2(*self.device.queue(), &[submit_info], Fence::null())
         };
 
         if let Err(err) = submit_res {
@@ -1234,7 +1259,8 @@ impl VulkanRenderer {
 
         self.seq_no = next_seq_no;
         let point = next_seq_no;
-        self.cmd_pool.store_pending_buffer(buf, point, vec![], vec![image.inner.clone()]);
+        self.cmd_pool
+            .store_pending_buffer(buf, point, vec![], vec![image.inner.clone()]);
 
         while let Err(VkResult::TIMEOUT) = unsafe {
             self.device.vk().wait_semaphores(
@@ -1410,15 +1436,14 @@ impl VulkanFrame<'_, '_> {
         };
 
         let fb_old_layout = self.fb.0.current_layout();
-        let (fb_src_stage, fb_src_access) =
-            if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
-                (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-            } else {
-                (
-                    PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                    AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
-                )
-            };
+        let (fb_src_stage, fb_src_access) = if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else {
+            (
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
+            )
+        };
 
         let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
         let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
@@ -1428,17 +1453,17 @@ impl VulkanFrame<'_, '_> {
         };
 
         let tex_old_layout = texture.current_layout();
-        let (tex_src_stage, tex_src_access) =
-            if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
-                (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-            } else {
-                (
-                    PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                    AccessFlags2::TRANSFER_READ
-                        | AccessFlags2::SHADER_STORAGE_READ
-                        | AccessFlags2::SHADER_STORAGE_WRITE,
-                )
-            };
+        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED
+        {
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else {
+            (
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::TRANSFER_READ
+                    | AccessFlags2::SHADER_STORAGE_READ
+                    | AccessFlags2::SHADER_STORAGE_WRITE,
+            )
+        };
 
         let fb_barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
@@ -1805,7 +1830,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let has_alpha = texture.has_alpha() as u32;
 
         for chunk in damage.chunks(4) {
-            let damage_rects: [Rectangle<i32, Physical>; 4] = chunk
+            let damage_rects_vec: Vec<Rectangle<i32, Physical>> = chunk
                 .iter()
                 .flat_map(|rect| {
                     let mut rect = *rect;
@@ -1822,6 +1847,32 @@ impl Frame for VulkanFrame<'_, '_> {
 
                     Rectangle::new(rect_constrained_loc, rect_clamped_size)
                 })
+                .collect();
+
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+
+            for rect in &damage_rects_vec {
+                if rect.size.w > 0 && rect.size.h > 0 {
+                    min_x = min_x.min(rect.loc.x);
+                    min_y = min_y.min(rect.loc.y);
+                    max_x = max_x.max(rect.loc.x + rect.size.w);
+                    max_y = max_y.max(rect.loc.y + rect.size.h);
+                }
+            }
+
+            if min_x >= max_x || min_y >= max_y {
+                continue;
+            }
+
+            let dispatch_offset = [min_x, min_y];
+            let dispatch_w = (max_x - min_x) as u32;
+            let dispatch_h = (max_y - min_y) as u32;
+
+            let damage_rects: [Rectangle<i32, Physical>; 4] = damage_rects_vec
+                .into_iter()
                 .chain(std::iter::repeat_with(Rectangle::zero))
                 .take(4)
                 .collect::<Vec<_>>()
@@ -1942,8 +1993,7 @@ impl Frame for VulkanFrame<'_, '_> {
                     skip_color_transform,
                     content_reference,
                     _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    offset: dispatch_offset,
                     damage: damage_rects,
                 };
 
@@ -1957,8 +2007,8 @@ impl Frame for VulkanFrame<'_, '_> {
                     );
                     self.renderer.device.vk().cmd_dispatch(
                         buf,
-                        (self.fb.width() as f64 / 8.).ceil() as u32,
-                        (self.fb.height() as f64 / 8.).ceil() as u32,
+                        (dispatch_w as f64 / 8.).ceil() as u32,
+                        (dispatch_h as f64 / 8.).ceil() as u32,
                         1,
                     );
                 }
@@ -1971,7 +2021,8 @@ impl Frame for VulkanFrame<'_, '_> {
                     damage_size: chunk.len() as u32,
                     is_bgr,
                     has_alpha,
-                    _padding0: [0; 3],
+                    _padding0: 0,
+                    offset: dispatch_offset,
                     damage: damage_rects,
                 };
 
@@ -1985,8 +2036,8 @@ impl Frame for VulkanFrame<'_, '_> {
                     );
                     self.renderer.device.vk().cmd_dispatch(
                         buf,
-                        (self.fb.width() as f64 / 8.).ceil() as u32,
-                        (self.fb.height() as f64 / 8.).ceil() as u32,
+                        (dispatch_w as f64 / 8.).ceil() as u32,
+                        (dispatch_h as f64 / 8.).ceil() as u32,
                         1,
                     );
                 }
@@ -2323,35 +2374,65 @@ impl VulkanFrame<'_, '_> {
         self.fb.0.set_current_layout(ImageLayout::GENERAL);
         self.fb.0.set_needs_acquire(false);
 
-        for chunk in damage.chunks(6) {
+        for chunk in damage.chunks(5) {
+            let rects_vec: Vec<Rectangle<i32, Physical>> = chunk
+                .iter()
+                .flat_map(|rect| {
+                    let mut rect = *rect;
+                    rect.loc += untransformed_dst.loc;
+                    rect.intersection(untransformed_dst)
+                })
+                .map(|rect| {
+                    let rect = self.transform.transform_rect_in(rect, &self.size);
+                    let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
+                    let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest_size));
+                    let rect_clamped_size = rect
+                        .size
+                        .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
+
+                    Rectangle::new(rect_constrained_loc, rect_clamped_size)
+                })
+                .collect();
+
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+
+            for rect in &rects_vec {
+                if rect.size.w > 0 && rect.size.h > 0 {
+                    min_x = min_x.min(rect.loc.x);
+                    min_y = min_y.min(rect.loc.y);
+                    max_x = max_x.max(rect.loc.x + rect.size.w);
+                    max_y = max_y.max(rect.loc.y + rect.size.h);
+                }
+            }
+
+            if min_x >= max_x || min_y >= max_y {
+                continue;
+            }
+
+            let dispatch_offset = [min_x, min_y];
+            let dispatch_w = (max_x - min_x) as u32;
+            let dispatch_h = (max_y - min_y) as u32;
+
+            let rects: [Rectangle<i32, Physical>; 5] = rects_vec
+                .into_iter()
+                .chain(std::iter::repeat_with(Rectangle::zero))
+                .take(5)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+
             let push_constants = ClearPushConstants {
                 color: color.components(),
                 blend: should_blend as u32,
                 size: chunk.len() as u32,
                 is_bgr: is_bgr_format(self.fb.0.format()) as u32,
-                _padding0: [0; 1],
-                rects: chunk
-                    .iter()
-                    .flat_map(|rect| {
-                        let mut rect = *rect;
-                        rect.loc += untransformed_dst.loc;
-                        rect.intersection(untransformed_dst)
-                    })
-                    .map(|rect| {
-                        let rect = self.transform.transform_rect_in(rect, &self.size);
-                        let dest_size = Size::new(self.fb.width() as i32, self.fb.height() as i32);
-                        let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest_size));
-                        let rect_clamped_size = rect
-                            .size
-                            .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
-
-                        Rectangle::new(rect_constrained_loc, rect_clamped_size)
-                    })
-                    .chain(std::iter::repeat_with(Rectangle::zero))
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
+                _padding0: 0,
+                offset: dispatch_offset,
+                _padding1: [0; 2],
+                rects,
             };
 
             unsafe {
@@ -2364,8 +2445,8 @@ impl VulkanFrame<'_, '_> {
                 );
                 self.renderer.device.vk().cmd_dispatch(
                     buf,
-                    (self.fb.width() as f64 / 8.).ceil() as u32,
-                    (self.fb.height() as f64 / 8.).ceil() as u32,
+                    (dispatch_w as f64 / 8.).ceil() as u32,
+                    (dispatch_h as f64 / 8.).ceil() as u32,
                     1,
                 );
             }
@@ -2433,7 +2514,10 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
         }
         tracing::debug!(
             "VulkanRenderer::create_buffer: format={:?}, size={:?}, usage={:?}, supports_optimal_host_copy={}",
-            format, size, usage, self.supports_optimal_host_copy
+            format,
+            size,
+            usage,
+            self.supports_optimal_host_copy
         );
         VulkanImage::new_with_fourcc(&self.device, size.w as u32, size.h as u32, format, usage, false)
             .or_else(|err| {
@@ -2441,18 +2525,26 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
                     "VulkanRenderer::create_buffer optimal tiling failed ({:?}), falling back to linear",
                     err
                 );
-                let mut linear_usage = ImageUsageFlags::TRANSFER_SRC
-                    | ImageUsageFlags::TRANSFER_DST
-                    | ImageUsageFlags::SAMPLED;
+                let mut linear_usage =
+                    ImageUsageFlags::TRANSFER_SRC | ImageUsageFlags::TRANSFER_DST | ImageUsageFlags::SAMPLED;
                 if self.device.vk_ext_host_image_copy().is_some() {
                     linear_usage |= ImageUsageFlags::HOST_TRANSFER_EXT;
                 }
-                VulkanImage::new_with_fourcc(&self.device, size.w as u32, size.h as u32, format, linear_usage, true)
+                VulkanImage::new_with_fourcc(
+                    &self.device,
+                    size.w as u32,
+                    size.h as u32,
+                    format,
+                    linear_usage,
+                    true,
+                )
             })
             .map_err(|err| {
                 tracing::error!(
                     "VulkanRenderer::create_buffer failed completely for format={:?}, size={:?}: {:?}",
-                    format, size, err
+                    format,
+                    size,
+                    err
                 );
                 Error::ImageError(err)
             })
@@ -2470,13 +2562,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
             "VulkanRenderer::bind dmabuf"
         );
         let image = match self.dmabuf_cache.get(&target.weak()) {
-            Some(image)
-                if image
-                    .vk_usage()
-                    .contains(ImageUsageFlags::TRANSFER_DST) =>
-            {
-                image.clone()
-            }
+            Some(image) if image.vk_usage().contains(ImageUsageFlags::TRANSFER_DST) => image.clone(),
             _ => {
                 let res = VulkanImage::new_from_dmabuf(
                     &self.device,

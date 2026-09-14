@@ -1913,9 +1913,7 @@ impl MultiTexture {
     {
         let mut tex = self.0.lock().unwrap();
         let target_id = renderer.context_id().erased();
-        if let Some(GpuSingleTexture::Dma { texture, dmabuf, .. }) =
-            tex.textures.get_mut(&target_id)
-        {
+        if let Some(GpuSingleTexture::Dma { texture, dmabuf, .. }) = tex.textures.get_mut(&target_id) {
             *texture = Box::new(renderer.import_dmabuf(dmabuf, None)?) as Box<_>;
         } else {
             let dmabuf_opt = tex.textures.values().find_map(|t| match t {

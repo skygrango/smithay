@@ -37,6 +37,7 @@ pub struct TexPushConstants {
     pub damage_size: u32,
     pub is_bgr: u32,
     pub has_alpha: u32,
-    pub _padding0: [u32; 3],
+    pub _padding0: u32,
+    pub offset: [i32; 2],
     pub damage: [Rectangle<i32, Physical>; 4],
 }

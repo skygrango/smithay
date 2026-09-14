@@ -322,11 +322,12 @@ where
                 Some((sync.clone(), dmabuf, geometry))
             }
             PrimaryPlaneElement::Element(e) => {
-                let dmabuf: Option<Dmabuf> = e.underlying_storage(renderer).and_then(|storage| match storage {
-                    #[cfg(feature = "wayland_frontend")]
-                    UnderlyingStorage::Wayland(b) => crate::wayland::dmabuf::get_dmabuf(b).ok().cloned(),
-                    _ => None,
-                });
+                let dmabuf: Option<Dmabuf> =
+                    e.underlying_storage(renderer).and_then(|storage| match storage {
+                        #[cfg(feature = "wayland_frontend")]
+                        UnderlyingStorage::Wayland(b) => crate::wayland::dmabuf::get_dmabuf(b).ok().cloned(),
+                        _ => None,
+                    });
                 if let Some(dmabuf) = dmabuf {
                     let size = dmabuf.size();
                     let geometry = Rectangle::from_size(size.to_logical(1, Transform::Normal).to_physical(1));

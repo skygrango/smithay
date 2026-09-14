@@ -346,12 +346,10 @@ impl VulkanImage {
                         best_index = Some(i as u32);
                         best_flags = flags;
                         break;
-                    } else if flags.contains(
-                        MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
-                    ) {
-                        if best_index.is_none()
-                            || !best_flags.contains(MemoryPropertyFlags::HOST_COHERENT)
-                        {
+                    } else if flags
+                        .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
+                    {
+                        if best_index.is_none() || !best_flags.contains(MemoryPropertyFlags::HOST_COHERENT) {
                             best_index = Some(i as u32);
                             best_flags = flags;
                         }
@@ -403,12 +401,22 @@ impl VulkanImage {
             if width > 1 || height > 1 {
                 tracing::error!(
                     "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
-                    width, height, fourcc, vk_format, vk_usage, linear, tiling, memory_reqs.memory_type_bits
+                    width,
+                    height,
+                    fourcc,
+                    vk_format,
+                    vk_usage,
+                    linear,
+                    tiling,
+                    memory_reqs.memory_type_bits
                 );
             } else {
                 tracing::debug!(
                     "VulkanImage::new_internal probe NoMemoryAvailable: vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
-                    vk_usage, linear, tiling, memory_reqs.memory_type_bits
+                    vk_usage,
+                    linear,
+                    tiling,
+                    memory_reqs.memory_type_bits
                 );
             }
             return Err(Error::NoMemoryAvailable);
@@ -451,7 +459,9 @@ impl VulkanImage {
                 .map_err(|err| {
                     tracing::error!(
                         "VulkanImage::new_internal: allocate_memory failed: {:?}, size={}, type_index={}",
-                        err, alloc_create_info.allocation_size, alloc_create_info.memory_type_index
+                        err,
+                        alloc_create_info.allocation_size,
+                        alloc_create_info.memory_type_index
                     );
                     Error::VulkanAllocate(err)
                 })?;

@@ -11,15 +11,19 @@ layout(binding = 0) uniform image2D dst;
 layout(push_constant, std140) uniform PushConstants {
     vec4 color;
     uint blend;
-
     uint rectSize;
     uint isBgr;
     uint _padding0;
-    ivec4 rects[6];
+    ivec2 offset;
+    uvec2 _padding1;
+    ivec4 rects[5];
 } params;
 
 void main() {
-    uvec2 coord = uvec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y);
+    ivec2 signedCoord = ivec2(gl_GlobalInvocationID.xy) + params.offset;
+    if (signedCoord.x < 0 || signedCoord.y < 0)
+        return;
+    uvec2 coord = uvec2(signedCoord);
     uvec2 outSize = imageSize(dst);
 
     if (coord.x >= outSize.x || coord.y >= outSize.y)
