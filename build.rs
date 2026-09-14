@@ -93,6 +93,7 @@ fn vulkan_compile() {
     let compiler = shaderc::Compiler::new().unwrap();
     let mut options = shaderc::CompileOptions::new().unwrap();
     options.add_macro_definition("EP", Some("main"));
+    options.set_optimization_level(shaderc::OptimizationLevel::Performance);
 
     for entry in std::fs::read_dir(Path::new("src/backend/renderer/vulkan/shaders"))
         .expect("Unable to find vulkan shader dir.")

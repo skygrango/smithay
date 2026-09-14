@@ -17,7 +17,7 @@ use crate::{
             PhysicalDevice, UnsupportedProperty,
             device::{Device, DeviceError, QueueType, WeakDevice},
             format::{get_drm_format, get_vk_format, known_formats},
-            image::{Error as ImageError, ImageUsageFlags, VulkanImage},
+            image::{Error as ImageError, ImageInner, ImageUsageFlags, VulkanImage},
             version::Version,
         },
     },
@@ -37,7 +37,7 @@ use ash::vk::{
 use gbm::Modifier;
 use indexmap::IndexSet;
 
-use std::{collections::HashMap, ffi::CStr, fmt, ptr::NonNull};
+use std::{collections::HashMap, ffi::CStr, fmt, ptr::NonNull, sync::Arc};
 
 use super::{Blit, BlitFrame, Color32F, HdrOutputConfig, TextureFilter, sdr_color_to_hdr, sync::SyncPoint};
 use tracing::trace;
@@ -426,8 +426,8 @@ impl Renderer for VulkanRenderer {
             transform: dst_transform,
             size: output_size,
             cmd_buffer: None,
-            descriptors: Vec::new(),
-            images: Vec::new(),
+            descriptors: Vec::with_capacity(16),
+            images: Vec::with_capacity(16),
             has_draws: false,
             _marker: std::marker::PhantomData,
             #[cfg(feature = "wayland_frontend")]
@@ -437,6 +437,17 @@ impl Renderer for VulkanRenderer {
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        if let Some(drm_sync) = sync.get::<crate::backend::drm::sync::DrmSyncPoint>() {
+            if let Some(timeline) = self.timeline.drm.as_ref() {
+                if timeline == drm_sync.timeline() {
+                    // On Vulkan, all submissions on this renderer queue already wait on the
+                    // previous sequence number via self.timeline.vk.
+                    // Since drm_sync.point() <= self.seq_no, GPU queue ordering is guaranteed
+                    // without any CPU-side stall.
+                    return Ok(());
+                }
+            }
+        }
         while let Err(super::sync::Interrupted) = sync.wait() {}
         Ok(())
     }
@@ -823,6 +834,14 @@ impl VulkanRenderer {
                 .vk_ext_host_image_copy()
                 .ok_or(Error::MissingExtension(host_image_copy::NAME))?;
             unsafe {
+                if self.seq_no > 0 {
+                    let _ = self.device.vk().wait_semaphores(
+                        &ash::vk::SemaphoreWaitInfo::default()
+                            .semaphores(&[self.timeline.vk])
+                            .values(&[self.seq_no]),
+                        10_000_000_000,
+                    );
+                }
                 device_copy
                     .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
                         .old_layout(image.current_layout())
@@ -837,8 +856,12 @@ impl VulkanRenderer {
                     .map_err(Error::HostImageTransitionError)?;
 
                 let bpp = 4usize;
-                let stride = image.width() as usize * bpp;
-                let size = stride * image.height() as usize;
+                let copy_width = (region.size.w as u32).min(image.width()).max(1);
+                let copy_height = (region.size.h as u32).min(image.height()).max(1);
+                let offset_x = region.loc.x.max(0);
+                let offset_y = region.loc.y.max(0);
+                let stride = copy_width as usize * bpp;
+                let size = stride * copy_height as usize;
                 let mut data = vec![0u8; size];
                 device_copy
                     .copy_image_to_memory(
@@ -848,8 +871,8 @@ impl VulkanRenderer {
                             .src_image_layout(ImageLayout::GENERAL)
                             .regions(&[ImageToMemoryCopyEXT::default()
                                 .host_pointer(data.as_mut_ptr() as *mut _)
-                                .memory_image_height(image.height())
-                                .memory_row_length(image.width())
+                                .memory_image_height(copy_height)
+                                .memory_row_length(copy_width)
                                 .image_subresource(
                                     ImageSubresourceLayers::default()
                                         .aspect_mask(ImageAspectFlags::COLOR)
@@ -857,12 +880,16 @@ impl VulkanRenderer {
                                         .base_array_layer(0)
                                         .layer_count(1),
                                 )
-                                .image_offset(Offset3D::default())
+                                .image_offset(Offset3D {
+                                    x: offset_x,
+                                    y: offset_y,
+                                    z: 0,
+                                })
                                 .image_extent(
                                     Extent3D::default()
                                         .depth(1)
-                                        .width(image.width())
-                                        .height(image.height()),
+                                        .width(copy_width)
+                                        .height(copy_height),
                                 )]),
                     )
                     .map_err(Error::HostImageCopyError)?;
@@ -948,7 +975,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     size: Size<i32, Physical>,
     cmd_buffer: Option<ash::vk::CommandBuffer>,
     descriptors: Vec<shaders::DescriptorSet>,
-    images: Vec<VulkanImage>,
+    images: Vec<Arc<ImageInner>>,
     has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
@@ -1017,7 +1044,9 @@ impl Frame for VulkanFrame<'_, '_> {
         let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some_and(|c| !c.is_sdr);
         let buf = self.get_or_create_cmd_buffer()?;
         self.has_draws = true;
-        self.images.push(texture.clone());
+        if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
+            self.images.push(texture.inner.clone());
+        }
         let descriptor = if is_hdr {
             self.renderer
                 .pipelines
@@ -1038,7 +1067,7 @@ impl Frame for VulkanFrame<'_, '_> {
             .vk_view()
             .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
         let tex_image_info = [DescriptorImageInfo::default()
-            .image_layout(ImageLayout::GENERAL)
+            .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(*view)
             .sampler(self.renderer.texture_sampler)];
 
@@ -1104,6 +1133,8 @@ impl Frame for VulkanFrame<'_, '_> {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
         } else if tex_old_layout == ImageLayout::UNDEFINED {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            (PipelineStageFlags2::COMPUTE_SHADER, AccessFlags2::SHADER_SAMPLED_READ)
         } else {
             (
                 PipelineStageFlags2::COMPUTE_SHADER
@@ -1130,10 +1161,11 @@ impl Frame for VulkanFrame<'_, '_> {
                     .level_count(1),
             );
 
+        let needs_tex_barrier = tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let tex_barrier = ImageMemoryBarrier2::default()
             .image(*texture.vk())
             .old_layout(tex_old_layout)
-            .new_layout(ImageLayout::GENERAL)
+            .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .src_queue_family_index(tex_src_queue)
             .dst_queue_family_index(tex_dst_queue)
             .src_stage_mask(tex_src_stage)
@@ -1164,15 +1196,22 @@ impl Frame for VulkanFrame<'_, '_> {
                 &[descriptor.vk()],
                 &[],
             );
-            self.renderer.device.vk().cmd_pipeline_barrier2(
-                buf,
-                &DependencyInfo::default().image_memory_barriers(&[fb_barrier, tex_barrier]),
-            );
+            if needs_tex_barrier {
+                self.renderer.device.vk().cmd_pipeline_barrier2(
+                    buf,
+                    &DependencyInfo::default().image_memory_barriers(&[fb_barrier, tex_barrier]),
+                );
+            } else {
+                self.renderer.device.vk().cmd_pipeline_barrier2(
+                    buf,
+                    &DependencyInfo::default().image_memory_barriers(&[fb_barrier]),
+                );
+            }
         }
 
         self.fb.0.set_current_layout(ImageLayout::GENERAL);
         self.fb.0.set_needs_acquire(false);
-        texture.set_current_layout(ImageLayout::GENERAL);
+        texture.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         texture.set_needs_acquire(false);
 
         let src_rect = Rectangle::new(
@@ -1193,6 +1232,7 @@ impl Frame for VulkanFrame<'_, '_> {
             Transform::Flipped180 => 6,
             Transform::Flipped270 => 7,
         };
+
         let is_bgr = (is_bgr_format(self.fb.0.format())
             || matches!(
                 self.fb.0.format(),
@@ -1237,13 +1277,20 @@ impl Frame for VulkanFrame<'_, '_> {
                 .unwrap();
 
             if is_hdr {
-                let config = self.renderer.hdr_config.unwrap();
+                let config = self.renderer.hdr_config.unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
+                    reference_white: 203.0,
+                    max_luminance: 1000.0,
+                    sdr_gamma: 2.2,
+                    gamut_stretch: 0.0,
+                    hardware_offload: false,
+                    is_sdr: false,
+                });
                 let mut reference_white = config.reference_white;
                 let mut sdr_gamma = config.sdr_gamma;
                 let mut gamut_stretch = config.gamut_stretch;
                 let mut max_content_luminance = config.reference_white;
                 let max_destination_luminance = config.max_luminance;
-                let hardware_offload = config.hardware_offload as u32;
+                let mut hardware_offload = config.hardware_offload as u32;
                 let target_is_sdr = config.is_sdr as u32;
 
                 let mut input_is_pq = 0u32;
@@ -1501,7 +1548,9 @@ impl Frame for VulkanFrame<'_, '_> {
         let point = next_seq_no;
         let descs = std::mem::take(&mut self.descriptors);
         let mut images = std::mem::take(&mut self.images);
-        images.push(self.fb.0.clone());
+        if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
+            images.push(self.fb.0.inner.clone());
+        }
         self.renderer.cmd_pool.store_pending_buffer(buf, point, descs, images);
 
         trace!(point, "VulkanFrame::finish single command buffer submitted");
@@ -1558,8 +1607,8 @@ impl Blit for VulkanRenderer {
             transform: Transform::Normal,
             size,
             cmd_buffer: None,
-            descriptors: Vec::new(),
-            images: Vec::new(),
+            descriptors: Vec::with_capacity(4),
+            images: Vec::with_capacity(4),
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,

@@ -12,7 +12,25 @@ impl Fence for DrmSyncPoint {
     }
 
     fn wait(&self) -> Result<(), Interrupted> {
-        self.wait(i64::MAX).map_err(|_| Interrupted)
+        if self.is_signaled() {
+            return Ok(());
+        }
+        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let now_ns = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+        let timeout_nsec = now_ns.saturating_add(10_000_000_000);
+
+        match self.wait(timeout_nsec) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Err(Interrupted),
+            Err(err) => {
+                if self.is_signaled() {
+                    Ok(())
+                } else {
+                    tracing::warn!(?err, point = self.point, "DrmSyncPoint wait error");
+                    Ok(())
+                }
+            }
+        }
     }
 
     fn is_exportable(&self) -> bool {

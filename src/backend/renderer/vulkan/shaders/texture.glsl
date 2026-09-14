@@ -51,36 +51,39 @@ void main() {
     if (coord.x < params.dstRect.x || coord.x >= (params.dstRect.x + params.dstRect.z) || coord.y < params.dstRect.y || coord.y >= (params.dstRect.y + params.dstRect.w))
         return;
 
-    uvec2 outSize = imageSize(dst);
+    bool in_damage = false;
+    for (int i = 0; i < params.damageSize; i++) {
+        ivec4 rect = params.damage[i];
+        if (coord.x >= rect.x && coord.x < (rect.x + rect.z) &&
+            coord.y >= rect.y && coord.y < (rect.y + rect.w))
+        {
+            in_damage = true;
+            break;
+        }
+    }
+    if (!in_damage)
+        return;
+
     uvec2 texSize = textureSize(tex, 0);
     vec2 dstUV = (vec2(coord) - params.dstRect.xy) / params.dstRect.zw;
     vec2 srcUV = ((dstUV * params.srcRect.zw) + params.srcRect.xy) / texSize;
     vec2 uv = applyTransform(srcUV, params.srcTransform);
 
-    for (int i = 0; i < params.damageSize; i++) {
-        ivec4 rect = params.damage[i];
-
-        if (coord.x >= rect.x && coord.x < (rect.x + rect.z) &&
-            coord.y >= rect.y && coord.y < (rect.y + rect.w))
-        {
-            vec4 raw = texture(tex, uv);
-            if (params.hasAlpha == 0) {
-                raw.a = 1.0;
-            }
-            vec4 color = raw * params.alpha;
-
-            if (color.a < 1.0) {
-                vec4 dstColor = imageLoad(dst, ivec2(coord));
-                if (params.isBgr != 0) {
-                    dstColor = dstColor.bgra;
-                }
-                color = color + dstColor * (1.0 - color.a);
-            }
-            if (params.isBgr != 0) {
-                color = color.bgra;
-            }
-            imageStore(dst, ivec2(coord), color);
-            break;
-        }
+    vec4 raw = texture(tex, uv);
+    if (params.hasAlpha == 0) {
+        raw.a = 1.0;
     }
+    vec4 color = raw * params.alpha;
+
+    if (color.a < 1.0) {
+        vec4 dstColor = imageLoad(dst, ivec2(coord));
+        if (params.isBgr != 0) {
+            dstColor = dstColor.bgra;
+        }
+        color = color + dstColor * (1.0 - color.a);
+    }
+    if (params.isBgr != 0) {
+        color = color.bgra;
+    }
+    imageStore(dst, ivec2(coord), color);
 }

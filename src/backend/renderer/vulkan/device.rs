@@ -8,8 +8,9 @@ use crate::backend::{
 use ash::{
     khr,
     vk::{
-        CommandPoolCreateInfo, ExportSemaphoreCreateInfo, ExternalSemaphoreHandleTypeFlags,
-        SemaphoreCreateInfo, SemaphoreGetFdInfoKHR, SemaphoreType, SemaphoreTypeCreateInfo,
+        CommandPoolCreateFlags, CommandPoolCreateInfo, ExportSemaphoreCreateInfo,
+        ExternalSemaphoreHandleTypeFlags, SemaphoreCreateInfo, SemaphoreGetFdInfoKHR, SemaphoreType,
+        SemaphoreTypeCreateInfo,
     },
 };
 
@@ -64,7 +65,9 @@ impl Device {
     }
 
     pub(super) fn create_command_pool(&self) -> Result<CommandPool, Error> {
-        let pool_info = CommandPoolCreateInfo::default().queue_family_index(self.queue_family_idx());
+        let pool_info = CommandPoolCreateInfo::default()
+            .queue_family_index(self.queue_family_idx())
+            .flags(CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let cmd_pool = unsafe {
             self.vk()
                 .create_command_pool(&pool_info, None)
