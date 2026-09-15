@@ -2135,15 +2135,37 @@ impl VulkanFrame<'_, '_> {
                     .level_count(1),
             );
 
+        let tex_restore_layout = if tex_old_layout == ImageLayout::UNDEFINED {
+            ImageLayout::GENERAL
+        } else {
+            tex_old_layout
+        };
+        let tex_post_barrier = ImageMemoryBarrier2::default()
+            .image(*texture.vk())
+            .old_layout(ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(tex_restore_layout)
+            .src_queue_family_index(QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
+            .src_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
+            .src_access_mask(AccessFlags2::TRANSFER_READ)
+            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
         unsafe {
             self.renderer.device.vk().cmd_pipeline_barrier2(
                 cmd_buffer,
-                &DependencyInfo::default().image_memory_barriers(&[fb_post_barrier]),
+                &DependencyInfo::default().image_memory_barriers(&[fb_post_barrier, tex_post_barrier]),
             );
         }
 
         self.fb.0.set_current_layout(ImageLayout::GENERAL);
-        texture.set_current_layout(ImageLayout::TRANSFER_SRC_OPTIMAL);
+        texture.set_current_layout(tex_restore_layout);
 
         self.images.push(texture.inner.clone());
         self.has_draws = true;
