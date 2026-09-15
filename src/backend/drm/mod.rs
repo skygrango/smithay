@@ -91,7 +91,10 @@ use crate::utils::{DevPath, Physical, Size};
 pub use color::{
     Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, CtaCoordinate, DrmColorCtm,
     DrmColorLut, DrmScanoutCapabilities, Eotf, HdrOutputMetadata, PlaneColorConversion, ScanoutPlan,
+    SrgbToPqEncoder, bt709_to_bt2020,
 };
+#[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
+pub use compositor::CursorBufferTransformFn;
 pub use device::{
     DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, EventMetadata as DrmEventMetadata, PlaneClaim,
     Time as DrmEventTime, WeakDrmDeviceFd,

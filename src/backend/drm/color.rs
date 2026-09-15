@@ -249,6 +249,153 @@ pub fn encode_pq(value: f32) -> f32 {
     ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
 }
 
+/// BT.709 -> BT.2020, linear light, D65.
+#[inline]
+pub fn bt709_to_bt2020(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    (
+        0.627404 * r + 0.329283 * g + 0.043313 * b,
+        0.069097 * r + 0.919540 * g + 0.011362 * b,
+        0.016391 * r + 0.088013 * g + 0.895595 * b,
+    )
+}
+
+/// Fast LUT-accelerated CPU encoder for premultiplied little-endian ARGB8888 cursor buffers
+/// on HDR outputs or during hardware scanout.
+#[derive(Clone)]
+pub struct SrgbToPqEncoder {
+    ref_lum_scale: f32,
+    eotf: [f32; 256],
+    pq: Box<[f32; Self::PQ_SAMPLES]>,
+    linear: bool,
+    to_bt2020: bool,
+}
+
+impl std::fmt::Debug for SrgbToPqEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrgbToPqEncoder")
+            .field("ref_lum_scale", &self.ref_lum_scale)
+            .field("linear", &self.linear)
+            .field("to_bt2020", &self.to_bt2020)
+            .finish()
+    }
+}
+
+impl SrgbToPqEncoder {
+    const PQ_SAMPLES: usize = 4096;
+
+    /// Creates an encoder that maps electrical sRGB into PQ/BT.2020.
+    /// `ref_lum_scale` is `reference_white / 10000.0` (e.g. 203 / 10000 = 0.0203).
+    pub fn new(ref_lum_scale: f32) -> Self {
+        let mut eotf = [0f32; 256];
+        for (i, v) in eotf.iter_mut().enumerate() {
+            *v = (i as f32 / 255.0).powf(2.2);
+        }
+
+        let mut pq = Box::new([0f32; Self::PQ_SAMPLES]);
+        for (i, v) in pq.iter_mut().enumerate() {
+            let t = i as f32 / (Self::PQ_SAMPLES - 1) as f32;
+            let lin = (t * t) * (t * t);
+            *v = encode_pq(lin * ref_lum_scale);
+        }
+
+        Self {
+            ref_lum_scale,
+            eotf,
+            pq,
+            linear: false,
+            to_bt2020: true,
+        }
+    }
+
+    /// Creates an encoder that maps electrical sRGB to linear light.
+    /// If `to_bt2020` is false, it stays in Rec.709 linear light (e.g. for CRTC CTM which does 709->2020).
+    /// If `to_bt2020` is true, it rotates Rec.709 to BT.2020 (e.g. for post-blend encode in BT.2020 space).
+    pub fn new_linear(scale: f32, to_bt2020: bool) -> Self {
+        let mut encoder = Self::new(scale);
+        for (i, v) in encoder.pq.iter_mut().enumerate() {
+            let t = i as f32 / (Self::PQ_SAMPLES - 1) as f32;
+            *v = (t * t) * (t * t) * scale;
+        }
+        encoder.linear = true;
+        encoder.to_bt2020 = to_bt2020;
+        encoder
+    }
+
+    #[inline]
+    fn eotf_lookup(&self, x: f32) -> f32 {
+        if x >= 1.0 {
+            return x.powf(2.2);
+        }
+        let pos = x.max(0.0) * 255.0;
+        let i = pos as usize;
+        let frac = pos - i as f32;
+        self.eotf[i] + (self.eotf[(i + 1).min(255)] - self.eotf[i]) * frac
+    }
+
+    #[inline]
+    fn pq_lookup(&self, lin: f32) -> f32 {
+        if lin >= 1.0 {
+            if self.linear {
+                return lin * self.ref_lum_scale;
+            }
+            return encode_pq(lin * self.ref_lum_scale);
+        }
+        let t = lin.max(0.0).sqrt().sqrt();
+        let pos = t * (Self::PQ_SAMPLES - 1) as f32;
+        let i = (pos as usize).min(Self::PQ_SAMPLES - 2);
+        let frac = pos - i as f32;
+        self.pq[i] + (self.pq[i + 1] - self.pq[i]) * frac
+    }
+
+    /// Transforms a premultiplied little-endian ARGB8888 buffer (B, G, R, A bytes) in-place.
+    pub fn apply(&self, data: &mut [u8], stride: u32, size: (u32, u32)) {
+        let (width, height) = size;
+        let row_len = width as usize * 4;
+        for row in 0..height as usize {
+            let start = row * stride as usize;
+            if start + row_len > data.len() {
+                break;
+            }
+            let row_data = &mut data[start..start + row_len];
+            for px in row_data.chunks_exact_mut(4) {
+                let a = px[3];
+                if a == 0 {
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                    continue;
+                }
+
+                let (r, g, b) = if a == 255 {
+                    (
+                        self.eotf[px[2] as usize],
+                        self.eotf[px[1] as usize],
+                        self.eotf[px[0] as usize],
+                    )
+                } else {
+                    let a_f = f32::from(a);
+                    (
+                        self.eotf_lookup(f32::from(px[2]) / a_f),
+                        self.eotf_lookup(f32::from(px[1]) / a_f),
+                        self.eotf_lookup(f32::from(px[0]) / a_f),
+                    )
+                };
+
+                let (r_out, g_out, b_out) = if self.to_bt2020 {
+                    bt709_to_bt2020(r, g, b)
+                } else {
+                    (r, g, b)
+                };
+
+                let a_scale = f32::from(a);
+                px[2] = (self.pq_lookup(r_out) * a_scale).round().clamp(0.0, 255.0) as u8;
+                px[1] = (self.pq_lookup(g_out) * a_scale).round().clamp(0.0, 255.0) as u8;
+                px[0] = (self.pq_lookup(b_out) * a_scale).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 /// Entry of a DRM CRTC hardware lookup table (`struct drm_color_lut`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
@@ -719,6 +866,15 @@ impl DrmScanoutCapabilities {
         self.crtc_color.has_degamma_lut && self.crtc_color.has_gamma_lut
     }
 
+    /// Whether the hardware can offload the trailing PQ encode of a single fullscreen plane
+    /// onto the CRTC GAMMA_LUT (e.g. for NVIDIA plane color pipelines which lack an encode stage).
+    /// Requires a high-precision gamma LUT (>= 1024 entries) to avoid severe near-black banding.
+    pub fn supports_post_blend_encode(&self) -> bool {
+        self.crtc_color.has_gamma_lut
+            && self.crtc_color.gamma_lut_size >= 1024
+            && (self.supports_plane_colorop || self.crtc_color.has_ctm)
+    }
+
     /// Evaluates the appropriate scanout plan for a given content image description,
     /// following the strict efficiency hierarchy:
     /// DirectPassthrough -> PlaneColorop -> CrtcHardware -> VulkanFastDirectFlip
@@ -727,6 +883,23 @@ impl DrmScanoutCapabilities {
         output_hdr_enabled: bool,
         desc: Option<&crate::wayland::color::management::ImageDescription>,
         output_reference_white: u16,
+    ) -> ScanoutPlan {
+        self.evaluate_scanout_plan_with_peak(output_hdr_enabled, desc, output_reference_white, None)
+    }
+
+    /// Evaluates the appropriate scanout plan, taking the sink's peak luminance into account.
+    ///
+    /// When content peak luminance exceeds the destination display's peak luminance
+    /// (`content_max > output_peak * 1.05`), hardware direct scanout cannot perform
+    /// the non-linear ICtCp gamut-preserving tone mapping curve without clipping highlights.
+    /// In this case, it falls back to [`ScanoutPlan::VulkanFastDirectFlip`] so that the
+    /// Vulkan shader (`tonemap_ictcp` in `hdr_texture.frag.glsl`) can roll off the highlights.
+    pub fn evaluate_scanout_plan_with_peak(
+        &self,
+        output_hdr_enabled: bool,
+        desc: Option<&crate::wayland::color::management::ImageDescription>,
+        output_reference_white: u16,
+        output_peak_luminance: Option<u16>,
     ) -> ScanoutPlan {
         if !output_hdr_enabled {
             match desc {
@@ -783,12 +956,47 @@ impl DrmScanoutCapabilities {
                 }
             }
         } else {
+            // Helper to check whether content exceeds sink peak luminance and needs
+            // shader-level ICtCp tone mapping (non-linear roll-off) rather than hardware scanout.
+            let tonemap_needed = |desc: &crate::wayland::color::management::ImageDescription,
+                                  content_ref_white: u32|
+             -> bool {
+                if let Some(peak) = output_peak_luminance {
+                    if peak > 0 {
+                        // Only consider content for compositor tone mapping if it explicitly declared
+                        // a peak luminance (via max_cll, mastering_luminance, or set_luminances).
+                        // If no peak luminance was declared, the fallback to 10,000 cd/m² is purely
+                        // the mathematical domain of the PQ transfer function and must not trigger
+                        // false-positive tone mapping that drops hardware direct passthrough.
+                        let content_explicit_max = desc
+                            .max_cll
+                            .or_else(|| desc.mastering_luminance.map(|(_, m)| m))
+                            .or_else(|| desc.luminances.map(|(_, m, _)| m));
+
+                        if let Some(max_lum) = content_explicit_max {
+                            let ref_scale =
+                                (output_reference_white as f64) / (content_ref_white as f64).max(1.0);
+                            let scaled_max = (max_lum as f64) * ref_scale;
+                            return scaled_max > (peak as f64) * 1.05;
+                        }
+                    }
+                }
+                false
+            };
+
             // HDR output active (BT.2020 PQ signal)
             match desc {
                 Some(desc) if desc.is_pq_bt2020() => {
-                    // Tier 1: Native PQ BT.2020 matches output HDR pipeline directly.
-                    // Zero GPU, zero plane/CRTC color transformation.
-                    ScanoutPlan::DirectPassthrough
+                    // Windows-BT.2100 is display-referred for a BT.2100 screen and exempt from tone-mapping.
+                    // For client-authored parametric PQ content, if content luminance exceeds output peak,
+                    // hardware passthrough would hard-clip highlights; fall back to Vulkan shader fast flip.
+                    if !desc.windows_bt2100 && tonemap_needed(desc, desc.luminances_or_default().2) {
+                        ScanoutPlan::VulkanFastDirectFlip
+                    } else {
+                        // Tier 1: Native PQ BT.2020 matches output HDR pipeline directly.
+                        // Zero GPU, zero plane/CRTC color transformation.
+                        ScanoutPlan::DirectPassthrough
+                    }
                 }
                 Some(desc)
                     if desc.windows_scrgb
@@ -797,51 +1005,61 @@ impl DrmScanoutCapabilities {
                 {
                     // scRGB FP16 on HDR
                     let ref_white = desc.luminances_or_default().2 as u16;
-                    let conv = PlaneColorConversion::ScRgbToPq {
-                        reference_white: if ref_white > 0 {
-                            ref_white
-                        } else if output_reference_white > 0 {
-                            output_reference_white
-                        } else {
-                            203
-                        },
-                    };
-                    if self.supports_plane_colorop && self.supports_fp16 {
-                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
-                        ScanoutPlan::PlaneColorop(conv)
-                    } else if self.supports_scrgb_hardware_scanout() {
-                        // Tier 2B: CRTC Color Management
-                        ScanoutPlan::CrtcHardware(conv)
+                    let eff_ref_white = if ref_white > 0 {
+                        ref_white
+                    } else if output_reference_white > 0 {
+                        output_reference_white
                     } else {
-                        // Tier 3: Vulkan Shader Fast Flip
+                        203
+                    };
+                    if !desc.windows_scrgb && tonemap_needed(desc, eff_ref_white as u32) {
                         ScanoutPlan::VulkanFastDirectFlip
+                    } else {
+                        let conv = PlaneColorConversion::ScRgbToPq {
+                            reference_white: eff_ref_white,
+                        };
+                        if self.supports_plane_colorop && self.supports_fp16 {
+                            // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                            ScanoutPlan::PlaneColorop(conv)
+                        } else if self.supports_scrgb_hardware_scanout() {
+                            // Tier 2B: CRTC Color Management
+                            ScanoutPlan::CrtcHardware(conv)
+                        } else {
+                            // Tier 3: Vulkan Shader Fast Flip
+                            ScanoutPlan::VulkanFastDirectFlip
+                        }
                     }
                 }
                 Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
                     // HLG on HDR
                     let ref_white = desc.luminances_or_default().2 as u16;
-                    let conv = PlaneColorConversion::HlgToPq {
-                        reference_white: if ref_white > 0 {
-                            ref_white
-                        } else if output_reference_white > 0 {
-                            output_reference_white
-                        } else {
-                            203
-                        },
-                    };
-                    if self.supports_plane_colorop {
-                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
-                        ScanoutPlan::PlaneColorop(conv)
-                    } else if self.supports_hlg_to_hdr_hardware_scanout() {
-                        // Tier 2B: CRTC Color Management
-                        ScanoutPlan::CrtcHardware(conv)
+                    let eff_ref_white = if ref_white > 0 {
+                        ref_white
+                    } else if output_reference_white > 0 {
+                        output_reference_white
                     } else {
-                        // Tier 3: Vulkan Shader Fast Flip
+                        203
+                    };
+                    if tonemap_needed(desc, eff_ref_white as u32) {
                         ScanoutPlan::VulkanFastDirectFlip
+                    } else {
+                        let conv = PlaneColorConversion::HlgToPq {
+                            reference_white: eff_ref_white,
+                        };
+                        if self.supports_plane_colorop {
+                            // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                            ScanoutPlan::PlaneColorop(conv)
+                        } else if self.supports_hlg_to_hdr_hardware_scanout() {
+                            // Tier 2B: CRTC Color Management
+                            ScanoutPlan::CrtcHardware(conv)
+                        } else {
+                            // Tier 3: Vulkan Shader Fast Flip
+                            ScanoutPlan::VulkanFastDirectFlip
+                        }
                     }
                 }
                 Some(desc) if !desc.is_hdr() => {
-                    // Tagged SDR on HDR
+                    // Tagged SDR on HDR:
                     let effective_ref_white = if output_reference_white > 0 {
                         output_reference_white
                     } else {
@@ -862,7 +1080,7 @@ impl DrmScanoutCapabilities {
                     }
                 }
                 None => {
-                    // Untagged SDR on HDR
+                    // Untagged SDR on HDR:
                     let effective_ref_white = if output_reference_white > 0 {
                         output_reference_white
                     } else {
@@ -1299,6 +1517,85 @@ mod tests {
         let plan = caps.evaluate_scanout_plan(true, Some(&hlg_desc), 203);
         assert_eq!(plan, ScanoutPlan::VulkanFastDirectFlip);
         caps.crtc_color.has_degamma_lut = true;
+    }
+
+    #[test]
+    fn test_evaluate_scanout_plan_peak_luminance_tonemap_fallback() {
+        use crate::wayland::color::management::ImageDescription;
+
+        let mut caps = DrmScanoutCapabilities {
+            supports_fp16: true,
+            supports_10bit: true,
+            supports_plane_colorop: false,
+            primary_plane_formats: FormatSet::default(),
+            crtc_color: CrtcColorCapabilities {
+                has_degamma_lut: true,
+                degamma_lut_size: 4096,
+                has_ctm: true,
+                has_gamma_lut: true,
+                gamma_lut_size: 4096,
+            },
+        };
+
+        // 1. Parametric PQ content with max_cll = 1500 nits.
+        let mut pq_desc = ImageDescription::WINDOWS_BT2100;
+        pq_desc.windows_bt2100 = false;
+        pq_desc.max_cll = Some(1500);
+
+        // When sink peak luminance is 1000 nits (< 1500 / 1.05 = 1428 nits),
+        // hardware direct passthrough would hard-clip highlights.
+        // It must fall back to VulkanFastDirectFlip for shader ICtCp tone mapping!
+        let plan_over = caps.evaluate_scanout_plan_with_peak(true, Some(&pq_desc), 203, Some(1000));
+        assert_eq!(plan_over, ScanoutPlan::VulkanFastDirectFlip);
+
+        // When sink peak luminance is 1600 nits (> 1500 nits), no tone mapping is required;
+        // DirectPassthrough is allowed!
+        let plan_under = caps.evaluate_scanout_plan_with_peak(true, Some(&pq_desc), 203, Some(1600));
+        assert_eq!(plan_under, ScanoutPlan::DirectPassthrough);
+
+        // When peak is None or 0, fallback tone-mapping check is disabled (passthrough).
+        let plan_unknown = caps.evaluate_scanout_plan_with_peak(true, Some(&pq_desc), 203, None);
+        assert_eq!(plan_unknown, ScanoutPlan::DirectPassthrough);
+
+        // Windows-BT2100 display-referred content is exempt from compositor tone mapping.
+        let plan_win = caps.evaluate_scanout_plan_with_peak(
+            true,
+            Some(&ImageDescription::WINDOWS_BT2100),
+            203,
+            Some(1000),
+        );
+        assert_eq!(plan_win, ScanoutPlan::DirectPassthrough);
+
+        // 1b. Parametric PQ content with NO explicit peak declared (fallback defaults to 10,000 in TF).
+        // It must NOT be false-positively treated as exceeding sink peak and must pass through directly!
+        let mut pq_no_max = ImageDescription::WINDOWS_BT2100;
+        pq_no_max.windows_bt2100 = false;
+        pq_no_max.max_cll = None;
+        pq_no_max.mastering_luminance = None;
+        pq_no_max.luminances = None;
+        let plan_no_max = caps.evaluate_scanout_plan_with_peak(true, Some(&pq_no_max), 203, Some(1000));
+        assert_eq!(plan_no_max, ScanoutPlan::DirectPassthrough);
+
+        // 2. Client-authored scRGB content with max_cll = 2000 nits
+        let mut scrgb_desc = ImageDescription::WINDOWS_SCRGB;
+        scrgb_desc.windows_scrgb = false;
+        scrgb_desc.max_cll = Some(2000);
+
+        // Sink peak 1000 nits: requires tone mapping -> VulkanFastDirectFlip
+        let plan_scrgb_over = caps.evaluate_scanout_plan_with_peak(true, Some(&scrgb_desc), 203, Some(1000));
+        assert_eq!(plan_scrgb_over, ScanoutPlan::VulkanFastDirectFlip);
+
+        // Sink peak 2500 nits: no tone mapping needed -> CrtcHardware (or PlaneColorop)
+        let plan_scrgb_under = caps.evaluate_scanout_plan_with_peak(true, Some(&scrgb_desc), 203, Some(2500));
+        assert!(matches!(plan_scrgb_under, ScanoutPlan::CrtcHardware(_)));
+
+        // 3. supports_post_blend_encode verification
+        assert!(caps.supports_post_blend_encode());
+        caps.crtc_color.has_gamma_lut = false;
+        assert!(!caps.supports_post_blend_encode());
+        caps.crtc_color.has_gamma_lut = true;
+        caps.crtc_color.gamma_lut_size = 256;
+        assert!(!caps.supports_post_blend_encode());
     }
 
     #[test]
@@ -1767,5 +2064,31 @@ mod tests {
         if !found_any {
             println!("  [NOTE] No accessible DRM card node found in /dev/dri/ (running in container/CI).");
         }
+    }
+
+    #[test]
+    fn test_srgb_to_pq_encoder_in_place_apply() {
+        let encoder = SrgbToPqEncoder::new(203.0 / 10000.0);
+        // Test ARGB8888 buffer (4 pixels: transparent black, opaque white, opaque red, half-transparent blue)
+        let mut data = vec![
+            // Pixel 0: (B=0, G=0, R=0, A=0) -> transparent black
+            0, 0, 0, 0, // Pixel 1: (B=255, G=255, R=255, A=255) -> opaque white (sRGB 1.0)
+            255, 255, 255, 255, // Pixel 2: (B=0, G=0, R=255, A=255) -> opaque red
+            0, 0, 255, 255, // Pixel 3: (B=128, G=0, R=0, A=128) -> half-transparent blue
+            128, 0, 0, 128,
+        ];
+        encoder.apply(&mut data, 16, (4, 1));
+
+        // Transparent pixel remains zero
+        assert_eq!(&data[0..4], &[0, 0, 0, 0]);
+        // Opaque white: alpha remains 255, values encoded into PQ
+        assert_eq!(data[7], 255);
+        // In PQ encoding for 203 nits white: 203/10000 = 0.0203, PQ(0.0203) ≈ 0.58 -> 0.58 * 255 ≈ 148
+        assert!(data[4] > 140 && data[4] < 160);
+        assert_eq!(data[4], data[5]);
+        assert_eq!(data[5], data[6]);
+        // Opaque red: alpha remains 255, red channel transformed into BT.2020 PQ
+        assert_eq!(data[11], 255);
+        assert!(data[10] > 0);
     }
 }

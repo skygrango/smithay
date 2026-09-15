@@ -896,6 +896,20 @@ impl From<ExportBufferError> for Option<RenderingReason> {
     }
 }
 
+/// Post-processing applied to cursor plane contents after they are filled.
+///
+/// Arguments: premultiplied ARGB8888 pixel data, the row stride in bytes, and the buffer's
+/// width and height in pixels.
+pub type CursorBufferTransformFn = Box<dyn Fn(&mut [u8], u32, (u32, u32)) + Send>;
+
+struct CursorBufferTransform(CursorBufferTransformFn);
+
+impl std::fmt::Debug for CursorBufferTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CursorBufferTransform")
+    }
+}
+
 #[derive(Debug)]
 struct OverlayPlaneElementIds {
     plane_ids: Vec<(plane::Handle, Id, Id)>,
@@ -1089,6 +1103,8 @@ where
 
     cursor_size: Size<i32, Physical>,
     cursor_state: Option<CursorState<G>>,
+    cursor_buffer_transform: Option<CursorBufferTransform>,
+    cursor_buffer_transform_dirty: bool,
 
     element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
     previous_element_states: IndexMap<Id, ElementState<<F as ExportFramebuffer<A::Buffer>>::Framebuffer>>,
@@ -1271,6 +1287,8 @@ where
                         framebuffer_exporter,
                         cursor_size,
                         cursor_state,
+                        cursor_buffer_transform: None,
+                        cursor_buffer_transform_dirty: false,
                         surface,
                         damage_tracker,
                         output_mode_source,
@@ -1453,6 +1471,8 @@ where
             framebuffer_exporter,
             cursor_size,
             cursor_state,
+            cursor_buffer_transform: None,
+            cursor_buffer_transform_dirty: false,
             surface,
             damage_tracker,
             output_mode_source,
@@ -2694,6 +2714,18 @@ where
         self.swapchain.reset_buffers();
     }
 
+    /// Sets the transform applied to cursor plane contents after they are filled.
+    ///
+    /// The transform closure is called with the mutable pixel data (premultiplied ARGB8888),
+    /// the stride, and the width/height of the cursor buffer.
+    ///
+    /// Setting a transform always re-renders the cursor plane on the next frame, so only call
+    /// this when the transform actually changes.
+    pub fn set_cursor_buffer_transform(&mut self, transform: Option<CursorBufferTransformFn>) {
+        self.cursor_buffer_transform = transform.map(CursorBufferTransform);
+        self.cursor_buffer_transform_dirty = true;
+    }
+
     /// Reset the age for all buffers.
     ///
     /// This can be used to efficiently clear the damage history without having to
@@ -3323,10 +3355,11 @@ where
 
         // if the output transform or scale change we have to (re-)render the cursor plane,
         // also if the element changed or reports damage we have to render it
-        let render = cursor_state
-            .previous_output_transform
-            .map(|t| t != output_transform)
-            .unwrap_or(true)
+        let render = self.cursor_buffer_transform_dirty
+            || cursor_state
+                .previous_output_transform
+                .map(|t| t != output_transform)
+                .unwrap_or(true)
             || cursor_state
                 .previous_output_scale
                 .map(|s| s != scale)
@@ -3543,6 +3576,25 @@ where
                 return None;
             }
         };
+
+        if let Some(ref transform) = self.cursor_buffer_transform {
+            let res = cursor_buffer.map_mut(
+                0,
+                0,
+                cursor_plane_size.w as u32,
+                cursor_plane_size.h as u32,
+                |mbo| {
+                    let stride = mbo.stride();
+                    let size = (mbo.width(), mbo.height());
+                    (transform.0)(mbo.buffer_mut(), stride, size);
+                },
+            );
+            if let Err(err) = res {
+                debug!("failed to apply cursor buffer transform: {err}");
+                return None;
+            }
+        }
+        self.cursor_buffer_transform_dirty = false;
 
         let src = Rectangle::from_size(cursor_buffer_size).to_f64();
         let dst = Rectangle::new(cursor_plane_location, cursor_plane_size);

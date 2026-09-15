@@ -375,6 +375,18 @@ impl ImageDescription {
             },
         }
     }
+
+    /// The maximum luminance in cd/m² the description declares: `max_cll` if provided,
+    /// otherwise `mastering_luminance` maximum, otherwise the primary color volume maximum.
+    pub const fn max_luminance(&self) -> u32 {
+        if let Some(max_cll) = self.max_cll {
+            return max_cll;
+        }
+        if let Some((_, max)) = self.mastering_luminance {
+            return max;
+        }
+        self.luminances_or_default().1
+    }
 }
 
 /// Double-buffered per-surface color management state.

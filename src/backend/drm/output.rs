@@ -23,6 +23,7 @@ use crate::{
     output::OutputModeSource,
 };
 
+pub use super::compositor::CursorBufferTransformFn;
 use super::{
     DrmDevice, DrmError, Planes,
     compositor::{
@@ -789,6 +790,11 @@ where
         color_state: crate::backend::drm::color::CrtcColorState,
     ) -> FrameResult<(), A, F> {
         self.with_compositor(|compositor| compositor.use_crtc_color_state(color_state))
+    }
+
+    /// Sets the transform function applied to cursor plane contents after they are filled.
+    pub fn set_cursor_buffer_transform(&self, transform: Option<CursorBufferTransformFn>) {
+        self.with_compositor(|compositor| compositor.set_cursor_buffer_transform(transform));
     }
 }
 
