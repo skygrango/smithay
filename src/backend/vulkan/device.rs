@@ -155,6 +155,10 @@ impl Device {
             None
         };
 
+        let mut props = vk::PhysicalDeviceProperties2::default();
+        unsafe { phd.get_properties(&mut props) };
+        let pipeline_cache_uuid = props.properties.pipeline_cache_uuid;
+
         Ok(Device(Arc::new(InnerDevice {
             vk: device,
             khr_external_semaphore_fd,
@@ -165,6 +169,7 @@ impl Device {
 
             mem_properties,
             formats: phd.drm_formats(),
+            #[cfg(feature = "backend_drm")]
             node: phd
                 .render_node()
                 .ok()
@@ -176,6 +181,7 @@ impl Device {
 
             context: ContextId::new(),
             allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
+            pipeline_cache_uuid,
         })))
     }
 
@@ -236,9 +242,12 @@ impl Device {
         size: vk::DeviceSize,
         alignment: vk::DeviceSize,
         memory_type_index: u32,
-    ) -> Result<(vk::DeviceMemory, vk::DeviceSize), vk::Result> {
+    ) -> Result<(vk::DeviceMemory, vk::DeviceSize, Option<*mut u8>), vk::Result> {
+        let host_visible = self.0.mem_properties.memory_types[memory_type_index as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
         let mut alloc = self.0.allocator.lock().unwrap();
-        unsafe { alloc.allocate(&self.0.vk, size, alignment, memory_type_index) }
+        unsafe { alloc.allocate(&self.0.vk, size, alignment, memory_type_index, host_visible) }
     }
 
     pub(crate) fn free_suballocation(
@@ -249,6 +258,10 @@ impl Device {
     ) {
         let mut alloc = self.0.allocator.lock().unwrap();
         unsafe { alloc.free(&self.0.vk, memory, offset, size) }
+    }
+
+    pub fn pipeline_cache_uuid(&self) -> [u8; 16] {
+        self.0.pipeline_cache_uuid
     }
 }
 
@@ -276,6 +289,7 @@ struct InnerDevice {
 
     context: ContextId<VulkanImage>,
     allocator: std::sync::Mutex<super::allocator::VulkanSuballocator>,
+    pipeline_cache_uuid: [u8; 16],
 }
 
 impl fmt::Debug for InnerDevice {

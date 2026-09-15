@@ -487,17 +487,7 @@ impl VulkanRenderer {
                     .get_image_subresource_layout(*image.vk(), subresource)
             };
 
-            let map_ptr = unsafe {
-                self.device
-                    .vk()
-                    .map_memory(
-                        image.inner.memory,
-                        image.inner.memory_offset,
-                        layout.size,
-                        MemoryMapFlags::empty(),
-                    )
-                    .map_err(Error::HostImageCopyError)?
-            };
+            let map_ptr = image.map().map_err(Error::HostImageCopyError)?;
 
             let dst_base = unsafe { (map_ptr as *mut u8).add(layout.offset as usize) };
             let dst_pitch = layout.row_pitch as usize;
@@ -519,8 +509,6 @@ impl VulkanRenderer {
                         .size(layout.size);
                     let _ = self.device.vk().flush_mapped_memory_ranges(&[range]);
                 }
-
-                self.device.vk().unmap_memory(image.inner.memory);
             }
         } else {
             let host_offset = (region.loc.y as usize * src_stride) + (region.loc.x as usize * bpp);
@@ -644,6 +632,7 @@ impl Renderer for VulkanRenderer {
             depth_enabled: false,
             current_depth: 0.0,
             depth_image: None,
+            pending_clears: Vec::new(),
         })
     }
 
@@ -916,11 +905,7 @@ impl fmt::Debug for VulkanMapping {
 
 impl Drop for VulkanMapping {
     fn drop(&mut self) {
-        if let VulkanMapping::Mapped(_, _, image, dev) = self {
-            if let Some(device) = dev.upgrade() {
-                unsafe { device.vk().unmap_memory(image.inner.memory) };
-            }
-        }
+        // Mapped memory is persistently mapped and will be unmapped when the underlying VulkanImage is dropped.
     }
 }
 
@@ -970,17 +955,8 @@ impl VulkanRenderer {
                 )
             };
 
-            let ptr = unsafe {
-                self.device
-                    .vk()
-                    .map_memory(
-                        image.inner.memory,
-                        image.inner.memory_offset + layout.offset,
-                        layout.size,
-                        MemoryMapFlags::empty(),
-                    )
-                    .map_err(Error::HostImageCopyError)? // TODO
-            };
+            let base_ptr = image.map().map_err(Error::HostImageCopyError)?;
+            let ptr = unsafe { base_ptr.add(layout.offset as usize) };
 
             Ok(VulkanMapping::Mapped(
                 unsafe { NonNull::new_unchecked(ptr as *mut _) },
@@ -1240,14 +1216,14 @@ impl VulkanRenderer {
         let signal_semaphore_info = [SemaphoreSubmitInfo::default()
             .semaphore(self.timeline.vk)
             .value(next_seq_no)
-            .stage_mask(PipelineStageFlags2::ALL_COMMANDS)];
+            .stage_mask(PipelineStageFlags2::ALL_TRANSFER)];
 
         let wait_semaphore_info = if prev_seq_no > 0 {
             vec![
                 SemaphoreSubmitInfo::default()
                     .semaphore(self.timeline.vk)
                     .value(prev_seq_no)
-                    .stage_mask(PipelineStageFlags2::ALL_COMMANDS),
+                    .stage_mask(PipelineStageFlags2::ALL_TRANSFER),
             ]
         } else {
             Vec::new()
@@ -1531,6 +1507,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     pub(crate) depth_enabled: bool,
     pub(crate) current_depth: f32,
     pub(crate) depth_image: Option<VulkanImage>,
+    pub(crate) pending_clears: Vec<(Color32F, Vec<vk::ClearRect>)>,
 }
 
 impl VulkanFrame<'_, '_> {
@@ -1551,6 +1528,96 @@ impl VulkanFrame<'_, '_> {
 
     pub fn current_depth(&self) -> f32 {
         self.current_depth
+    }
+
+    /// Batches layout transitions and queue family acquires for a collection of textures into a single
+    /// pipeline barrier, avoiding breaking dynamic rendering passes mid-frame.
+    pub fn prepare_textures<'a, I>(&mut self, textures: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = &'a VulkanImage>,
+    {
+        let qfam = self.renderer.device.queue_family_idx();
+        let ext_queue = self.renderer.external_queue_family();
+
+        let mut barriers = Vec::new();
+        let mut transitioned = Vec::new();
+
+        for texture in textures {
+            if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
+                self.images.push(texture.inner.clone());
+            }
+
+            let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
+            let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
+                (ext_queue, qfam)
+            } else {
+                (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
+            };
+
+            let tex_old_layout = texture.current_layout();
+            let needs_tex_barrier =
+                tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+            if needs_tex_barrier {
+                let (tex_src_stage, tex_src_access) =
+                    if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
+                        (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+                    } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                        (
+                            PipelineStageFlags2::FRAGMENT_SHADER,
+                            AccessFlags2::SHADER_SAMPLED_READ,
+                        )
+                    } else {
+                        (
+                            PipelineStageFlags2::COMPUTE_SHADER
+                                | PipelineStageFlags2::ALL_TRANSFER
+                                | PipelineStageFlags2::HOST,
+                            AccessFlags2::SHADER_STORAGE_WRITE
+                                | AccessFlags2::TRANSFER_WRITE
+                                | AccessFlags2::HOST_WRITE,
+                        )
+                    };
+
+                let barrier = ImageMemoryBarrier2::default()
+                    .image(*texture.vk())
+                    .old_layout(tex_old_layout)
+                    .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(tex_src_queue)
+                    .dst_queue_family_index(tex_dst_queue)
+                    .src_stage_mask(tex_src_stage)
+                    .src_access_mask(tex_src_access)
+                    .dst_stage_mask(PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .layer_count(1)
+                            .level_count(1),
+                    );
+
+                barriers.push(barrier);
+                transitioned.push(texture);
+            }
+        }
+
+        if !barriers.is_empty() {
+            if self.rendering {
+                self.end_rendering();
+            }
+            let buf = self.get_or_create_cmd_buffer()?;
+            unsafe {
+                self.renderer
+                    .device
+                    .vk()
+                    .cmd_pipeline_barrier2(buf, &DependencyInfo::default().image_memory_barriers(&barriers));
+            }
+            for tex in transitioned {
+                tex.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                tex.set_needs_acquire(false);
+            }
+        }
+
+        Ok(())
     }
 
     fn get_or_create_cmd_buffer(&mut self) -> Result<ash::vk::CommandBuffer, Error> {
@@ -1730,6 +1797,44 @@ impl VulkanFrame<'_, '_> {
         }
 
         self.rendering = true;
+
+        if !self.pending_clears.is_empty() {
+            let pending = std::mem::take(&mut self.pending_clears);
+            for (color, clear_rects) in pending {
+                let mut attachments = Vec::with_capacity(2);
+                attachments.push(vk::ClearAttachment {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    color_attachment: 0,
+                    clear_value: vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: color.components(),
+                        },
+                    },
+                });
+
+                if self.depth_enabled {
+                    attachments.push(vk::ClearAttachment {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        color_attachment: 0,
+                        clear_value: vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                    });
+                }
+
+                unsafe {
+                    self.renderer
+                        .device
+                        .vk()
+                        .cmd_clear_attachments(buf, &attachments, &clear_rects);
+                }
+                self.has_draws = true;
+            }
+        }
+
         Ok(buf)
     }
 
@@ -1950,7 +2055,84 @@ impl Frame for VulkanFrame<'_, '_> {
     }
 
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        self.draw_color(Rectangle::from_size(self.size), at, color, false)
+        trace!(?color, at_len = at.len(), fb_size = ?self.size, "VulkanFrame::clear executing");
+        if at.is_empty() {
+            return Ok(());
+        }
+
+        let scissors = calculate_damage_scissors(
+            at,
+            Rectangle::from_size(self.size),
+            self.transform,
+            &self.size,
+            self.fb.width(),
+            self.fb.height(),
+        );
+
+        if scissors.is_empty() {
+            return Ok(());
+        }
+
+        let color = if let Some(config) = self.renderer.hdr_config {
+            sdr_color_to_hdr(
+                color,
+                config.reference_white,
+                config.sdr_gamma,
+                config.gamut_stretch,
+                config.hardware_offload,
+                config.is_sdr,
+            )
+        } else {
+            color
+        };
+
+        let clear_rects: Vec<vk::ClearRect> = scissors
+            .into_iter()
+            .map(|rect| vk::ClearRect {
+                rect,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .collect();
+
+        if self.rendering {
+            let buf = self.cmd_buffer.unwrap();
+            let mut attachments = Vec::with_capacity(2);
+            attachments.push(vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: color.components(),
+                    },
+                },
+            });
+
+            if self.depth_enabled {
+                attachments.push(vk::ClearAttachment {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    color_attachment: 0,
+                    clear_value: vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: 1.0,
+                            stencil: 0,
+                        },
+                    },
+                });
+            }
+
+            unsafe {
+                self.renderer
+                    .device
+                    .vk()
+                    .cmd_clear_attachments(buf, &attachments, &clear_rects);
+            }
+            self.has_draws = true;
+        } else {
+            self.pending_clears.push((color, clear_rects));
+        }
+
+        Ok(())
     }
 
     fn draw_solid(
@@ -2419,6 +2601,9 @@ impl Frame for VulkanFrame<'_, '_> {
             has_drm = self.renderer.timeline.drm.is_some(),
             "VulkanFrame::finish"
         );
+        if !self.pending_clears.is_empty() {
+            self.ensure_rendering()?;
+        }
         if !self.has_draws {
             return Ok(SyncPoint::signaled());
         }
@@ -2483,14 +2668,18 @@ impl Frame for VulkanFrame<'_, '_> {
         let signal_semaphore_info = [SemaphoreSubmitInfo::default()
             .semaphore(self.renderer.timeline.vk)
             .value(next_seq_no)
-            .stage_mask(PipelineStageFlags2::ALL_COMMANDS)];
+            .stage_mask(PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | PipelineStageFlags2::ALL_TRANSFER)];
 
         let wait_semaphore_info = if prev_seq_no > 0 {
             vec![
                 SemaphoreSubmitInfo::default()
                     .semaphore(self.renderer.timeline.vk)
                     .value(prev_seq_no)
-                    .stage_mask(PipelineStageFlags2::ALL_COMMANDS),
+                    .stage_mask(
+                        PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                            | PipelineStageFlags2::FRAGMENT_SHADER
+                            | PipelineStageFlags2::ALL_TRANSFER,
+                    ),
             ]
         } else {
             Vec::new()
@@ -2594,6 +2783,7 @@ impl Blit for VulkanRenderer {
             depth_enabled: false,
             current_depth: 0.0,
             depth_image: None,
+            pending_clears: Vec::new(),
         };
         if frame.can_copy_image(&from.0, src, dst) {
             frame.copy_image_from_to(&from.0, src, dst)?;
@@ -2652,7 +2842,6 @@ impl VulkanFrame<'_, '_> {
         }
         let untransformed_dst = dst;
         let _dst = self.transform.transform_rect_in(dst, &self.size);
-        self.renderer.cleanup()?;
 
         let color = if let Some(config) = self.renderer.hdr_config {
             sdr_color_to_hdr(

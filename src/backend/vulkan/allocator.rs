@@ -12,12 +12,19 @@ struct MemoryBlock {
     memory_type_index: u32,
     total_size: vk::DeviceSize,
     free_chunks: Vec<MemoryChunk>,
+    mapped_base: Option<*mut u8>,
 }
+
+unsafe impl Send for MemoryBlock {}
+unsafe impl Sync for MemoryBlock {}
 
 #[derive(Debug, Default)]
 pub struct VulkanSuballocator {
     blocks: Vec<MemoryBlock>,
 }
+
+unsafe impl Send for VulkanSuballocator {}
+unsafe impl Sync for VulkanSuballocator {}
 
 const DEFAULT_BLOCK_SIZE: vk::DeviceSize = 8 * 1024 * 1024; // 8 MB
 
@@ -28,7 +35,8 @@ impl VulkanSuballocator {
         size: vk::DeviceSize,
         alignment: vk::DeviceSize,
         memory_type_index: u32,
-    ) -> Result<(vk::DeviceMemory, vk::DeviceSize), vk::Result> {
+        host_visible: bool,
+    ) -> Result<(vk::DeviceMemory, vk::DeviceSize, Option<*mut u8>), vk::Result> {
         let align = alignment.max(1);
 
         // Try to allocate from an existing block matching memory_type_index
@@ -62,7 +70,10 @@ impl VulkanSuballocator {
                         });
                     }
 
-                    return Ok((block.memory, aligned_offset));
+                    let mapped_ptr = block
+                        .mapped_base
+                        .map(|base| unsafe { base.add(aligned_offset as usize) });
+                    return Ok((block.memory, aligned_offset, mapped_ptr));
                 }
             }
         }
@@ -85,6 +96,21 @@ impl VulkanSuballocator {
             Err(err) => return Err(err),
         };
 
+        let mapped_base = if host_visible {
+            match unsafe { vk_device.map_memory(memory, 0, total_size, vk::MemoryMapFlags::empty()) } {
+                Ok(ptr) => Some(ptr as *mut u8),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to persistently map host-visible suballocator block: {:?}",
+                        err
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut free_chunks = Vec::new();
         let remaining = total_size - size;
         if remaining > 0 {
@@ -99,9 +125,10 @@ impl VulkanSuballocator {
             memory_type_index,
             total_size,
             free_chunks,
+            mapped_base,
         });
 
-        Ok((memory, 0))
+        Ok((memory, 0, mapped_base))
     }
 
     pub unsafe fn free(
@@ -151,6 +178,9 @@ impl VulkanSuballocator {
             if block.total_size != DEFAULT_BLOCK_SIZE || count_same_type > 1 {
                 let removed = self.blocks.swap_remove(idx);
                 unsafe {
+                    if removed.mapped_base.is_some() {
+                        vk_device.unmap_memory(removed.memory);
+                    }
                     vk_device.free_memory(removed.memory, None);
                 }
             }
@@ -160,6 +190,9 @@ impl VulkanSuballocator {
     pub unsafe fn destroy(&mut self, vk_device: &ash::Device) {
         for block in self.blocks.drain(..) {
             unsafe {
+                if block.mapped_base.is_some() {
+                    vk_device.unmap_memory(block.memory);
+                }
                 vk_device.free_memory(block.memory, None);
             }
         }

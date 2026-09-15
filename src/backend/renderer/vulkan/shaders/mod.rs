@@ -56,6 +56,7 @@ pub struct FormatPipelines {
 pub struct Pipelines {
     device: WeakDevice,
     cache: vk::PipelineCache,
+    cache_path: Option<std::path::PathBuf>,
 
     clear_layout: PipelineLayout,
     tex_layout: PipelineLayout,
@@ -70,6 +71,23 @@ pub struct Pipelines {
     hdr_tex_frag: vk::ShaderModule,
 
     format_pipelines: HashMap<(vk::Format, bool), FormatPipelines>,
+}
+
+fn get_pipeline_cache_path(device: &Device) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("SMITHAY_VULKAN_PIPELINE_CACHE") {
+        return Some(std::path::PathBuf::from(path));
+    }
+
+    let base_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+
+    let dir = base_dir.join("smithay");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let uuid = device.pipeline_cache_uuid();
+    let hex_uuid = uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    Some(dir.join(format!("vulkan_pipelines_{}.bin", hex_uuid)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,7 +115,17 @@ pub enum Error {
 
 impl Pipelines {
     pub fn new(device: &Device) -> Result<Self, Error> {
-        let create_info = vk::PipelineCacheCreateInfo::default();
+        let cache_path = get_pipeline_cache_path(device);
+        let initial_data = cache_path.as_ref().and_then(|p| match std::fs::read(p) {
+            Ok(data) if !data.is_empty() => Some(data),
+            _ => None,
+        });
+
+        let mut create_info = vk::PipelineCacheCreateInfo::default();
+        if let Some(ref data) = initial_data {
+            create_info = create_info.initial_data(data);
+        }
+
         let cache = unsafe {
             device
                 .vk()
@@ -213,6 +241,7 @@ impl Pipelines {
         Ok(Pipelines {
             device: device.downgrade(),
             cache,
+            cache_path,
 
             clear_layout,
             tex_layout,
@@ -564,7 +593,43 @@ impl Pipelines {
 
         self.format_pipelines
             .insert((format, has_depth), format_pipelines);
+        self.save_cache();
         Ok(format_pipelines)
+    }
+
+    pub fn save_cache(&self) {
+        let Some(ref path) = self.cache_path else {
+            return;
+        };
+        let Some(device) = self.device.upgrade() else {
+            return;
+        };
+
+        let data = unsafe {
+            match device.vk().get_pipeline_cache_data(self.cache) {
+                Ok(data) => data,
+                Err(err) => {
+                    tracing::debug!("Failed to get Vulkan pipeline cache data: {:?}", err);
+                    return;
+                }
+            }
+        };
+
+        if data.is_empty() {
+            return;
+        }
+
+        let temp_path = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&temp_path, &data) {
+            tracing::debug!(
+                "Failed to write Vulkan pipeline cache to {:?}: {:?}",
+                temp_path,
+                err
+            );
+            return;
+        }
+
+        let _ = std::fs::rename(&temp_path, path);
     }
 
     pub fn clear_pipeline_layout(&self) -> &PipelineLayout {
@@ -590,6 +655,7 @@ impl Pipelines {
 
 impl Drop for Pipelines {
     fn drop(&mut self) {
+        self.save_cache();
         if let Some(device) = self.device.upgrade() {
             unsafe {
                 for (_, p) in self.format_pipelines.drain() {

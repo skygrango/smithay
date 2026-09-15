@@ -270,6 +270,7 @@ impl VulkanImage {
             memory_offset: 0,
             suballocated: false,
             allocation_size: 0,
+            persistent_mapping: std::sync::Mutex::new(None),
             device: device.downgrade(),
             view: None,
             current_layout: std::sync::atomic::AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
@@ -497,11 +498,14 @@ impl VulkanImage {
             );
 
             match suballoc_res {
-                Ok((memory, memory_offset)) => {
+                Ok((memory, memory_offset, mapped_ptr)) => {
                     inner.memory = memory;
                     inner.memory_offset = memory_offset;
                     inner.suballocated = true;
                     inner.allocation_size = memory_reqs.size;
+                    if let Some(ptr) = mapped_ptr {
+                        *inner.persistent_mapping.lock().unwrap() = Some(MappedPointer(ptr));
+                    }
 
                     unsafe {
                         device
@@ -703,7 +707,18 @@ impl VulkanImage {
     pub fn export(&self) -> Result<Dmabuf, crate::backend::allocator::vulkan::ExportError> {
         crate::backend::allocator::dmabuf::AsDmabuf::export(self)
     }
+
+    /// Returns a persistent pointer to the mapped memory of this image.
+    /// The pointer is offset to the start of this image within its memory allocation/block.
+    pub fn map(&self) -> Result<*mut u8, vk::Result> {
+        self.inner.map()
+    }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MappedPointer(pub *mut u8);
+unsafe impl Send for MappedPointer {}
+unsafe impl Sync for MappedPointer {}
 
 #[derive(Debug)]
 pub(crate) struct ImageInner {
@@ -713,6 +728,7 @@ pub(crate) struct ImageInner {
     pub(crate) memory_offset: vk::DeviceSize,
     pub(crate) suballocated: bool,
     pub(crate) allocation_size: vk::DeviceSize,
+    pub(crate) persistent_mapping: std::sync::Mutex<Option<MappedPointer>>,
     pub(crate) device: WeakDevice,
     pub(crate) view: Option<vk::ImageView>,
     pub(crate) current_layout: std::sync::atomic::AtomicI32,
@@ -720,6 +736,29 @@ pub(crate) struct ImageInner {
 
     pub(crate) dmabuf_exportable: bool,
     pub(crate) dmabuf_plane_count: u32,
+}
+
+impl ImageInner {
+    pub fn map(&self) -> Result<*mut u8, vk::Result> {
+        let mut guard = self.persistent_mapping.lock().unwrap();
+        if let Some(mapped) = *guard {
+            return Ok(mapped.0);
+        }
+
+        if self.memory == vk::DeviceMemory::null() {
+            return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
+        }
+
+        let device = self.device.upgrade().ok_or(vk::Result::ERROR_DEVICE_LOST)?;
+        let vk = device.vk();
+
+        let ptr =
+            unsafe { vk.map_memory(self.memory, 0, self.allocation_size, vk::MemoryMapFlags::empty())? };
+
+        let ptr = unsafe { (ptr as *mut u8).add(self.memory_offset as usize) };
+        *guard = Some(MappedPointer(ptr));
+        Ok(ptr)
+    }
 }
 
 impl Drop for ImageInner {
@@ -735,6 +774,11 @@ impl Drop for ImageInner {
                     if self.suballocated {
                         device.free_suballocation(self.memory, self.memory_offset, self.allocation_size);
                     } else {
+                        if let Ok(mut lock) = self.persistent_mapping.lock() {
+                            if lock.take().is_some() {
+                                vk.unmap_memory(self.memory);
+                            }
+                        }
                         vk.free_memory(self.memory, None);
                     }
                 }
