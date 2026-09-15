@@ -86,6 +86,124 @@ mod lut3d;
 use lut3d::{Lut3dTexture, generate_ictcp_tonemap_lut};
 
 #[derive(Debug)]
+pub struct QueuedSubmit {
+    pub cmd_buffer: vk::CommandBuffer,
+    pub cmd_buffer_infos: Vec<CommandBufferSubmitInfo<'static>>,
+    pub signal_semaphore_infos: Vec<SemaphoreSubmitInfo<'static>>,
+    pub wait_semaphore_infos: Vec<SemaphoreSubmitInfo<'static>>,
+    pub point: u64,
+    pub descs: Vec<self::shaders::DescriptorSet>,
+    pub images: Vec<Arc<ImageInner>>,
+}
+
+pub struct PendingVulkanShmCopy {
+    pub device: ash::Device,
+    pub staging_buffer: vk::Buffer,
+    pub staging_memory: vk::DeviceMemory,
+    pub buffer_size: vk::DeviceSize,
+    pub is_coherent: bool,
+    pub timeline_sem: vk::Semaphore,
+    pub point: u64,
+    pub width: u32,
+    pub height: u32,
+    pub bpp: usize,
+}
+
+impl fmt::Debug for PendingVulkanShmCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingVulkanShmCopy")
+            .field("staging_buffer", &self.staging_buffer)
+            .field("buffer_size", &self.buffer_size)
+            .field("point", &self.point)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+unsafe impl Send for PendingVulkanShmCopy {}
+unsafe impl Sync for PendingVulkanShmCopy {}
+
+impl PendingVulkanShmCopy {
+    pub fn wait_and_copy(
+        mut self,
+        dst_ptr: *mut u8,
+        dst_len: usize,
+        dst_offset: i32,
+        dst_stride: i32,
+    ) -> Result<(), vk::Result> {
+        let sems = [self.timeline_sem];
+        let vals = [self.point];
+        let wait_info = SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
+        loop {
+            let res = unsafe { self.device.wait_semaphores(&wait_info, 100_000_000) };
+            match res {
+                Ok(()) => break,
+                Err(vk::Result::TIMEOUT) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        let src_ptr = unsafe {
+            self.device
+                .map_memory(self.staging_memory, 0, self.buffer_size, MemoryMapFlags::empty())?
+        };
+
+        if !self.is_coherent {
+            let mapped_range = vk::MappedMemoryRange::default()
+                .memory(self.staging_memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            unsafe {
+                let _ = self.device.invalidate_mapped_memory_ranges(&[mapped_range]);
+            }
+        }
+
+        let row_bytes = (self.width as usize * self.bpp).min(dst_stride as usize);
+        for i in 0..(self.height as usize) {
+            let src_row = unsafe { (src_ptr as *const u8).add(i * self.width as usize * self.bpp) };
+            let dst_row_offset = dst_offset as usize + i * dst_stride as usize;
+            if dst_row_offset + row_bytes <= dst_len {
+                unsafe {
+                    std::ptr::copy_nonoverlapping::<u8>(src_row, dst_ptr.add(dst_row_offset), row_bytes);
+                }
+            }
+        }
+
+        unsafe {
+            self.device.unmap_memory(self.staging_memory);
+            self.device.destroy_buffer(self.staging_buffer, None);
+            self.device.free_memory(self.staging_memory, None);
+        }
+        self.staging_buffer = vk::Buffer::null();
+        self.staging_memory = vk::DeviceMemory::null();
+
+        Ok(())
+    }
+}
+
+impl Drop for PendingVulkanShmCopy {
+    fn drop(&mut self) {
+        if self.staging_buffer != vk::Buffer::null() {
+            unsafe {
+                let sems = [self.timeline_sem];
+                let vals = [self.point];
+                let wait_info = SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
+                let _ = self.device.wait_semaphores(&wait_info, 100_000_000);
+                self.device.destroy_buffer(self.staging_buffer, None);
+                self.staging_buffer = vk::Buffer::null();
+            }
+        }
+        if self.staging_memory != vk::DeviceMemory::null() {
+            unsafe {
+                self.device.free_memory(self.staging_memory, None);
+                self.staging_memory = vk::DeviceMemory::null();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct VulkanRenderer {
     capabilities: Vec<Capability>,
     dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
@@ -105,6 +223,8 @@ pub struct VulkanRenderer {
     upscale_filter: super::TextureFilter,
     pub(crate) hdr_config: Option<HdrOutputConfig>,
     pub(crate) supports_optimal_host_copy: bool,
+    pub(crate) batch_submits: bool,
+    pub(crate) queued_submits: Vec<QueuedSubmit>,
 
     imported_timelines: HashMap<WeakDrmTimeline, vk::Semaphore>,
     pending_waits: Vec<DrmSyncPoint>,
@@ -120,6 +240,11 @@ impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.vk().device_wait_idle();
+            for q in self.queued_submits.drain(..) {
+                self.device
+                    .vk()
+                    .free_command_buffers(self.cmd_pool.vk(), &[q.cmd_buffer]);
+            }
             self.cmd_pool.clean_old_buffers(u64::MAX);
             self.dmabuf_cache.clear();
             if let Some(mut lut) = self.lut3d.take() {
@@ -375,7 +500,65 @@ impl VulkanRenderer {
             upscale_filter: super::TextureFilter::Linear,
             hdr_config: None,
             supports_optimal_host_copy,
+            batch_submits: false,
+            queued_submits: Vec::new(),
         })
+    }
+
+    pub fn begin_batch(&mut self) {
+        self.cancel_batch();
+        self.batch_submits = true;
+    }
+
+    pub fn cancel_batch(&mut self) {
+        self.batch_submits = false;
+        let queued = std::mem::take(&mut self.queued_submits);
+        for q in queued {
+            unsafe {
+                self.device
+                    .vk()
+                    .free_command_buffers(self.cmd_pool.vk(), &[q.cmd_buffer]);
+            }
+        }
+    }
+
+    pub fn flush_batch(&mut self) -> Result<(), Error> {
+        self.batch_submits = false;
+        if self.queued_submits.is_empty() {
+            return Ok(());
+        }
+
+        let queued = std::mem::take(&mut self.queued_submits);
+        let mut submit_infos = Vec::with_capacity(queued.len());
+        for q in &queued {
+            submit_infos.push(
+                SubmitInfo2::default()
+                    .command_buffer_infos(&q.cmd_buffer_infos)
+                    .signal_semaphore_infos(&q.signal_semaphore_infos)
+                    .wait_semaphore_infos(&q.wait_semaphore_infos),
+            );
+        }
+
+        let res = unsafe {
+            self.device
+                .vk()
+                .queue_submit2(*self.device.queue(), &submit_infos, Fence::null())
+        };
+
+        if let Err(err) = res {
+            if err == vk::Result::ERROR_DEVICE_LOST {
+                return Err(Error::DeadDevice);
+            } else {
+                return Err(Error::SubmitError(err));
+            }
+        }
+
+        for q in queued {
+            self.cmd_pool
+                .store_pending_buffer(q.cmd_buffer, q.point, q.descs, q.images);
+        }
+
+        Ok(())
     }
 
     pub fn device(&self) -> &Device {
@@ -1377,6 +1560,297 @@ impl VulkanRenderer {
         self.cleanup()?;
 
         Ok(VulkanMapping::Copied(data, image.clone()))
+    }
+
+    pub fn record_copy_image_to_shm(
+        &mut self,
+        image: &VulkanImage,
+        region: Rectangle<i32, BufferCoords>,
+        format: Fourcc,
+    ) -> Result<PendingVulkanShmCopy, Error> {
+        let bpp = match format {
+            Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => 4usize,
+            Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8usize,
+            _ => 4usize,
+        };
+
+        let copy_width = (region.size.w as u32).min(image.width()).max(1);
+        let copy_height = (region.size.h as u32).min(image.height()).max(1);
+        let offset_x = region.loc.x.max(0);
+        let offset_y = region.loc.y.max(0);
+        let stride = copy_width as usize * bpp;
+        let buffer_size = (stride * copy_height as usize) as vk::DeviceSize;
+
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let staging_buffer = unsafe {
+            self.device
+                .vk()
+                .create_buffer(&buffer_info, None)
+                .map_err(Error::HostImageCopyError)?
+        };
+
+        let mem_reqs = unsafe { self.device.vk().get_buffer_memory_requirements(staging_buffer) };
+
+        let mut mem_type_index = None;
+        let mut is_coherent = false;
+        for (i, mem_type) in self
+            .device
+            .memory_properties()
+            .memory_types_as_slice()
+            .iter()
+            .enumerate()
+        {
+            if (mem_reqs.memory_type_bits & (1 << i)) != 0
+                && mem_type
+                    .property_flags
+                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
+            {
+                mem_type_index = Some(i as u32);
+                is_coherent = true;
+                break;
+            }
+        }
+        if mem_type_index.is_none() {
+            for (i, mem_type) in self
+                .device
+                .memory_properties()
+                .memory_types_as_slice()
+                .iter()
+                .enumerate()
+            {
+                if (mem_reqs.memory_type_bits & (1 << i)) != 0
+                    && mem_type
+                        .property_flags
+                        .contains(MemoryPropertyFlags::HOST_VISIBLE)
+                {
+                    mem_type_index = Some(i as u32);
+                    is_coherent = false;
+                    break;
+                }
+            }
+        }
+
+        let Some(mem_type_index) = mem_type_index else {
+            unsafe {
+                self.device.vk().destroy_buffer(staging_buffer, None);
+            }
+            return Err(Error::ImageError(ImageError::NoMemoryAvailable));
+        };
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type_index);
+
+        let staging_memory = match unsafe { self.device.vk().allocate_memory(&alloc_info, None) } {
+            Ok(mem) => mem,
+            Err(err) => {
+                unsafe {
+                    self.device.vk().destroy_buffer(staging_buffer, None);
+                }
+                return Err(Error::ImageError(ImageError::VulkanAllocate(err)));
+            }
+        };
+
+        if let Err(err) = unsafe {
+            self.device
+                .vk()
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+        } {
+            unsafe {
+                self.device.vk().destroy_buffer(staging_buffer, None);
+                self.device.vk().free_memory(staging_memory, None);
+            }
+            return Err(Error::ImageError(ImageError::VulkanBind(err)));
+        }
+
+        self.cleanup()?;
+        let buf = self.cmd_pool.create_and_begin_buffer()?;
+
+        let qfam = self.device.queue_family_idx();
+        let ext_queue = self.external_queue_family();
+        let tex_needs_acquire = image.needs_acquire() && image.dmabuf_exportable();
+        let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
+            (ext_queue, qfam)
+        } else {
+            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
+        };
+
+        let old_layout = image.current_layout();
+        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else {
+            (
+                PipelineStageFlags2::ALL_TRANSFER
+                    | PipelineStageFlags2::COMPUTE_SHADER
+                    | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::TRANSFER_WRITE
+                    | AccessFlags2::SHADER_STORAGE_WRITE
+                    | AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+        };
+
+        let img_barrier = ImageMemoryBarrier2::default()
+            .image(*image.vk())
+            .old_layout(old_layout)
+            .new_layout(ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_queue_family_index(tex_src_queue)
+            .dst_queue_family_index(tex_dst_queue)
+            .src_stage_mask(tex_src_stage)
+            .src_access_mask(tex_src_access)
+            .dst_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
+            .dst_access_mask(AccessFlags2::TRANSFER_READ)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        unsafe {
+            self.device.vk().cmd_pipeline_barrier2(
+                buf,
+                &DependencyInfo::default().image_memory_barriers(&[img_barrier]),
+            );
+        }
+
+        image.set_needs_acquire(false);
+
+        let copy_region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(copy_width)
+            .buffer_image_height(copy_height)
+            .image_subresource(
+                ImageSubresourceLayers::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_offset(Offset3D {
+                x: offset_x,
+                y: offset_y,
+                z: 0,
+            })
+            .image_extent(Extent3D {
+                width: copy_width,
+                height: copy_height,
+                depth: 1,
+            });
+
+        unsafe {
+            self.device.vk().cmd_copy_image_to_buffer(
+                buf,
+                *image.vk(),
+                ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging_buffer,
+                &[copy_region],
+            );
+        }
+
+        let restore_layout = if old_layout == ImageLayout::UNDEFINED {
+            ImageLayout::GENERAL
+        } else {
+            old_layout
+        };
+        let restore_barrier = ImageMemoryBarrier2::default()
+            .image(*image.vk())
+            .old_layout(ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(restore_layout)
+            .src_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
+            .src_access_mask(AccessFlags2::TRANSFER_READ)
+            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE)
+            .subresource_range(
+                ImageSubresourceRange::default()
+                    .aspect_mask(ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1),
+            );
+
+        unsafe {
+            self.device.vk().cmd_pipeline_barrier2(
+                buf,
+                &DependencyInfo::default().image_memory_barriers(&[restore_barrier]),
+            );
+            self.device
+                .vk()
+                .end_command_buffer(buf)
+                .map_err(Error::CommandBufferError)?;
+        }
+        image.set_current_layout(restore_layout);
+
+        let cmd_buffer_info = [CommandBufferSubmitInfo::default().command_buffer(buf)];
+        let next_seq_no = self.seq_no + 1;
+        let prev_seq_no = self.seq_no;
+
+        let signal_semaphore_info = [SemaphoreSubmitInfo::default()
+            .semaphore(self.timeline.vk)
+            .value(next_seq_no)
+            .stage_mask(PipelineStageFlags2::ALL_TRANSFER)];
+
+        let wait_semaphore_info = if prev_seq_no > 0 {
+            vec![
+                SemaphoreSubmitInfo::default()
+                    .semaphore(self.timeline.vk)
+                    .value(prev_seq_no)
+                    .stage_mask(PipelineStageFlags2::ALL_TRANSFER),
+            ]
+        } else {
+            Vec::new()
+        };
+
+        if self.batch_submits {
+            self.queued_submits.push(QueuedSubmit {
+                cmd_buffer: buf,
+                cmd_buffer_infos: cmd_buffer_info.to_vec(),
+                signal_semaphore_infos: signal_semaphore_info.to_vec(),
+                wait_semaphore_infos: wait_semaphore_info,
+                point: next_seq_no,
+                descs: Vec::new(),
+                images: vec![image.inner.clone()],
+            });
+        } else {
+            let submit_info = SubmitInfo2::default()
+                .command_buffer_infos(&cmd_buffer_info)
+                .signal_semaphore_infos(&signal_semaphore_info)
+                .wait_semaphore_infos(&wait_semaphore_info);
+
+            let submit_res = unsafe {
+                self.device
+                    .vk()
+                    .queue_submit2(*self.device.queue(), &[submit_info], Fence::null())
+            };
+
+            if let Err(err) = submit_res {
+                if err == vk::Result::ERROR_DEVICE_LOST {
+                    return Err(Error::DeadDevice);
+                } else {
+                    return Err(Error::SubmitError(err));
+                }
+            }
+
+            self.cmd_pool
+                .store_pending_buffer(buf, next_seq_no, vec![], vec![image.inner.clone()]);
+        }
+
+        self.seq_no = next_seq_no;
+
+        Ok(PendingVulkanShmCopy {
+            device: self.device.vk().clone(),
+            staging_buffer,
+            staging_memory,
+            buffer_size,
+            is_coherent,
+            timeline_sem: self.timeline.vk,
+            point: next_seq_no,
+            width: copy_width,
+            height: copy_height,
+            bpp,
+        })
     }
 }
 
@@ -2871,28 +3345,6 @@ impl Frame for VulkanFrame<'_, '_> {
             }
         }
 
-        let submit_info = SubmitInfo2::default()
-            .command_buffer_infos(&cmd_buffer_info)
-            .signal_semaphore_infos(&signal_semaphore_info)
-            .wait_semaphore_infos(&wait_semaphore_info);
-
-        let submit_res = unsafe {
-            self.renderer.device.vk().queue_submit2(
-                *self.renderer.device.queue(),
-                &[submit_info],
-                Fence::null(),
-            )
-        };
-
-        if let Err(err) = submit_res {
-            self.cmd_buffer = Some(buf);
-            if err == vk::Result::ERROR_DEVICE_LOST {
-                return Err(Error::DeadDevice);
-            } else {
-                return Err(Error::SubmitError(err));
-            }
-        }
-
         self.renderer.seq_no = next_seq_no;
 
         let point = next_seq_no;
@@ -2901,11 +3353,47 @@ impl Frame for VulkanFrame<'_, '_> {
         if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
             images.push(self.fb.0.inner.clone());
         }
-        self.renderer
-            .cmd_pool
-            .store_pending_buffer(buf, point, descs, images);
 
-        trace!(point, "VulkanFrame::finish single command buffer submitted");
+        if self.renderer.batch_submits {
+            self.renderer.queued_submits.push(QueuedSubmit {
+                cmd_buffer: buf,
+                cmd_buffer_infos: cmd_buffer_info.to_vec(),
+                signal_semaphore_infos: signal_semaphore_info.to_vec(),
+                wait_semaphore_infos: wait_semaphore_info,
+                point,
+                descs,
+                images,
+            });
+            trace!(point, "VulkanFrame::finish command buffer queued in batch");
+        } else {
+            let submit_info = SubmitInfo2::default()
+                .command_buffer_infos(&cmd_buffer_info)
+                .signal_semaphore_infos(&signal_semaphore_info)
+                .wait_semaphore_infos(&wait_semaphore_info);
+
+            let submit_res = unsafe {
+                self.renderer.device.vk().queue_submit2(
+                    *self.renderer.device.queue(),
+                    &[submit_info],
+                    Fence::null(),
+                )
+            };
+
+            if let Err(err) = submit_res {
+                self.cmd_buffer = Some(buf);
+                if err == vk::Result::ERROR_DEVICE_LOST {
+                    return Err(Error::DeadDevice);
+                } else {
+                    return Err(Error::SubmitError(err));
+                }
+            }
+
+            self.renderer
+                .cmd_pool
+                .store_pending_buffer(buf, point, descs, images);
+
+            trace!(point, "VulkanFrame::finish single command buffer submitted");
+        }
 
         if let Some(timeline) = self.renderer.timeline.drm.as_ref() {
             Ok(DrmSyncPoint {
