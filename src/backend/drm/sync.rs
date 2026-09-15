@@ -76,6 +76,12 @@ impl PartialEq for DrmTimeline {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+impl Eq for DrmTimeline {}
+impl std::hash::Hash for DrmTimeline {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
 
 impl DrmTimeline {
     /// Import DRM timeline from file descriptor
@@ -106,6 +112,11 @@ impl DrmTimeline {
         WeakDrmTimeline(Arc::downgrade(&self.0))
     }
 
+    /// Borrow the underlying DRM timeline file descriptor.
+    pub fn timeline_fd(&self) -> BorrowedFd<'_> {
+        self.0.timeline_fd.as_fd()
+    }
+
     pub(crate) fn update_device(&self, device: &DrmDeviceFd) -> io::Result<()> {
         let mut ctx = self.0.dev_ctx.lock().unwrap();
         let mut new = DrmTimelineDeviceSpecific::import(self.0.timeline_fd.as_fd(), device)?;
@@ -123,6 +134,18 @@ impl DrmTimeline {
 
     pub(crate) fn invalidate(&self) {
         self.0.dev_ctx.lock().unwrap().invalidate()
+    }
+}
+
+impl PartialEq for WeakDrmTimeline {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for WeakDrmTimeline {}
+impl std::hash::Hash for WeakDrmTimeline {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Weak::as_ptr(&self.0).hash(state);
     }
 }
 
@@ -144,6 +167,11 @@ impl DrmSyncPoint {
     /// Borrow the [`DrmTimeline`] this point lives on.
     pub fn timeline(&self) -> &DrmTimeline {
         &self.timeline
+    }
+
+    /// Borrow the underlying DRM timeline file descriptor.
+    pub fn timeline_fd(&self) -> BorrowedFd<'_> {
+        self.timeline.timeline_fd()
     }
 
     /// Numeric timeline value for this point.

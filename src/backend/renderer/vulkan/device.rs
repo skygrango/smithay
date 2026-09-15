@@ -1,4 +1,4 @@
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use crate::backend::{
     drm::{DrmDeviceFd, sync::DrmTimeline},
@@ -8,7 +8,7 @@ use crate::backend::{
 use ash::{
     khr,
     vk::{
-        CommandPoolCreateFlags, CommandPoolCreateInfo, ExportSemaphoreCreateInfo,
+        self, CommandPoolCreateFlags, CommandPoolCreateInfo, ExportSemaphoreCreateInfo,
         ExternalSemaphoreHandleTypeFlags, SemaphoreCreateInfo, SemaphoreGetFdInfoKHR, SemaphoreType,
         SemaphoreTypeCreateInfo,
     },
@@ -62,6 +62,55 @@ impl Device {
             vk: semaphore,
             drm,
         })
+    }
+
+    pub(super) fn import_timeline_semaphore(
+        &self,
+        timeline_fd: BorrowedFd<'_>,
+    ) -> Result<vk::Semaphore, Error> {
+        let Some(khr_external_semaphore_fd) = self.vk_khr_external_semaphore_fd() else {
+            return Err(Error::MissingExtension(khr::external_semaphore_fd::NAME));
+        };
+
+        let mut semaphore_type_info = SemaphoreTypeCreateInfo::default()
+            .semaphore_type(SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let mut semaphore_export_info =
+            ExportSemaphoreCreateInfo::default().handle_types(ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+
+        let semaphore_create_info = SemaphoreCreateInfo::default()
+            .push_next(&mut semaphore_type_info)
+            .push_next(&mut semaphore_export_info);
+
+        let semaphore = unsafe {
+            self.vk()
+                .create_semaphore(&semaphore_create_info, None)
+                .map_err(Error::SemaphoreError)?
+        };
+
+        let dup_fd = match rustix::io::dup(timeline_fd) {
+            Ok(fd) => fd,
+            Err(_) => {
+                unsafe { self.vk().destroy_semaphore(semaphore, None) };
+                return Err(Error::SemaphoreImportError(
+                    vk::Result::ERROR_INITIALIZATION_FAILED,
+                ));
+            }
+        };
+
+        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+            .fd(dup_fd.into_raw_fd());
+
+        let res = unsafe { khr_external_semaphore_fd.import_semaphore_fd(&import_info) };
+
+        if let Err(err) = res {
+            unsafe { self.vk().destroy_semaphore(semaphore, None) };
+            return Err(Error::SemaphoreImportError(err));
+        }
+
+        Ok(semaphore)
     }
 
     pub(super) fn create_command_pool(&self) -> Result<CommandPool, Error> {

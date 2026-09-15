@@ -26,7 +26,27 @@ pub struct VulkanSuballocator {
 unsafe impl Send for VulkanSuballocator {}
 unsafe impl Sync for VulkanSuballocator {}
 
-const DEFAULT_BLOCK_SIZE: vk::DeviceSize = 8 * 1024 * 1024; // 8 MB
+const TIER_1_SIZE: vk::DeviceSize = 8 * 1024 * 1024; // 8 MB
+const TIER_2_SIZE: vk::DeviceSize = 32 * 1024 * 1024; // 32 MB
+const TIER_3_SIZE: vk::DeviceSize = 64 * 1024 * 1024; // 64 MB
+
+#[inline]
+fn select_tier_block_size(size: vk::DeviceSize) -> vk::DeviceSize {
+    if size <= TIER_1_SIZE {
+        TIER_1_SIZE
+    } else if size <= TIER_2_SIZE {
+        TIER_2_SIZE
+    } else if size <= TIER_3_SIZE {
+        TIER_3_SIZE
+    } else {
+        (size + TIER_2_SIZE - 1) & !(TIER_2_SIZE - 1)
+    }
+}
+
+#[inline]
+fn is_tiered_size(size: vk::DeviceSize) -> bool {
+    size == TIER_1_SIZE || size == TIER_2_SIZE || size == TIER_3_SIZE
+}
 
 impl VulkanSuballocator {
     pub unsafe fn allocate(
@@ -78,8 +98,8 @@ impl VulkanSuballocator {
             }
         }
 
-        // Need to allocate a new block. Try DEFAULT_BLOCK_SIZE first, fall back to exact size on OOM
-        let block_size = DEFAULT_BLOCK_SIZE.max(size);
+        // Need to allocate a new block. Select tiered block size first, fall back to exact size on OOM
+        let block_size = select_tier_block_size(size);
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(block_size)
             .memory_type_index(memory_type_index);
@@ -166,16 +186,22 @@ impl VulkanSuballocator {
             }
         }
 
-        // If an entire block is free, free it back to Vulkan if it's fallback/oversized or extra
+        // If an entire block is free, retain up to 2 empty tiered blocks as hot cache
         if let Some(idx) = empty_block_idx {
             let block = &self.blocks[idx];
             let mem_type = block.memory_type_index;
-            let count_same_type = self
+            let empty_count_same_type = self
                 .blocks
                 .iter()
-                .filter(|b| b.memory_type_index == mem_type)
+                .filter(|b| {
+                    b.memory_type_index == mem_type
+                        && b.free_chunks.len() == 1
+                        && b.free_chunks[0].size == b.total_size
+                })
                 .count();
-            if block.total_size != DEFAULT_BLOCK_SIZE || count_same_type > 1 {
+
+            let keep_as_cache = is_tiered_size(block.total_size) && empty_count_same_type <= 2;
+            if !keep_as_cache {
                 let removed = self.blocks.swap_remove(idx);
                 unsafe {
                     if removed.mapped_base.is_some() {

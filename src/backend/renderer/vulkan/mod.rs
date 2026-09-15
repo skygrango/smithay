@@ -7,7 +7,10 @@ use crate::{
             dmabuf::{Dmabuf, WeakDmabuf},
             format::FormatSet,
         },
-        drm::{DrmDeviceFd, sync::DrmSyncPoint},
+        drm::{
+            DrmDeviceFd,
+            sync::{DrmSyncPoint, DrmTimeline, WeakDrmTimeline},
+        },
         renderer::{
             Bind, ContextId, ExportMem, Frame, ImportDma, ImportMem, Renderer, RendererSuper, Texture,
             TextureMapping,
@@ -28,11 +31,10 @@ use crate::{
 use ash::vk::{
     self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyInfo, DescriptorImageInfo,
     DescriptorType, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags,
-    ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange, ImageToMemoryCopyEXT,
-    MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint,
-    PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags,
-    SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags,
-    SubmitInfo2,
+    ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange, MemoryMapFlags,
+    MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint, PipelineStageFlags2,
+    QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags, SamplerCreateInfo,
+    SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags, SubmitInfo2,
 };
 use gbm::Modifier;
 use indexmap::IndexSet;
@@ -91,6 +93,7 @@ pub struct VulkanRenderer {
     pipelines: Pipelines,
     cmd_pool: cmds::CommandPool,
     texture_sampler: vk::Sampler,
+    texture_sampler_nearest: vk::Sampler,
     pub(crate) lut3d: Option<Lut3dTexture>,
 
     seq_no: u64,
@@ -102,6 +105,9 @@ pub struct VulkanRenderer {
     upscale_filter: super::TextureFilter,
     pub(crate) hdr_config: Option<HdrOutputConfig>,
     pub(crate) supports_optimal_host_copy: bool,
+
+    imported_timelines: HashMap<WeakDrmTimeline, vk::Semaphore>,
+    pending_waits: Vec<DrmSyncPoint>,
 
     // A bunch of the previous structs contain Weak-device references.
     // So we want to drop this last for proper cleanup and avoiding accidental
@@ -120,6 +126,12 @@ impl Drop for VulkanRenderer {
                 lut.destroy(&self.device);
             }
             self.device.vk().destroy_sampler(self.texture_sampler, None);
+            self.device
+                .vk()
+                .destroy_sampler(self.texture_sampler_nearest, None);
+            for (_, sem) in self.imported_timelines.drain() {
+                self.device.vk().destroy_semaphore(sem, None);
+            }
         }
     }
 }
@@ -156,6 +168,8 @@ pub enum Error {
     SemaphoreCounterError(#[source] VkResult),
     #[error("Failed to export semaphore fd: `{0:?}`")]
     SemaphoreExportError(#[source] VkResult),
+    #[error("Failed to import semaphore fd: `{0:?}`")]
+    SemaphoreImportError(#[source] VkResult),
     #[error("Failed to submit command buffer")]
     SubmitError(#[source] VkResult),
     #[error("Error intefacing with the underlying drm device")]
@@ -263,8 +277,34 @@ impl VulkanRenderer {
                 .create_sampler(
                     &SamplerCreateInfo::default()
                         .flags(SamplerCreateFlags::empty())
-                        .mag_filter(Filter::LINEAR) // TODO
+                        .mag_filter(Filter::LINEAR)
                         .min_filter(Filter::LINEAR)
+                        .mipmap_mode(SamplerMipmapMode::NEAREST)
+                        .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .mip_lod_bias(0.0)
+                        .anisotropy_enable(false)
+                        .max_anisotropy(0.0)
+                        .compare_enable(false)
+                        .compare_op(CompareOp::NEVER)
+                        .min_lod(0.0)
+                        .max_lod(0.0)
+                        .border_color(BorderColor::FLOAT_TRANSPARENT_BLACK)
+                        .unnormalized_coordinates(false),
+                    None,
+                )
+                .map_err(Error::SamplerError)?
+        };
+
+        let sampler_nearest = unsafe {
+            device
+                .vk()
+                .create_sampler(
+                    &SamplerCreateInfo::default()
+                        .flags(SamplerCreateFlags::empty())
+                        .mag_filter(Filter::NEAREST)
+                        .min_filter(Filter::NEAREST)
                         .mipmap_mode(SamplerMipmapMode::NEAREST)
                         .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
                         .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
@@ -323,6 +363,9 @@ impl VulkanRenderer {
             pipelines,
             cmd_pool,
             texture_sampler: sampler,
+            texture_sampler_nearest: sampler_nearest,
+            imported_timelines: HashMap::new(),
+            pending_waits: Vec::new(),
             lut3d,
             seq_no: 0,
             node,
@@ -418,6 +461,14 @@ impl VulkanRenderer {
         self.node
     }
 
+    pub fn drm_timeline(&self) -> Option<&DrmTimeline> {
+        self.timeline.drm.as_ref()
+    }
+
+    pub fn timeline_semaphore(&self) -> vk::Semaphore {
+        self.timeline.vk
+    }
+
     pub fn cleanup(&mut self) -> Result<(), Error> {
         let val = match unsafe { self.device.vk().get_semaphore_counter_value(self.timeline.vk) } {
             Ok(val) => val,
@@ -425,7 +476,40 @@ impl VulkanRenderer {
             Err(err) => return Err(Error::SemaphoreCounterError(err)),
         };
         self.cmd_pool.clean_old_buffers(val);
+        self.imported_timelines.retain(|weak, sem| {
+            if weak.upgrade().is_none() {
+                unsafe { self.device.vk().destroy_semaphore(*sem, None) };
+                false
+            } else {
+                true
+            }
+        });
         Ok(())
+    }
+
+    pub fn active_sampler(&self, is_downscaling: bool) -> vk::Sampler {
+        let filter = if is_downscaling {
+            self.downscale_filter
+        } else {
+            self.upscale_filter
+        };
+        match filter {
+            super::TextureFilter::Linear => self.texture_sampler,
+            super::TextureFilter::Nearest => self.texture_sampler_nearest,
+        }
+    }
+
+    pub(super) fn get_or_import_timeline_semaphore(
+        &mut self,
+        timeline: &DrmTimeline,
+    ) -> Result<vk::Semaphore, Error> {
+        let weak = timeline.downgrade();
+        if let Some(&sem) = self.imported_timelines.get(&weak) {
+            return Ok(sem);
+        }
+        let sem = self.device.import_timeline_semaphore(timeline.timeline_fd())?;
+        self.imported_timelines.insert(weak, sem);
+        Ok(sem)
     }
 
     fn upload_host_memory_to_image(
@@ -615,6 +699,7 @@ impl Renderer for VulkanRenderer {
     where
         'buffer: 'frame,
     {
+        let pending_waits = std::mem::take(&mut self.pending_waits);
         Ok(VulkanFrame {
             renderer: self,
             fb: framebuffer,
@@ -633,11 +718,12 @@ impl Renderer for VulkanRenderer {
             current_depth: 0.0,
             depth_image: None,
             pending_clears: Vec::new(),
+            pending_waits,
         })
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
-        if let Some(drm_sync) = sync.get::<crate::backend::drm::sync::DrmSyncPoint>() {
+        if let Some(drm_sync) = sync.get::<DrmSyncPoint>() {
             if let Some(timeline) = self.timeline.drm.as_ref() {
                 if timeline == drm_sync.timeline() {
                     // On Vulkan, all submissions on this renderer queue already wait on the
@@ -647,6 +733,8 @@ impl Renderer for VulkanRenderer {
                     return Ok(());
                 }
             }
+            self.pending_waits.push(drm_sync.clone());
+            return Ok(());
         }
         while let Err(super::sync::Interrupted) = sync.wait() {}
         Ok(())
@@ -1508,6 +1596,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     pub(crate) current_depth: f32,
     pub(crate) depth_image: Option<VulkanImage>,
     pub(crate) pending_clears: Vec<(Color32F, Vec<vk::ClearRect>)>,
+    pub(crate) pending_waits: Vec<DrmSyncPoint>,
 }
 
 impl VulkanFrame<'_, '_> {
@@ -1691,17 +1780,42 @@ impl VulkanFrame<'_, '_> {
             .set_current_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         self.fb.0.set_needs_acquire(false);
 
-        let view = self.fb.0.vk_view().unwrap();
-        let color_attachment = vk::RenderingAttachmentInfo::default()
-            .image_view(*view)
-            .image_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE);
-
         let fb_width = self.fb.0.width();
         let fb_height = self.fb.0.height();
         let render_width = (self.size.w as u32).min(fb_width);
         let render_height = (self.size.h as u32).min(fb_height);
+
+        let mut load_op = if fb_old_layout == ImageLayout::UNDEFINED {
+            vk::AttachmentLoadOp::DONT_CARE
+        } else {
+            vk::AttachmentLoadOp::LOAD
+        };
+        let mut clear_color_val = vk::ClearColorValue::default();
+
+        if let Some(pos) = self.pending_clears.iter().position(|(_, rects)| {
+            rects.len() == 1
+                && rects[0].rect.offset.x == 0
+                && rects[0].rect.offset.y == 0
+                && rects[0].rect.extent.width == render_width
+                && rects[0].rect.extent.height == render_height
+        }) {
+            let (color, _) = self.pending_clears.remove(pos);
+            load_op = vk::AttachmentLoadOp::CLEAR;
+            clear_color_val = vk::ClearColorValue {
+                float32: color.components(),
+            };
+            self.has_draws = true;
+        }
+
+        let view = self.fb.0.vk_view().unwrap();
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(*view)
+            .image_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .clear_value(vk::ClearValue {
+                color: clear_color_val,
+            })
+            .store_op(vk::AttachmentStoreOp::STORE);
 
         let color_attachments = [color_attachment];
         let mut rendering_info = vk::RenderingInfo::default()
@@ -2258,10 +2372,12 @@ impl Frame for VulkanFrame<'_, '_> {
         let view = texture
             .vk_view()
             .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
+        let is_downscaling = (dst.size.w as f64) < src.size.w || (dst.size.h as f64) < src.size.h;
+        let sampler = self.renderer.active_sampler(is_downscaling);
         let tex_image_info = [DescriptorImageInfo::default()
             .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(*view)
-            .sampler(self.renderer.texture_sampler)];
+            .sampler(sampler)];
 
         let lut3d_view = self
             .renderer
@@ -2592,6 +2708,15 @@ impl Frame for VulkanFrame<'_, '_> {
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
+        if let Some(drm_sync) = sync.get::<DrmSyncPoint>() {
+            if let Some(timeline) = self.renderer.timeline.drm.as_ref() {
+                if timeline == drm_sync.timeline() {
+                    return Ok(());
+                }
+            }
+            self.pending_waits.push(drm_sync.clone());
+            return Ok(());
+        }
         self.renderer.wait(sync)
     }
 
@@ -2670,7 +2795,7 @@ impl Frame for VulkanFrame<'_, '_> {
             .value(next_seq_no)
             .stage_mask(PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT | PipelineStageFlags2::ALL_TRANSFER)];
 
-        let wait_semaphore_info = if prev_seq_no > 0 {
+        let mut wait_semaphore_info = if prev_seq_no > 0 {
             vec![
                 SemaphoreSubmitInfo::default()
                     .semaphore(self.renderer.timeline.vk)
@@ -2684,6 +2809,45 @@ impl Frame for VulkanFrame<'_, '_> {
         } else {
             Vec::new()
         };
+
+        let mut max_points: HashMap<DrmTimeline, u64> = HashMap::new();
+        for sync in self.pending_waits.drain(..) {
+            max_points
+                .entry(sync.timeline.clone())
+                .and_modify(|p| *p = (*p).max(sync.point))
+                .or_insert(sync.point);
+        }
+
+        for (timeline, point) in max_points {
+            match self.renderer.get_or_import_timeline_semaphore(&timeline) {
+                Ok(vk_sem) => {
+                    wait_semaphore_info.push(
+                        SemaphoreSubmitInfo::default()
+                            .semaphore(vk_sem)
+                            .value(point)
+                            .stage_mask(
+                                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                                    | PipelineStageFlags2::FRAGMENT_SHADER
+                                    | PipelineStageFlags2::ALL_TRANSFER,
+                            ),
+                    );
+                }
+                Err(err) => {
+                    let is_signaled = timeline
+                        .query_signalled_point()
+                        .map(|p| p >= point)
+                        .unwrap_or(false);
+                    if !is_signaled {
+                        tracing::warn!(
+                            "Failed to import client timeline semaphore, falling back to CPU wait: {:?}",
+                            err
+                        );
+                        // Wait up to 100ms instead of hanging the renderer thread indefinitely
+                        let _ = DrmSyncPoint { timeline, point }.wait(100_000_000);
+                    }
+                }
+            }
+        }
 
         let submit_info = SubmitInfo2::default()
             .command_buffer_infos(&cmd_buffer_info)
@@ -2763,9 +2927,14 @@ impl Blit for VulkanRenderer {
         to: &mut Self::Framebuffer<'_>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
-        _filter: TextureFilter,
+        filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
         let size = Size::from((Texture::width(&to.0) as i32, Texture::height(&to.0) as i32));
+        let saved_downscale = self.downscale_filter;
+        let saved_upscale = self.upscale_filter;
+        self.downscale_filter = filter;
+        self.upscale_filter = filter;
+        let pending_waits = std::mem::take(&mut self.pending_waits);
         let mut frame = VulkanFrame {
             renderer: self,
             fb: to,
@@ -2784,13 +2953,15 @@ impl Blit for VulkanRenderer {
             current_depth: 0.0,
             depth_image: None,
             pending_clears: Vec::new(),
+            pending_waits,
         };
-        if frame.can_copy_image(&from.0, src, dst) {
+        let res = if frame.can_copy_image(&from.0, src, dst) {
             frame.copy_image_from_to(&from.0, src, dst)?;
+            frame.finish()
         } else {
-            let src_rect = Rectangle::from_loc_and_size(
-                (src.loc.x as f64, src.loc.y as f64),
-                (src.size.w as f64, src.size.h as f64),
+            let src_rect = Rectangle::new(
+                Point::from((src.loc.x as f64, src.loc.y as f64)),
+                Size::from((src.size.w as f64, src.size.h as f64)),
             );
             frame.render_texture_from_to(
                 &from.0,
@@ -2801,8 +2972,11 @@ impl Blit for VulkanRenderer {
                 Transform::Normal,
                 1.0,
             )?;
-        }
-        frame.finish()
+            frame.finish()
+        };
+        self.downscale_filter = saved_downscale;
+        self.upscale_filter = saved_upscale;
+        res
     }
 }
 
