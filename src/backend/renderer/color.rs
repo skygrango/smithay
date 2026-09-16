@@ -130,11 +130,16 @@ impl HdrOutputConfig {
 
     /// Create an SDR output configuration with HDR surface tone-mapping enabled.
     pub fn sdr_tonemapping() -> Self {
+        Self::sdr_tonemapping_with_reference(203.0)
+    }
+
+    /// Create an SDR output configuration with HDR surface tone-mapping enabled and custom reference white.
+    pub fn sdr_tonemapping_with_reference(reference_white: f32) -> Self {
         Self {
-            reference_white: 203.0,
+            reference_white,
             sdr_gamma: 0.0, // standard piecewise sRGB
             gamut_stretch: 0.0,
-            max_luminance: 203.0,
+            max_luminance: reference_white,
             hardware_offload: false,
             is_sdr: true,
         }
@@ -266,4 +271,18 @@ pub fn sdr_color_to_hdr(
 /// Helper function to transform an sRGB color using standard defaults (Gamma 2.2).
 pub fn srgb_color_to_pq(color: Color32F, reference_white: f32) -> Color32F {
     sdr_color_to_pq(color, reference_white, 2.2, 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sdr_tonemapping_with_reference() {
+        let config = HdrOutputConfig::sdr_tonemapping_with_reference(350.0);
+        assert_eq!(config.reference_white, 350.0);
+        assert_eq!(config.max_luminance, 350.0);
+        assert!(config.is_sdr);
+        assert_eq!(config.sdr_gamma, 0.0);
+    }
 }

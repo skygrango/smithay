@@ -841,6 +841,20 @@ where
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error>;
+
+    /// Copies and converts the contents of `src` from an HDR framebuffer to `dst` in an SDR framebuffer,
+    /// applying PQ to SDR tonemapping, gamut conversion, and transfer function encoding based on `config`.
+    fn blit_hdr_to_sdr(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        _config: &HdrOutputConfig,
+    ) -> Result<SyncPoint, Self::Error> {
+        self.blit(from, to, src, dst, filter)
+    }
 }
 
 /// Trait for frames supporting blitting contents from/to the current framebuffer to/from another.

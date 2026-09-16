@@ -640,6 +640,18 @@ impl VulkanRenderer {
         self.hdr_config
     }
 
+    pub fn blit_hdr_to_sdr(
+        &mut self,
+        from: &<Self as RendererSuper>::Framebuffer<'_>,
+        to: &mut <Self as RendererSuper>::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        config: &HdrOutputConfig,
+    ) -> Result<SyncPoint, Error> {
+        Blit::blit_hdr_to_sdr(self, from, to, src, dst, filter, config)
+    }
+
     pub fn node(&self) -> Option<DrmNode> {
         self.node
     }
@@ -902,6 +914,7 @@ impl Renderer for VulkanRenderer {
             depth_image: None,
             pending_clears: Vec::new(),
             pending_waits,
+            hdr_to_sdr: None,
         })
     }
 
@@ -2051,6 +2064,17 @@ pub(crate) fn calculate_damage_scissors(
         .collect()
 }
 
+/// Helper function to check if a Vulkan format represents an HDR format (10-bit or FP16).
+pub fn is_hdr_vk_format(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::A2B10G10R10_UNORM_PACK32
+            | vk::Format::A2R10G10B10_UNORM_PACK32
+            | vk::Format::R16G16B16A16_SFLOAT
+            | vk::Format::R16G16B16A16_UNORM
+    )
+}
+
 pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
     fb: &'frame mut VulkanFramebuffer,
@@ -2071,6 +2095,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     pub(crate) depth_image: Option<VulkanImage>,
     pub(crate) pending_clears: Vec<(Color32F, Vec<vk::ClearRect>)>,
     pub(crate) pending_waits: Vec<DrmSyncPoint>,
+    pub(crate) hdr_to_sdr: Option<HdrOutputConfig>,
 }
 
 impl VulkanFrame<'_, '_> {
@@ -2771,13 +2796,13 @@ impl Frame for VulkanFrame<'_, '_> {
         let untransformed_dst = dst;
         let dst = self.transform.transform_rect_in(dst, &self.size);
 
-        // Use the HDR shader pipeline whenever hdr_config is present (even with is_sdr=true).
-        // When is_sdr=true, target_is_sdr=1 makes the shader output sRGB-encoded values, which is
-        // what consumers like OBS expect. With the old logic (!c.is_sdr), setting is_sdr=true
-        // caused the pipeline to use the raw non-HDR passthrough, copying PQ-encoded framebuffer
-        // data directly into the screencopy buffer without any sRGB conversion — causing washed-out
-        // images in OBS.
-        let is_hdr = !self.is_blit && self.renderer.hdr_config.is_some();
+        // Use the HDR shader pipeline whenever hdr_config is present (even with is_sdr=true),
+        // or when explicitly performing an HDR-to-SDR blit.
+        let is_hdr = if self.hdr_to_sdr.is_some() {
+            true
+        } else {
+            !self.is_blit && self.renderer.hdr_config.is_some()
+        };
         self.has_draws = true;
         if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
             self.images.push(texture.inner.clone());
@@ -2965,33 +2990,55 @@ impl Frame for VulkanFrame<'_, '_> {
         };
 
         let (layout, pipeline, hdr_push_constants) = if is_hdr {
-            let config =
-                self.renderer
-                    .hdr_config
-                    .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
-                        reference_white: 203.0,
-                        max_luminance: 1000.0,
-                        sdr_gamma: 2.2,
-                        gamut_stretch: 0.0,
-                        hardware_offload: false,
-                        is_sdr: false,
-                    });
+            let (config, is_hdr_to_sdr) = if let Some(ref blit_cfg) = self.hdr_to_sdr {
+                (*blit_cfg, true)
+            } else {
+                (
+                    self.renderer
+                        .hdr_config
+                        .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
+                            reference_white: 203.0,
+                            max_luminance: 1000.0,
+                            sdr_gamma: 2.2,
+                            gamut_stretch: 0.0,
+                            hardware_offload: false,
+                            is_sdr: false,
+                        }),
+                    false,
+                )
+            };
             let mut reference_white = config.reference_white;
             let mut sdr_gamma = config.sdr_gamma;
             let mut gamut_stretch = config.gamut_stretch;
-            let mut max_content_luminance = config.reference_white;
-            let max_destination_luminance = config.max_luminance;
-            let hardware_offload = config.hardware_offload as u32;
-            let target_is_sdr = config.is_sdr as u32;
+            let mut max_content_luminance = if is_hdr_to_sdr {
+                config.max_luminance
+            } else {
+                config.reference_white
+            };
+            let max_destination_luminance = if is_hdr_to_sdr {
+                config.reference_white
+            } else {
+                config.max_luminance
+            };
+            let hardware_offload = if is_hdr_to_sdr {
+                0u32
+            } else {
+                config.hardware_offload as u32
+            };
+            let target_is_sdr = if is_hdr_to_sdr || !is_hdr_vk_format(self.fb.0.format()) {
+                1u32
+            } else {
+                config.is_sdr as u32
+            };
 
-            let mut input_is_pq = 0u32;
+            let mut input_is_pq = if is_hdr_to_sdr { 1u32 } else { 0u32 };
             let mut input_is_hlg = 0u32;
-            let mut input_primaries = 0u32;
+            let mut input_primaries = if is_hdr_to_sdr { 2u32 } else { 0u32 };
             let mut skip_color_transform = 0u32;
-            let mut content_reference = 203.0f32;
+            let mut content_reference = config.reference_white;
 
             #[cfg(feature = "wayland_frontend")]
-            if let Some(desc) = self.active_color_description.as_ref() {
+            if !is_hdr_to_sdr && let Some(desc) = self.active_color_description.as_ref() {
                 use crate::wayland::color::management::{Primaries, TransferFunction};
                 if desc.is_pq_bt2020() {
                     input_is_pq = 1;
@@ -3046,7 +3093,7 @@ impl Frame for VulkanFrame<'_, '_> {
                         skip_color_transform = 1;
                     }
                 }
-            } else {
+            } else if !is_hdr_to_sdr {
                 if config.is_sdr && sdr_gamma == 0.0 {
                     skip_color_transform = 1;
                 }
@@ -3079,9 +3126,9 @@ impl Frame for VulkanFrame<'_, '_> {
             let chosen_pipeline = if should_blend {
                 if skip_color_transform != 0 {
                     format_pipelines.hdr_passthrough_blend_pipeline
-                } else if input_is_pq != 0 {
+                } else if input_is_pq != 0 && target_is_sdr == 0 {
                     format_pipelines.hdr_pq_blend_pipeline
-                } else if input_is_hlg == 0 && input_primaries == 0 {
+                } else if input_is_hlg == 0 && input_primaries == 0 && target_is_sdr == 0 {
                     format_pipelines.hdr_sdr_blend_pipeline
                 } else {
                     format_pipelines.hdr_tex_blend_pipeline
@@ -3089,9 +3136,9 @@ impl Frame for VulkanFrame<'_, '_> {
             } else {
                 if skip_color_transform != 0 {
                     format_pipelines.hdr_passthrough_pipeline
-                } else if input_is_pq != 0 {
+                } else if input_is_pq != 0 && target_is_sdr == 0 {
                     format_pipelines.hdr_pq_pipeline
-                } else if input_is_hlg == 0 && input_primaries == 0 {
+                } else if input_is_hlg == 0 && input_primaries == 0 && target_is_sdr == 0 {
                     format_pipelines.hdr_sdr_pipeline
                 } else {
                     format_pipelines.hdr_tex_pipeline
@@ -3439,6 +3486,15 @@ impl Blit for VulkanRenderer {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
+        let is_to_hdr = is_hdr_vk_format(to.0.format());
+        let is_from_hdr = is_hdr_vk_format(from.0.format());
+        let is_hdr_mode = self.hdr_config.as_ref().map(|c| !c.is_sdr).unwrap_or(false);
+
+        if !is_to_hdr && (is_from_hdr || is_hdr_mode) {
+            let config = self.hdr_config.unwrap_or_else(HdrOutputConfig::default);
+            return self.blit_hdr_to_sdr(from, to, src, dst, filter, &config);
+        }
+
         let size = Size::from((Texture::width(&to.0) as i32, Texture::height(&to.0) as i32));
         let saved_downscale = self.downscale_filter;
         let saved_upscale = self.upscale_filter;
@@ -3464,6 +3520,7 @@ impl Blit for VulkanRenderer {
             depth_image: None,
             pending_clears: Vec::new(),
             pending_waits,
+            hdr_to_sdr: None,
         };
         let res = if frame.can_copy_image(&from.0, src, dst) {
             frame.copy_image_from_to(&from.0, src, dst)?;
@@ -3484,6 +3541,68 @@ impl Blit for VulkanRenderer {
             )?;
             frame.finish()
         };
+        self.downscale_filter = saved_downscale;
+        self.upscale_filter = saved_upscale;
+        res
+    }
+
+    fn blit_hdr_to_sdr(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        config: &HdrOutputConfig,
+    ) -> Result<SyncPoint, Self::Error> {
+        tracing::debug!(
+            from_format = ?from.0.format(),
+            to_format = ?to.0.format(),
+            ref_white = config.reference_white,
+            max_lum = config.max_luminance,
+            "blit_hdr_to_sdr: performing PQ to SDR tonemapping with custom color parameters"
+        );
+        let size = Size::from((Texture::width(&to.0) as i32, Texture::height(&to.0) as i32));
+        let saved_downscale = self.downscale_filter;
+        let saved_upscale = self.upscale_filter;
+        self.downscale_filter = filter;
+        self.upscale_filter = filter;
+        let pending_waits = std::mem::take(&mut self.pending_waits);
+        let mut frame = VulkanFrame {
+            renderer: self,
+            fb: to,
+            _marker: std::marker::PhantomData,
+            transform: Transform::Normal,
+            size,
+            cmd_buffer: None,
+            descriptors: Vec::with_capacity(4),
+            images: Vec::with_capacity(4),
+            has_draws: false,
+            #[cfg(feature = "wayland_frontend")]
+            active_color_description: None,
+            is_blit: true,
+            rendering: false,
+            depth_enabled: false,
+            current_depth: 0.0,
+            depth_image: None,
+            pending_clears: Vec::new(),
+            pending_waits,
+            hdr_to_sdr: Some(*config),
+        };
+        let src_rect = Rectangle::new(
+            Point::from((src.loc.x as f64, src.loc.y as f64)),
+            Size::from((src.size.w as f64, src.size.h as f64)),
+        );
+        frame.render_texture_from_to(
+            &from.0,
+            src_rect,
+            dst,
+            &[Rectangle::from_size(dst.size)],
+            &[],
+            Transform::Normal,
+            1.0,
+        )?;
+        let res = frame.finish();
         self.downscale_filter = saved_downscale;
         self.upscale_filter = saved_upscale;
         res
@@ -3915,5 +4034,16 @@ mod test {
         assert_eq!(align_of::<HdrTexPushConstants>(), 16);
         assert_eq!(size_of::<HdrTexPushConstants>(), 112);
         assert!(size_of::<HdrTexPushConstants>() <= 128);
+    }
+
+    #[test]
+    fn test_is_hdr_vk_format() {
+        assert!(is_hdr_vk_format(vk::Format::A2B10G10R10_UNORM_PACK32));
+        assert!(is_hdr_vk_format(vk::Format::A2R10G10B10_UNORM_PACK32));
+        assert!(is_hdr_vk_format(vk::Format::R16G16B16A16_SFLOAT));
+        assert!(is_hdr_vk_format(vk::Format::R16G16B16A16_UNORM));
+        assert!(!is_hdr_vk_format(vk::Format::B8G8R8A8_UNORM));
+        assert!(!is_hdr_vk_format(vk::Format::R8G8B8A8_UNORM));
+        assert!(!is_hdr_vk_format(vk::Format::B8G8R8A8_SRGB));
     }
 }
