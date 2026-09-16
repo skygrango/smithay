@@ -932,6 +932,11 @@ impl Renderer for VulkanRenderer {
             self.pending_waits.push(drm_sync.clone());
             return Ok(());
         }
+        if let Some(vk_sync) = sync.get::<VulkanSyncPoint>() {
+            if self.timeline == vk_sync.timeline {
+                return Ok(());
+            }
+        }
         while let Err(super::sync::Interrupted) = sync.wait() {}
         Ok(())
     }
@@ -3449,16 +3454,11 @@ impl Frame for VulkanFrame<'_, '_> {
             }
             .into())
         } else {
-            // TODO: vulkan syncpoint
-            while let Err(VkResult::TIMEOUT) = unsafe {
-                self.renderer.device.vk().wait_semaphores(
-                    &SemaphoreWaitInfo::default()
-                        .semaphores(&[self.renderer.timeline.vk])
-                        .values(&[point]),
-                    u64::MAX,
-                )
-            } {}
-            Ok(SyncPoint::signaled())
+            Ok(VulkanSyncPoint {
+                timeline: self.renderer.timeline.clone(),
+                point,
+            }
+            .into())
         }
     }
 }

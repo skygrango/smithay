@@ -57,11 +57,7 @@ impl Device {
             None
         };
 
-        Ok(VulkanTimeline {
-            device: self.downgrade(),
-            vk: semaphore,
-            drm,
-        })
+        Ok(VulkanTimeline::new(self.downgrade(), semaphore, drm))
     }
 
     pub(super) fn import_timeline_semaphore(
