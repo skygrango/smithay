@@ -3523,7 +3523,7 @@ impl Blit for VulkanRenderer {
         let is_from_hdr = is_hdr_vk_format(from.0.format());
         let is_hdr_mode = self.hdr_config.as_ref().map(|c| !c.is_sdr).unwrap_or(false);
 
-        if !is_to_hdr && (is_from_hdr || is_hdr_mode) {
+        if !is_to_hdr && is_from_hdr && is_hdr_mode {
             let config = self.hdr_config.unwrap_or_else(HdrOutputConfig::default);
             return self.blit_hdr_to_sdr(from, to, src, dst, filter, &config);
         }
@@ -4055,5 +4055,40 @@ mod test {
         assert!(!is_hdr_vk_format(vk::Format::B8G8R8A8_UNORM));
         assert!(!is_hdr_vk_format(vk::Format::R8G8B8A8_UNORM));
         assert!(!is_hdr_vk_format(vk::Format::B8G8R8A8_SRGB));
+    }
+
+    #[test]
+    fn test_blit_hdr_to_sdr_condition() {
+        use crate::backend::renderer::color::HdrOutputConfig;
+
+        let check_needs_hdr_to_sdr =
+            |from_fmt: vk::Format, to_fmt: vk::Format, hdr_cfg: Option<HdrOutputConfig>| -> bool {
+                let is_to_hdr = is_hdr_vk_format(to_fmt);
+                let is_from_hdr = is_hdr_vk_format(from_fmt);
+                let is_hdr_mode = hdr_cfg.as_ref().map(|c| !c.is_sdr).unwrap_or(false);
+                !is_to_hdr && is_from_hdr && is_hdr_mode
+            };
+
+        let sdr_10bit = vk::Format::A2B10G10R10_UNORM_PACK32;
+        let sdr_8bit = vk::Format::R8G8B8A8_UNORM;
+        let hdr_fp16 = vk::Format::R16G16B16A16_SFLOAT;
+
+        let sdr_config = Some(HdrOutputConfig::sdr_tonemapping());
+        let hdr_config = Some(HdrOutputConfig::default());
+
+        // 1. SDR screen with 10-bit swapchain copied to 8-bit OBS buffer -> must NOT trigger HDR-to-SDR
+        assert!(!check_needs_hdr_to_sdr(sdr_10bit, sdr_8bit, sdr_config));
+
+        // 2. SDR screen with no hdr_config -> must NOT trigger HDR-to-SDR
+        assert!(!check_needs_hdr_to_sdr(sdr_10bit, sdr_8bit, None));
+
+        // 3. HDR screen with 10-bit swapchain copied to 8-bit OBS buffer -> MUST trigger HDR-to-SDR
+        assert!(check_needs_hdr_to_sdr(sdr_10bit, sdr_8bit, hdr_config));
+
+        // 4. HDR screen with FP16 swapchain copied to 8-bit OBS buffer -> MUST trigger HDR-to-SDR
+        assert!(check_needs_hdr_to_sdr(hdr_fp16, sdr_8bit, hdr_config));
+
+        // 5. HDR screen copied to HDR 10-bit capture buffer -> must NOT trigger HDR-to-SDR (passthrough)
+        assert!(!check_needs_hdr_to_sdr(sdr_10bit, sdr_10bit, hdr_config));
     }
 }
