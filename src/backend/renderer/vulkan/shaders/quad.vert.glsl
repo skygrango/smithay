@@ -1,4 +1,5 @@
 #version 450
+#extension GL_ARB_shader_draw_parameters : enable
 
 layout(location = 0) out vec2 v_pos;
 
@@ -23,5 +24,9 @@ void main() {
     v_pos = pos;
     vec2 pixelPos = params.dstRect.xy + pos * params.dstRect.zw;
     vec2 ndc = (pixelPos / params.screenSize) * 2.0 - 1.0;
-    gl_Position = vec4(ndc, params.depth, 1.0);
+    float depthOffset = 0.0;
+#ifdef GL_ARB_shader_draw_parameters
+    depthOffset = float(gl_BaseInstanceARB) * 0.0 + float(gl_DrawIDARB) * 0.0;
+#endif
+    gl_Position = vec4(ndc, params.depth + depthOffset, 1.0);
 }

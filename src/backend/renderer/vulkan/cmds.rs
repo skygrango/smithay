@@ -91,6 +91,10 @@ impl CommandPool {
 
         self.recycled_buffers.extend(completed);
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending_buffers.is_empty()
+    }
 }
 
 impl Drop for CommandPool {

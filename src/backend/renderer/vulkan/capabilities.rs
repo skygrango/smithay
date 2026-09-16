@@ -15,6 +15,9 @@ use ash::{
 
 use crate::backend::vulkan::{PhysicalDevice, version::Version};
 
+pub const EXT_DESCRIPTOR_INDEXING: &CStr = c"VK_EXT_descriptor_indexing";
+pub const KHR_SHADER_DRAW_PARAMETERS: &CStr = c"VK_KHR_shader_draw_parameters";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     DmabufMemory,
@@ -24,6 +27,9 @@ pub enum Capability {
     PushDescriptor,
     MemoryBudget,
     DynamicRendering,
+    DescriptorIndexing,
+    MultiDrawIndirect,
+    ShaderDrawParameters,
 }
 
 pub struct Features {
@@ -63,11 +69,24 @@ impl Features {
         features
     }
 
+    pub fn multi_draw_indirect(&self) -> bool {
+        self.features.features.multi_draw_indirect == 1
+    }
+
+    pub fn shader_draw_parameters(&self) -> bool {
+        self.features_11.shader_draw_parameters == 1
+    }
+
+    pub fn descriptor_indexing(&self) -> bool {
+        self.features_12.descriptor_indexing == 1 || self.features_12.runtime_descriptor_array == 1
+    }
+
     pub fn required_features() -> Pin<Box<Self>> {
         let mut features = Self::new(&Version::VERSION_1_3);
 
         {
             let features = unsafe { features.as_mut().get_unchecked_mut() };
+            // Core synchronization and dynamic rendering
             features.features_12.timeline_semaphore = 1;
             features.features_ext_host_image_copy.host_image_copy = 1;
             features
@@ -82,6 +101,24 @@ impl Features {
                 features_13.synchronization2 = 1;
                 features_13.dynamic_rendering = 1;
             }
+
+            // Vulkan 1.0 multiDrawIndirect
+            features.features.features.multi_draw_indirect = 1;
+
+            // Vulkan 1.1 shaderDrawParameters
+            features.features_11.shader_draw_parameters = 1;
+
+            // Vulkan 1.2 Descriptor Indexing (VK_EXT_descriptor_indexing)
+            features.features_12.descriptor_indexing = 1;
+            features
+                .features_12
+                .shader_sampled_image_array_non_uniform_indexing = 1;
+            features
+                .features_12
+                .descriptor_binding_sampled_image_update_after_bind = 1;
+            features.features_12.descriptor_binding_partially_bound = 1;
+            features.features_12.descriptor_binding_variable_descriptor_count = 1;
+            features.features_12.runtime_descriptor_array = 1;
         }
 
         features
@@ -224,6 +261,25 @@ impl Capability {
         Some(Capability::DmabufMemory)
     }
 
+    pub fn supports_descriptor_indexing(phd: &PhysicalDevice) -> Option<Capability> {
+        let features = Features::supported_features(phd);
+        let supported = features.descriptor_indexing() || phd.has_device_extension(EXT_DESCRIPTOR_INDEXING);
+        supported.then_some(Capability::DescriptorIndexing)
+    }
+
+    pub fn supports_multi_draw_indirect(phd: &PhysicalDevice) -> Option<Capability> {
+        let features = Features::supported_features(phd);
+        features
+            .multi_draw_indirect()
+            .then_some(Capability::MultiDrawIndirect)
+    }
+
+    pub fn supports_shader_draw_parameters(phd: &PhysicalDevice) -> Option<Capability> {
+        let features = Features::supported_features(phd);
+        (features.shader_draw_parameters() || phd.has_device_extension(KHR_SHADER_DRAW_PARAMETERS))
+            .then_some(Capability::ShaderDrawParameters)
+    }
+
     pub fn as_extensions(caps: &[Capability]) -> Vec<&CStr> {
         caps.iter()
             .flat_map(|cap| match cap {
@@ -238,8 +294,36 @@ impl Capability {
                 Capability::PushDescriptor => &[khr::push_descriptor::NAME],
                 Capability::MemoryBudget => &[ext::memory_budget::NAME],
                 Capability::DynamicRendering => &[] as &'static [&CStr],
+                Capability::DescriptorIndexing => &[] as &'static [&CStr],
+                Capability::MultiDrawIndirect => &[] as &'static [&CStr],
+                Capability::ShaderDrawParameters => &[] as &'static [&CStr],
             })
             .copied()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::vulkan::Instance;
+
+    #[test]
+    fn test_device_features_support() {
+        if let Ok(instance) = Instance::new(Version::VERSION_1_3, None) {
+            if let Ok(phds) = PhysicalDevice::enumerate(&instance) {
+                for phd in phds {
+                    let features = Features::supported_features(&phd);
+                    println!("Device: {}", phd.name());
+                    println!("  multi_draw_indirect: {}", features.multi_draw_indirect());
+                    println!("  shader_draw_parameters: {}", features.shader_draw_parameters());
+                    println!("  descriptor_indexing: {}", features.descriptor_indexing());
+                    println!(
+                        "  runtime_descriptor_array: {}",
+                        features.features_12.runtime_descriptor_array
+                    );
+                }
+            }
+        }
     }
 }

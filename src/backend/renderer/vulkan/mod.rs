@@ -30,11 +30,12 @@ use crate::{
 
 use ash::vk::{
     self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyInfo, DescriptorImageInfo,
-    DescriptorType, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags,
-    ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange, MemoryMapFlags,
-    MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint, PipelineStageFlags2,
-    QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags, SamplerCreateInfo,
-    SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags, SubmitInfo2,
+    DescriptorType, DrawIndirectCommand, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT,
+    ImageAspectFlags, ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange,
+    MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint,
+    PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags,
+    SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags,
+    SubmitInfo2,
 };
 use gbm::Modifier;
 use indexmap::IndexSet;
@@ -49,10 +50,12 @@ mod capabilities;
 mod cmds;
 mod device;
 mod image;
+pub mod indirect;
 mod shaders;
 mod sync;
 
 pub use self::capabilities::*;
+pub use self::indirect::*;
 pub use self::shaders::Error as PipelineError;
 use self::shaders::Pipelines;
 pub use self::sync::*;
@@ -223,6 +226,11 @@ pub struct VulkanRenderer {
     upscale_filter: super::TextureFilter,
     pub(crate) hdr_config: Option<HdrOutputConfig>,
     pub(crate) supports_optimal_host_copy: bool,
+    pub(crate) supports_descriptor_indexing: bool,
+    pub(crate) supports_multi_draw_indirect: bool,
+    pub(crate) supports_shader_draw_parameters: bool,
+    pub(crate) indirect_buffer: Option<DrawIndirectBuffer>,
+    pub(crate) bindless_pool: Option<BindlessDescriptorPool>,
     pub(crate) batch_submits: bool,
     pub(crate) queued_submits: Vec<QueuedSubmit>,
 
@@ -283,6 +291,10 @@ pub enum Error {
     PipelineError(#[from] PipelineError),
     #[error("Failed to create vulkan command pool")]
     CommandPoolError(#[source] VkResult),
+    #[error("Failed to allocate indirect buffer: `{0:?}`")]
+    IndirectBufferError(#[source] VkResult),
+    #[error("Failed to create descriptor pool: `{0:?}`")]
+    DescriptorPoolError(#[source] VkResult),
     #[error("Failed to create vulkan command buffer")]
     CommandBufferError(#[source] VkResult),
     #[error("Failed to create an image sampler")]
@@ -369,6 +381,9 @@ impl VulkanRenderer {
         capabilities.extend(Capability::supports_push_descriptor(phd));
         capabilities.extend(Capability::supports_memory_budget(phd));
         capabilities.extend(Capability::supports_dynamic_rendering(phd));
+        capabilities.extend(Capability::supports_descriptor_indexing(phd));
+        capabilities.extend(Capability::supports_multi_draw_indirect(phd));
+        capabilities.extend(Capability::supports_shader_draw_parameters(phd));
 
         // Get extensions
         let extensions = Capability::as_extensions(&capabilities);
@@ -480,6 +495,48 @@ impl VulkanRenderer {
         // Trilinear 3D LUT is disabled in favor of analytical HDR precision / tetrahedral interpolation
         let lut3d = None;
 
+        let supports_descriptor_indexing = capabilities.contains(&Capability::DescriptorIndexing);
+        let supports_multi_draw_indirect = capabilities.contains(&Capability::MultiDrawIndirect);
+        let supports_shader_draw_parameters = capabilities.contains(&Capability::ShaderDrawParameters);
+
+        let indirect_buffer = if supports_multi_draw_indirect {
+            match DrawIndirectBuffer::new(&device, DrawIndirectBuffer::DEFAULT_CAPACITY) {
+                Ok(buf) => {
+                    tracing::debug!(
+                        "Vulkan DrawIndirectBuffer initialized for multi-draw indirect dispatches"
+                    );
+                    Some(buf)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "Failed to initialize Vulkan DrawIndirectBuffer, falling back to direct draw"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let bindless_pool = if supports_descriptor_indexing {
+            match BindlessDescriptorPool::new(&device, BindlessDescriptorPool::DEFAULT_MAX_TEXTURES) {
+                Ok(pool) => {
+                    tracing::debug!("Vulkan BindlessDescriptorPool initialized for descriptor indexing");
+                    Some(pool)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "Failed to initialize Vulkan BindlessDescriptorPool, falling back to standard descriptors"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(VulkanRenderer {
             phd: phd.clone(),
             device,
@@ -500,9 +557,49 @@ impl VulkanRenderer {
             upscale_filter: super::TextureFilter::Linear,
             hdr_config: None,
             supports_optimal_host_copy,
+            supports_descriptor_indexing,
+            supports_multi_draw_indirect,
+            supports_shader_draw_parameters,
+            indirect_buffer,
+            bindless_pool,
             batch_submits: false,
             queued_submits: Vec::new(),
         })
+    }
+
+    /// Whether this renderer supports descriptor indexing (bindless texture arrays).
+    pub fn supports_descriptor_indexing(&self) -> bool {
+        self.supports_descriptor_indexing
+    }
+
+    /// Whether this renderer supports multi-draw indirect (`vkCmdDrawIndirect` with count > 1).
+    pub fn supports_multi_draw_indirect(&self) -> bool {
+        self.supports_multi_draw_indirect
+    }
+
+    /// Whether this renderer supports shader draw parameters (`gl_DrawID` in vertex shaders).
+    pub fn supports_shader_draw_parameters(&self) -> bool {
+        self.supports_shader_draw_parameters
+    }
+
+    /// Underlying draw indirect buffer, if supported and initialized.
+    pub fn indirect_buffer(&self) -> Option<&DrawIndirectBuffer> {
+        self.indirect_buffer.as_ref()
+    }
+
+    /// Underlying mutable draw indirect buffer, if supported and initialized.
+    pub fn indirect_buffer_mut(&mut self) -> Option<&mut DrawIndirectBuffer> {
+        self.indirect_buffer.as_mut()
+    }
+
+    /// Underlying bindless descriptor pool, if supported and initialized.
+    pub fn bindless_pool(&self) -> Option<&BindlessDescriptorPool> {
+        self.bindless_pool.as_ref()
+    }
+
+    /// Underlying mutable bindless descriptor pool, if supported and initialized.
+    pub fn bindless_pool_mut(&mut self) -> Option<&mut BindlessDescriptorPool> {
+        self.bindless_pool.as_mut()
     }
 
     pub fn begin_batch(&mut self) {
@@ -671,6 +768,11 @@ impl VulkanRenderer {
             Err(err) => return Err(Error::SemaphoreCounterError(err)),
         };
         self.cmd_pool.clean_old_buffers(val);
+        if self.cmd_pool.is_empty() {
+            if let Some(ref mut ib) = self.indirect_buffer {
+                ib.reset();
+            }
+        }
         self.imported_timelines.retain(|weak, sem| {
             if weak.upgrade().is_none() {
                 unsafe { self.device.vk().destroy_semaphore(*sem, None) };
@@ -2132,6 +2234,96 @@ impl VulkanFrame<'_, '_> {
         self.current_depth
     }
 
+    /// Issues an indirect multi-draw command using `vkCmdDrawIndirect`.
+    pub fn cmd_draw_indirect(
+        &mut self,
+        indirect_buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        draw_count: u32,
+        stride: u32,
+    ) -> Result<(), Error> {
+        if draw_count == 0 {
+            return Ok(());
+        }
+        let buf = self.ensure_rendering()?;
+        self.has_draws = true;
+        unsafe {
+            self.renderer
+                .device
+                .vk()
+                .cmd_draw_indirect(buf, indirect_buffer, offset, draw_count, stride);
+        }
+        Ok(())
+    }
+
+    /// Renders quads through multi-draw indirect buffer when supported, falling back to direct draw.
+    pub(crate) fn draw_quads(&mut self, buf: vk::CommandBuffer, scissors: &[vk::Rect2D]) {
+        if scissors.is_empty() {
+            return;
+        }
+
+        if self.renderer.supports_multi_draw_indirect {
+            if let Some(indirect_buf) = self.renderer.indirect_buffer.as_mut() {
+                if scissors.len() == 1 {
+                    unsafe {
+                        self.renderer.device.vk().cmd_set_scissor(buf, 0, &scissors[..1]);
+                    }
+                    let cmd = DrawIndirectCommand {
+                        vertex_count: 6,
+                        instance_count: 1,
+                        first_vertex: 0,
+                        first_instance: 0,
+                    };
+                    if let Ok(offset) = indirect_buf.push(cmd) {
+                        unsafe {
+                            self.renderer.device.vk().cmd_draw_indirect(
+                                buf,
+                                indirect_buf.buffer(),
+                                offset,
+                                1,
+                                indirect_buf.stride(),
+                            );
+                        }
+                        return;
+                    }
+                } else {
+                    let cmds: Vec<DrawIndirectCommand> = (0..scissors.len())
+                        .map(|idx| DrawIndirectCommand {
+                            vertex_count: 6,
+                            instance_count: 1,
+                            first_vertex: 0,
+                            first_instance: idx as u32,
+                        })
+                        .collect();
+
+                    if let Ok(base_offset) = indirect_buf.write_commands(&cmds) {
+                        let stride = indirect_buf.stride() as vk::DeviceSize;
+                        for (i, scissor) in scissors.iter().enumerate() {
+                            unsafe {
+                                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[*scissor]);
+                                self.renderer.device.vk().cmd_draw_indirect(
+                                    buf,
+                                    indirect_buf.buffer(),
+                                    base_offset + (i as vk::DeviceSize * stride),
+                                    1,
+                                    indirect_buf.stride(),
+                                );
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        for scissor in scissors {
+            unsafe {
+                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[*scissor]);
+                self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
+            }
+        }
+    }
+
     /// Batches layout transitions and queue family acquires for a collection of textures into a single
     /// pipeline barrier, avoiding breaking dynamic rendering passes mid-frame.
     pub fn prepare_textures<'a, I>(&mut self, textures: I) -> Result<(), Error>
@@ -2930,6 +3122,13 @@ impl Frame for VulkanFrame<'_, '_> {
             .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
         let is_downscaling = (dst.size.w as f64) < src.size.w || (dst.size.h as f64) < src.size.h;
         let sampler = self.renderer.active_sampler(is_downscaling);
+
+        if self.renderer.supports_descriptor_indexing {
+            if let Some(ref bindless) = self.renderer.bindless_pool {
+                let _ = bindless.update_texture(0, *view, sampler);
+            }
+        }
+
         let tex_image_info = [DescriptorImageInfo::default()
             .image_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(*view)
@@ -3264,12 +3463,7 @@ impl Frame for VulkanFrame<'_, '_> {
             self.fb.height(),
         );
 
-        for scissor in scissors {
-            unsafe {
-                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
-                self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
-            }
-        }
+        self.draw_quads(buf, &scissors);
 
         if let Some(descriptor) = descriptor {
             self.descriptors.push(descriptor);
@@ -3753,12 +3947,7 @@ impl VulkanFrame<'_, '_> {
             self.fb.height(),
         );
 
-        for scissor in scissors {
-            unsafe {
-                self.renderer.device.vk().cmd_set_scissor(buf, 0, &[scissor]);
-                self.renderer.device.vk().cmd_draw(buf, 6, 1, 0, 0);
-            }
-        }
+        self.draw_quads(buf, &scissors);
 
         Ok(())
     }
@@ -4090,5 +4279,91 @@ mod test {
 
         // 5. HDR screen copied to HDR 10-bit capture buffer -> must NOT trigger HDR-to-SDR (passthrough)
         assert!(!check_needs_hdr_to_sdr(sdr_10bit, sdr_10bit, hdr_config));
+    }
+
+    #[test]
+    fn test_render_frame_with_indirect_draw_and_bindless() {
+        let Ok(instance) = crate::backend::vulkan::Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+        let Ok(phds) = PhysicalDevice::enumerate(&instance) else {
+            return;
+        };
+
+        for phd in phds {
+            let Ok(mut renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+
+            assert!(renderer.supports_multi_draw_indirect());
+            assert!(renderer.supports_shader_draw_parameters());
+            assert!(renderer.supports_descriptor_indexing());
+            assert!(renderer.indirect_buffer().is_some());
+            assert!(renderer.bindless_pool().is_some());
+
+            // 1. Create a color render target framebuffer image
+            let mut target = VulkanImage::new(
+                &renderer.device,
+                128,
+                128,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                false,
+            )
+            .expect("Failed to create target VulkanImage");
+
+            // 2. Create a source texture image to render
+            let src_tex = VulkanImage::new(
+                &renderer.device,
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::SAMPLED,
+                false,
+            )
+            .expect("Failed to create src VulkanImage");
+
+            // 3. Bind renderer to the target framebuffer and render
+            use crate::backend::renderer::{Frame, Renderer};
+            let dst_rect = Rectangle::new((0, 0).into(), (128, 128).into());
+            let damage = [Rectangle::new((0, 0).into(), (64, 64).into())];
+
+            let mut fb = renderer.bind(&mut target).expect("Failed to bind framebuffer");
+            let mut frame = renderer
+                .render(&mut fb, (128, 128).into(), Transform::Normal)
+                .expect("Failed to create frame");
+
+            // Execute draw_solid (which calls draw_color -> draw_quads via DrawIndirectBuffer)
+            frame
+                .draw_solid(dst_rect, &damage, Color32F::new(0.2, 0.4, 0.8, 1.0))
+                .expect("draw_solid failed");
+
+            // Execute render_texture_from_to (which updates bindless descriptor pool and calls draw_quads)
+            let src_rect = Rectangle::new(Point::new(0.0, 0.0), Size::new(64.0, 64.0));
+            frame
+                .render_texture_from_to(&src_tex, src_rect, dst_rect, &damage, &[], Transform::Normal, 1.0)
+                .expect("render_texture_from_to failed");
+
+            let sync = frame.finish().expect("VulkanFrame::finish failed");
+            drop(sync);
+
+            // Verify indirect commands were written into the DrawIndirectBuffer
+            let indirect_buf = renderer.indirect_buffer().expect("indirect_buffer should exist");
+            assert!(
+                indirect_buf.len() > 0,
+                "indirect_buffer should contain written DrawIndirectCommands"
+            );
+
+            // Wait idle and cleanup
+            unsafe {
+                let _ = renderer.device.vk().device_wait_idle();
+            }
+            renderer.cleanup().expect("cleanup failed");
+            assert_eq!(
+                renderer.indirect_buffer().unwrap().len(),
+                0,
+                "indirect_buffer len should reset after cleanup"
+            );
+        }
     }
 }
