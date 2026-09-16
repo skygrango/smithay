@@ -1401,10 +1401,19 @@ impl VulkanRenderer {
         let old_layout = image.current_layout();
         let (tex_src_stage, tex_src_access) = if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else if old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
         } else {
             (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
+                PipelineStageFlags2::ALL_TRANSFER
+                    | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                    | PipelineStageFlags2::COMPUTE_SHADER,
+                AccessFlags2::TRANSFER_WRITE
+                    | AccessFlags2::COLOR_ATTACHMENT_WRITE
+                    | AccessFlags2::SHADER_STORAGE_WRITE,
             )
         };
 
@@ -2164,9 +2173,11 @@ impl VulkanFrame<'_, '_> {
                         (
                             PipelineStageFlags2::COMPUTE_SHADER
                                 | PipelineStageFlags2::ALL_TRANSFER
+                                | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
                                 | PipelineStageFlags2::HOST,
                             AccessFlags2::SHADER_STORAGE_WRITE
                                 | AccessFlags2::TRANSFER_WRITE
+                                | AccessFlags2::COLOR_ATTACHMENT_WRITE
                                 | AccessFlags2::HOST_WRITE,
                         )
                     };
@@ -2509,10 +2520,15 @@ impl VulkanFrame<'_, '_> {
         let fb_old_layout = self.fb.0.current_layout();
         let (fb_src_stage, fb_src_access) = if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else if fb_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
         } else {
             (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::TRANSFER_WRITE | AccessFlags2::COLOR_ATTACHMENT_WRITE,
             )
         };
 
@@ -2527,12 +2543,22 @@ impl VulkanFrame<'_, '_> {
         let (tex_src_stage, tex_src_access) = if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED
         {
             (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        } else if tex_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+        } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            (
+                PipelineStageFlags2::FRAGMENT_SHADER,
+                AccessFlags2::SHADER_SAMPLED_READ,
+            )
         } else {
             (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
+                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 AccessFlags2::TRANSFER_READ
-                    | AccessFlags2::SHADER_STORAGE_READ
-                    | AccessFlags2::SHADER_STORAGE_WRITE,
+                    | AccessFlags2::TRANSFER_WRITE
+                    | AccessFlags2::COLOR_ATTACHMENT_WRITE,
             )
         };
 
@@ -2625,13 +2651,13 @@ impl VulkanFrame<'_, '_> {
         let fb_post_barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
             .old_layout(ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(ImageLayout::GENERAL)
+            .new_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .src_queue_family_index(QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
             .src_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
             .src_access_mask(AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(PipelineStageFlags2::COMPUTE_SHADER | PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::NONE)
+            .dst_stage_mask(PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(AccessFlags2::COLOR_ATTACHMENT_READ | AccessFlags2::COLOR_ATTACHMENT_WRITE)
             .subresource_range(
                 ImageSubresourceRange::default()
                     .aspect_mask(ImageAspectFlags::COLOR)
@@ -2640,7 +2666,7 @@ impl VulkanFrame<'_, '_> {
             );
 
         let tex_restore_layout = if tex_old_layout == ImageLayout::UNDEFINED {
-            ImageLayout::GENERAL
+            ImageLayout::SHADER_READ_ONLY_OPTIMAL
         } else {
             tex_old_layout
         };
@@ -2668,7 +2694,9 @@ impl VulkanFrame<'_, '_> {
             );
         }
 
-        self.fb.0.set_current_layout(ImageLayout::GENERAL);
+        self.fb
+            .0
+            .set_current_layout(ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
         texture.set_current_layout(tex_restore_layout);
 
         self.images.push(texture.inner.clone());
@@ -2843,9 +2871,11 @@ impl Frame for VulkanFrame<'_, '_> {
                     (
                         PipelineStageFlags2::COMPUTE_SHADER
                             | PipelineStageFlags2::ALL_TRANSFER
+                            | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
                             | PipelineStageFlags2::HOST,
                         AccessFlags2::SHADER_STORAGE_WRITE
                             | AccessFlags2::TRANSFER_WRITE
+                            | AccessFlags2::COLOR_ATTACHMENT_WRITE
                             | AccessFlags2::HOST_WRITE,
                     )
                 };
@@ -3297,16 +3327,19 @@ impl Frame for VulkanFrame<'_, '_> {
                 AccessFlags2::COLOR_ATTACHMENT_WRITE,
             )
         } else {
-            (
-                PipelineStageFlags2::COMPUTE_SHADER | PipelineStageFlags2::ALL_TRANSFER,
-                AccessFlags2::SHADER_STORAGE_WRITE | AccessFlags2::TRANSFER_WRITE,
-            )
+            (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_WRITE)
         };
+
+        // For scanout release to ext_queue (VK_QUEUE_FAMILY_FOREIGN_EXT or VK_QUEUE_FAMILY_EXTERNAL),
+        // keep current_layout (e.g. COLOR_ATTACHMENT_OPTIMAL) instead of GENERAL.
+        // This avoids forcing an unnecessary DCC decompress pass in the driver and allows
+        // direct compressed scanout by DCN/KMS.
+        let new_layout = current_layout;
 
         let barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
             .old_layout(current_layout)
-            .new_layout(ImageLayout::GENERAL)
+            .new_layout(new_layout)
             .src_queue_family_index(qfam)
             .dst_queue_family_index(ext_queue)
             .src_stage_mask(src_stage)
@@ -3784,7 +3817,6 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
         size: Size<i32, BufferCoords>,
     ) -> Result<VulkanImage, Self::Error> {
         let mut usage = ImageUsageFlags::COLOR_ATTACHMENT
-            | ImageUsageFlags::STORAGE
             | ImageUsageFlags::TRANSFER_SRC
             | ImageUsageFlags::TRANSFER_DST
             | ImageUsageFlags::SAMPLED;
@@ -3835,8 +3867,7 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
         use crate::backend::allocator::Buffer as AllocBuffer;
-        tracing::debug!(
-            format = ?AllocBuffer::format(target),
+        trace!(
             width = AllocBuffer::width(target),
             height = AllocBuffer::height(target),
             modifier = ?target.format().modifier,
@@ -3845,39 +3876,18 @@ impl Bind<Dmabuf> for VulkanRenderer {
         let image = match self.dmabuf_cache.get(&target.weak()) {
             Some(image) if image.vk_usage().contains(ImageUsageFlags::TRANSFER_DST) => image.clone(),
             _ => {
-                let res = VulkanImage::new_from_dmabuf(
+                let image = VulkanImage::new_from_dmabuf(
                     &self.device,
                     target,
                     ImageUsageFlags::COLOR_ATTACHMENT
-                        | ImageUsageFlags::STORAGE
                         | ImageUsageFlags::TRANSFER_SRC
                         | ImageUsageFlags::TRANSFER_DST
                         | ImageUsageFlags::SAMPLED,
-                );
-                let image = match res {
-                    Ok(img) => img,
-                    Err(err) => {
-                        tracing::warn!(
-                            "VulkanRenderer::bind dmabuf with STORAGE failed ({:?}), retrying with COLOR_ATTACHMENT/TRANSFER",
-                            err
-                        );
-                        VulkanImage::new_from_dmabuf(
-                            &self.device,
-                            target,
-                            ImageUsageFlags::COLOR_ATTACHMENT
-                                | ImageUsageFlags::TRANSFER_SRC
-                                | ImageUsageFlags::TRANSFER_DST
-                                | ImageUsageFlags::SAMPLED,
-                        )
-                        .map_err(|e| {
-                            tracing::error!(
-                                "VulkanRenderer::bind dmabuf failed: initial error: {:?}, fallback error: {:?}",
-                                err, e
-                            );
-                            Error::ImageError(e)
-                        })?
-                    }
-                };
+                )
+                .map_err(|err| {
+                    tracing::error!("VulkanRenderer::bind dmabuf failed: {:?}", err);
+                    Error::ImageError(err)
+                })?;
                 self.dmabuf_cache.insert(target.weak(), image.clone());
                 image
             }
