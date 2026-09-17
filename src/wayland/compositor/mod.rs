@@ -800,6 +800,14 @@ impl CompositorState {
     pub fn subcompositor_global(&self) -> GlobalId {
         self.subcompositor.clone()
     }
+
+    /// Iterates over all alive surfaces known to the compositor.
+    pub fn for_each_surface(&mut self, mut f: impl FnMut(&WlSurface)) {
+        self.surfaces.retain(|s| s.is_alive());
+        for surface in &self.surfaces {
+            f(surface);
+        }
+    }
 }
 
 #[cfg(test)]

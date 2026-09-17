@@ -411,6 +411,12 @@ impl RendererSurfaceState {
         self.color_description = None;
         self.render_intent = RenderIntent::Perceptual;
     }
+
+    /// Clears all cached renderer textures for this surface.
+    pub fn clear_textures(&mut self) {
+        self.textures.clear();
+        self.renderer_seen.clear();
+    }
 }
 
 /// Handler to let smithay take over buffer management.

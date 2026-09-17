@@ -5,7 +5,6 @@ use ash::vk::{self, ImageTiling, MemoryPropertyFlags};
 #[cfg(feature = "backend_drm")]
 use drm::node::DrmNode;
 
-use super::device::WeakDevice;
 use crate::backend::{
     allocator::{Buffer, Format, Fourcc, Modifier, dmabuf::Dmabuf, format::has_alpha},
     vulkan::{Device, format::component_mapping_for_format},
@@ -271,7 +270,7 @@ impl VulkanImage {
             suballocated: false,
             allocation_size: 0,
             persistent_mapping: std::sync::Mutex::new(None),
-            device: device.downgrade(),
+            device: device.clone(),
             view: None,
             current_layout: std::sync::atomic::AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
             needs_acquire: std::sync::atomic::AtomicBool::new(true),
@@ -729,7 +728,7 @@ pub(crate) struct ImageInner {
     pub(crate) suballocated: bool,
     pub(crate) allocation_size: vk::DeviceSize,
     pub(crate) persistent_mapping: std::sync::Mutex<Option<MappedPointer>>,
-    pub(crate) device: WeakDevice,
+    pub(crate) device: Device,
     pub(crate) view: Option<vk::ImageView>,
     pub(crate) current_layout: std::sync::atomic::AtomicI32,
     pub(crate) needs_acquire: std::sync::atomic::AtomicBool,
@@ -749,8 +748,7 @@ impl ImageInner {
             return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
         }
 
-        let device = self.device.upgrade().ok_or(vk::Result::ERROR_DEVICE_LOST)?;
-        let vk = device.vk();
+        let vk = self.device.vk();
 
         let ptr =
             unsafe { vk.map_memory(self.memory, 0, self.allocation_size, vk::MemoryMapFlags::empty())? };
@@ -763,24 +761,23 @@ impl ImageInner {
 
 impl Drop for ImageInner {
     fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                let vk = device.vk();
-                if let Some(view) = self.view.as_ref() {
-                    vk.destroy_image_view(*view, None);
-                }
-                vk.destroy_image(self.image, None);
-                if self.memory != vk::DeviceMemory::null() {
-                    if self.suballocated {
-                        device.free_suballocation(self.memory, self.memory_offset, self.allocation_size);
-                    } else {
-                        if let Ok(mut lock) = self.persistent_mapping.lock() {
-                            if lock.take().is_some() {
-                                vk.unmap_memory(self.memory);
-                            }
+        unsafe {
+            let vk = self.device.vk();
+            if let Some(view) = self.view.as_ref() {
+                vk.destroy_image_view(*view, None);
+            }
+            vk.destroy_image(self.image, None);
+            if self.memory != vk::DeviceMemory::null() {
+                if self.suballocated {
+                    self.device
+                        .free_suballocation(self.memory, self.memory_offset, self.allocation_size);
+                } else {
+                    if let Ok(mut lock) = self.persistent_mapping.lock() {
+                        if lock.take().is_some() {
+                            vk.unmap_memory(self.memory);
                         }
-                        vk.free_memory(self.memory, None);
                     }
+                    vk.free_memory(self.memory, None);
                 }
             }
         }

@@ -269,11 +269,7 @@ impl AsDmabuf for VulkanImage {
 
     #[profiling::function]
     fn export(&self) -> Result<Dmabuf, Self::Error> {
-        let device = self
-            .inner
-            .device
-            .upgrade()
-            .ok_or(ExportError::AllocatorDestroyed)?;
+        let device = &self.inner.device;
 
         // Was the image created exportable?
         if !self.inner.dmabuf_exportable || self.drm.is_none() {
