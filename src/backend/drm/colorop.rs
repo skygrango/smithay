@@ -1038,6 +1038,13 @@ impl ResolvedColorPipeline {
     fn bypass(&mut self, op: &ColorOp) -> Option<()> {
         let handle = Self::op_handle(op)?;
         self.props.push((handle, *op.props.get("BYPASS")?, 1));
+        if let ColorOpKind::Curve1D { supported } = &op.kind {
+            if let Some((_, first_curve_val)) = supported.first() {
+                if let Some(prop) = op.props.get("CURVE_1D_TYPE") {
+                    self.props.push((handle, *prop, *first_curve_val));
+                }
+            }
+        }
         Some(())
     }
 }

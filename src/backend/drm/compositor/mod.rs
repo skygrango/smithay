@@ -2256,11 +2256,31 @@ where
         // If not do a single atomic commit test and when that fails render everything that failed
         // the test on the primary plane. This will also automatically correct any mistake we made
         // during plane assignment and start the full test cycle on the next frame.
+        let requires_modeset = self.surface.commit_pending()
+            || next_frame_state.planes.iter().any(|(handle, s)| {
+                let modifies_crtc = s
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.color_pipeline.as_ref())
+                    .is_some_and(|p| p.post_blend().is_some());
+                let primary_format_or_pipeline_changed = *handle == self.surface.plane()
+                    && previous_state
+                        .plane_state(*handle)
+                        .and_then(|prev| prev.config.as_ref())
+                        .map(|prev_c| {
+                            s.config.as_ref().map_or(true, |new_c| {
+                                prev_c.properties.format != new_c.properties.format
+                                    || prev_c.color_pipeline != new_c.color_pipeline
+                            })
+                        })
+                        .unwrap_or(true);
+                modifies_crtc || primary_format_or_pipeline_changed
+            });
         let test_res = next_frame_state.test_state_complete(
             previous_state,
             &self.surface,
             self.supports_fencing,
-            self.surface.commit_pending(),
+            requires_modeset,
             allow_partial_update,
         );
         if let Err(ref test_err) = test_res {
@@ -3646,6 +3666,14 @@ where
             frame_state,
         );
 
+        if let Err(ref err) = res {
+            trace!(
+                "try_assign_plane failed on primary for element {:?}: {:?}",
+                element.id(),
+                err
+            );
+        }
+
         if let Err(Some(RenderingReason::ScanoutFailed)) = res {
             element_config.failed_planes.primary = true;
         }
@@ -4631,6 +4659,9 @@ where
                 }
             },
         };
+        let modifies_crtc = color_pipeline
+            .as_ref()
+            .is_some_and(|p| p.post_blend().is_some());
 
         // Try to assign the element to a plane
         trace!(
@@ -4693,7 +4724,7 @@ where
                 .buffer
                 .buffer
                 .acquire_point(self.signaled_fence.as_ref()),
-            color_pipeline,
+            color_pipeline: color_pipeline.clone(),
         };
 
         let is_compatible = previous_state
@@ -4744,15 +4775,34 @@ where
             frame_state.set_state(plane.handle, plane_state);
             true
         } else {
-            frame_state
+            let format_changed = previous_state
+                .plane_state(plane.handle)
+                .and_then(|s| s.config.as_ref())
+                .map(|c| c.properties.format != element_config.properties.format)
+                .unwrap_or(true);
+            let color_pipeline_changed = previous_state
+                .plane_state(plane.handle)
+                .and_then(|s| s.config.as_ref())
+                .map(|c| c.color_pipeline != color_pipeline)
+                .unwrap_or(true);
+            let allow_modeset = self.surface.commit_pending()
+                || modifies_crtc
+                || (is_primary && (format_changed || color_pipeline_changed));
+            let test_res = frame_state
                 .test_state(
                     &self.surface,
                     self.supports_fencing,
                     plane.handle,
                     plane_state,
-                    self.surface.commit_pending(),
-                )
-                .is_ok()
+                    allow_modeset,
+                );
+            if let Err(ref err) = test_res {
+                trace!(
+                    "atomic test failed for element {:?} on plane {:?} (format={:?}, allow_modeset={}): {:?}",
+                    element_id, plane.handle, element_config.properties.format, allow_modeset, err
+                );
+            }
+            test_res.is_ok()
         };
 
         if res {

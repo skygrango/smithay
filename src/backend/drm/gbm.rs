@@ -309,15 +309,32 @@ where
 
     let ret = if use_opaque {
         let opaque_wrapper = OpaqueBufferWrapper(&bo);
-        drm.add_planar_framebuffer(&opaque_wrapper, flags).map(|fb| {
-            (
+        match drm.add_planar_framebuffer(&opaque_wrapper, flags) {
+            Ok(fb) => Ok((
                 fb,
                 drm_fourcc::DrmFormat {
                     code: opaque_wrapper.format(),
                     modifier: modifier.unwrap_or(DrmModifier::Invalid),
                 },
-            )
-        })
+            )),
+            Err(err) => {
+                tracing::trace!(
+                    "failed to add opaque framebuffer ({:?}), falling back to native format {:?}: {:?}",
+                    opaque_wrapper.format(),
+                    bo.format(),
+                    err
+                );
+                drm.add_planar_framebuffer(&bo, flags).map(|fb| {
+                    (
+                        fb,
+                        drm_fourcc::DrmFormat {
+                            code: bo.format(),
+                            modifier: modifier.unwrap_or(DrmModifier::Invalid),
+                        },
+                    )
+                })
+            }
+        }
     } else {
         drm.add_planar_framebuffer(&bo, flags).map(|fb| {
             (

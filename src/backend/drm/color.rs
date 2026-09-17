@@ -933,6 +933,20 @@ pub struct DrmScanoutCapabilities {
 }
 
 impl DrmScanoutCapabilities {
+    /// Tests whether the primary plane's colorop pipeline hardware can directly satisfy all stages
+    /// of this color conversion without needing CRTC post-blend encode offloading (e.g. AMD GPU).
+    pub fn can_plane_colorop_direct(&self, conv: PlaneColorConversion) -> bool {
+        if !self.supports_plane_colorop || self.primary_plane_color_pipelines.is_empty() {
+            return false;
+        }
+        let Some(tr) = conv.to_scanout_color_transform() else {
+            return false;
+        };
+        self.primary_plane_color_pipelines
+            .iter()
+            .any(|p| tr.plan(p).is_some())
+    }
+
     /// Tests whether the primary plane's colorop pipeline hardware can execute the given conversion.
     ///
     /// This directly tests the conversion against each discovered [`ColorPipeline`] by invoking
