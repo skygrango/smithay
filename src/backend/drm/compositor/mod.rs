@@ -4659,9 +4659,7 @@ where
                 }
             },
         };
-        let modifies_crtc = color_pipeline
-            .as_ref()
-            .is_some_and(|p| p.post_blend().is_some());
+        let modifies_crtc = color_pipeline.as_ref().is_some_and(|p| p.post_blend().is_some());
 
         // Try to assign the element to a plane
         trace!(
@@ -4788,14 +4786,13 @@ where
             let allow_modeset = self.surface.commit_pending()
                 || modifies_crtc
                 || (is_primary && (format_changed || color_pipeline_changed));
-            let test_res = frame_state
-                .test_state(
-                    &self.surface,
-                    self.supports_fencing,
-                    plane.handle,
-                    plane_state,
-                    allow_modeset,
-                );
+            let test_res = frame_state.test_state(
+                &self.surface,
+                self.supports_fencing,
+                plane.handle,
+                plane_state,
+                allow_modeset,
+            );
             if let Err(ref err) = test_res {
                 trace!(
                     "atomic test failed for element {:?} on plane {:?} (format={:?}, allow_modeset={}): {:?}",

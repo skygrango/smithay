@@ -465,6 +465,18 @@ impl DrmColorLut {
         lut
     }
 
+    /// Generates a pure power Gamma 2.2 degamma hardware lookup table (non-linear to linear radiance [0.0, 1.0]).
+    pub fn create_gamma22_degamma_lut(size: usize) -> Vec<Self> {
+        let mut lut = Vec::with_capacity(size);
+        let denom = (size - 1).max(1) as f32;
+        for i in 0..size {
+            let input = (i as f32) / denom;
+            let linear = input.powf(2.2);
+            lut.push(Self::from_rgb(linear, linear, linear));
+        }
+        lut
+    }
+
     /// Generates an sRGB gamma hardware lookup table (linear radiance [0.0, 1.0] to non-linear sRGB).
     pub fn create_srgb_gamma_lut(size: usize) -> Vec<Self> {
         let mut lut = Vec::with_capacity(size);
@@ -710,7 +722,7 @@ impl PlaneColorConversion {
                 let scale = (ref_white as f64) / 10000.0;
                 let ctm = DrmColorCtm::rec709_to_bt2020_scaled(scale);
                 let degamma_lut = if degamma_lut_size > 0 {
-                    Some(DrmColorLut::create_srgb_degamma_lut(degamma_lut_size))
+                    Some(DrmColorLut::create_gamma22_degamma_lut(degamma_lut_size))
                 } else {
                     None
                 };
@@ -811,7 +823,7 @@ impl PlaneColorConversion {
                     0.0880132, 0.8955950, 0.0,
                 ];
                 Some(ScanoutColorTransform {
-                    decode: Some(Curve1DType::SrgbEotf),
+                    decode: Some(Curve1DType::Gamma22),
                     multiplier: (ref_white as f64) / 80.0,
                     ctm: Some(ctm),
                     encode: Some(Curve1DType::Pq125InvEotf),
