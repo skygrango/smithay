@@ -14,7 +14,7 @@ pub(super) mod atomic;
 pub(super) mod gbm;
 pub(super) mod legacy;
 use super::{
-    DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes,
+    ColorPipeline, DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes, ResolvedColorPipeline,
     color::{Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, DrmScanoutCapabilities},
     device::PlaneClaimStorage,
     error::Error,
@@ -161,6 +161,12 @@ pub struct PlaneConfig<'a> {
     pub fb: framebuffer::Handle,
     /// Optional fence
     pub fence: Option<BorrowedFd<'a>>,
+    /// Color pipeline to process the plane's pixels with during scanout.
+    ///
+    /// `None` sets the plane's `COLOR_PIPELINE` property to `Bypass` (when the plane has
+    /// one); `Some` selects the resolved pipeline and programs its colorops in the same
+    /// commit. See [`ScanoutColorTransform::resolve`](super::colorop::ScanoutColorTransform::resolve).
+    pub color_pipeline: Option<&'a ResolvedColorPipeline>,
 }
 
 /// VRR support state
@@ -219,6 +225,17 @@ impl DrmSurface {
     /// Returns the [`PlaneInfo`] of the underlying primary [`plane`](drm::control::plane) of this surface
     pub fn plane_info(&self) -> &PlaneInfo {
         &self.primary_plane.0
+    }
+
+    /// Returns the color pipelines advertised on the given plane.
+    ///
+    /// See [`DrmDevice::plane_color_pipelines`](super::DrmDevice::plane_color_pipelines) for
+    /// more details; an empty list means the plane offers no (usable) pipelines.
+    pub fn plane_color_pipelines(&self, plane: plane::Handle) -> Result<Vec<ColorPipeline>, Error> {
+        if self.is_legacy() {
+            return Ok(Vec::new());
+        }
+        super::colorop::plane_color_pipelines(self, plane)
     }
 
     /// Currently used [`connector`](drm::control::connector)s of this surface
@@ -507,9 +524,15 @@ impl DrmSurface {
             DrmSurfaceInternal::Atomic(surf) => surf.supports_plane_colorop(),
             DrmSurfaceInternal::Legacy(_) => false,
         };
+        let primary_plane_color_pipelines = if supports_plane_colorop {
+            self.plane_color_pipelines(self.plane()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(DrmScanoutCapabilities {
             crtc_color,
             supports_plane_colorop,
+            primary_plane_color_pipelines,
             primary_plane_formats: plane_info.formats.clone(),
             supports_fp16,
             supports_10bit,

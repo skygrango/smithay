@@ -266,6 +266,8 @@ pub enum RenderingReason {
     FormatUnsupported,
     /// Element was selected for direct scan-out but failed
     ScanoutFailed,
+    /// The element's color transform cannot be expressed by the plane's color pipeline
+    ColorTransformUnsupported,
 }
 
 /// Defines the presentation state of an element after rendering

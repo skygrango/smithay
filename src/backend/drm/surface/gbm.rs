@@ -226,6 +226,7 @@ where
                 damage_clips: None,
                 fb: *handle.as_ref(),
                 fence: None,
+                color_pipeline: None,
             }),
         };
 
@@ -392,6 +393,7 @@ where
                 damage_clips: damage_clips.as_ref().map(|d| d.blob()),
                 fb: *handle.as_ref(),
                 fence: fence.as_ref().map(|fence| fence.as_fd()),
+                color_pipeline: None,
             }),
         };
 

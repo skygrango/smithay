@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, RwLock, RwLockWriteGuard, TryLockError},
 };
 
-use drm::control::{self, Mode, connector, crtc};
+use drm::control::{self, Mode, connector, crtc, plane};
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 
 use crate::{
@@ -18,7 +18,10 @@ use crate::{
             dmabuf::{AsDmabuf, Dmabuf},
             gbm::GbmDevice,
         },
-        renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
+        renderer::{
+            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture,
+            element::{Id, RenderElement},
+        },
     },
     output::OutputModeSource,
 };
@@ -26,6 +29,7 @@ use crate::{
 pub use super::compositor::CursorBufferTransformFn;
 use super::{
     DrmDevice, DrmError, Planes,
+    colorop::{ColorPipeline, PostBlendEncode, ScanoutColorTransform},
     compositor::{
         DrmCompositor, FrameError, FrameFlags, FrameResult, PrimaryPlaneElement, RenderFrameError,
         RenderFrameErrorType, RenderFrameResult,
@@ -795,6 +799,37 @@ where
     /// Sets the transform function applied to cursor plane contents after they are filled.
     pub fn set_cursor_buffer_transform(&self, transform: Option<CursorBufferTransformFn>) {
         self.with_compositor(|compositor| compositor.set_cursor_buffer_transform(transform));
+    }
+
+    /// Sets the transform function applied to cursor plane contents when offloading the
+    /// encode behind blending.
+    pub fn set_cursor_buffer_transform_post_blend(&self, transform: Option<CursorBufferTransformFn>) {
+        self.with_compositor(|compositor| compositor.set_cursor_buffer_transform_post_blend(transform));
+    }
+
+    /// Configures the color transforms to apply to elements when scanning them out directly.
+    pub fn use_color_transforms(
+        &self,
+        transforms: HashMap<Id, Option<ScanoutColorTransform>>,
+        deny_untransformed_scanout: bool,
+    ) {
+        self.with_compositor(|compositor| {
+            compositor.use_color_transforms(transforms, deny_untransformed_scanout)
+        });
+    }
+
+    /// Enables or disables offloading the PQ encode behind blending onto the CRTC gamma LUT.
+    pub fn use_post_blend_encode(
+        &self,
+        post_blend: Option<PostBlendEncode>,
+        linear_transforms: HashMap<Id, ScanoutColorTransform>,
+    ) -> bool {
+        self.with_compositor(|compositor| compositor.use_post_blend_encode(post_blend, linear_transforms))
+    }
+
+    /// Discovers the color pipelines of a plane.
+    pub fn plane_color_pipelines(&self, plane: plane::Handle) -> FrameResult<Vec<ColorPipeline>, A, F> {
+        self.with_compositor(|compositor| compositor.plane_color_pipelines(plane))
     }
 }
 

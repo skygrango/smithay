@@ -71,6 +71,7 @@
 //! [`DrmDevice`] instead.
 
 pub mod color;
+pub mod colorop;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
 pub mod compositor;
 pub(crate) mod device;
@@ -92,6 +93,10 @@ pub use color::{
     Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, CtaCoordinate, DrmColorCtm,
     DrmColorLut, DrmScanoutCapabilities, Eotf, HdrOutputMetadata, PlaneColorConversion, ScanoutPlan,
     SrgbToPqEncoder, bt709_to_bt2020,
+};
+pub use colorop::{
+    ColorOp, ColorOpKind, ColorPipeline, Curve1DType, Lut1DInterpolation, Lut3DInterpolation,
+    PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform,
 };
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
 pub use compositor::CursorBufferTransformFn;

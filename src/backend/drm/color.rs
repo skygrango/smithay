@@ -20,6 +20,7 @@
 //! `smithay-drm-extras`' `display_info` module and libdisplay-info's
 //! `Info::hdr_static_metadata()` / `Info::supported_signal_colorimetry()`.
 
+use super::colorop::{ColorPipeline, Curve1DType, PostBlendEncode, ScanoutColorTransform};
 use crate::backend::allocator::format::FormatSet;
 
 /// Value of the `Colorspace` connector property.
@@ -782,6 +783,85 @@ impl PlaneColorConversion {
             }
         }
     }
+
+    /// Builds the DRM Plane colorop transform needed to perform this conversion directly
+    /// in the hardware plane pipeline before blending.
+    pub fn to_scanout_color_transform(&self) -> Option<ScanoutColorTransform> {
+        match *self {
+            PlaneColorConversion::ScRgbToPq { reference_white } => {
+                let ref_white = if reference_white > 0 { reference_white } else { 80 };
+                // Linear Rec.709 FP16 input. 1.0 nominal white = ref_white cd/m².
+                // DRM PQ125 curve linear unit is 80 cd/m² (125.0 = 10,000 cd/m²).
+                // Gamut rotation Rec.709 -> BT.2020 (row-major with 0 offset):
+                let ctm = [
+                    0.6274040, 0.3292820, 0.0433136, 0.0, 0.0690970, 0.9195400, 0.0113612, 0.0, 0.0163916,
+                    0.0880132, 0.8955950, 0.0,
+                ];
+                Some(ScanoutColorTransform {
+                    decode: None,
+                    multiplier: (ref_white as f64) / 80.0,
+                    ctm: Some(ctm),
+                    encode: Some(Curve1DType::Pq125InvEotf),
+                })
+            }
+            PlaneColorConversion::SrgbToPq { reference_white } => {
+                let ref_white = if reference_white > 0 { reference_white } else { 203 };
+                let ctm = [
+                    0.6274040, 0.3292820, 0.0433136, 0.0, 0.0690970, 0.9195400, 0.0113612, 0.0, 0.0163916,
+                    0.0880132, 0.8955950, 0.0,
+                ];
+                Some(ScanoutColorTransform {
+                    decode: Some(Curve1DType::SrgbEotf),
+                    multiplier: (ref_white as f64) / 80.0,
+                    ctm: Some(ctm),
+                    encode: Some(Curve1DType::Pq125InvEotf),
+                })
+            }
+            PlaneColorConversion::HlgToPq { reference_white } => {
+                let ref_white = if reference_white > 0 {
+                    reference_white
+                } else {
+                    1000
+                };
+                Some(ScanoutColorTransform {
+                    decode: Some(Curve1DType::Bt2020InvOetf),
+                    multiplier: (ref_white as f64) / 80.0,
+                    ctm: None,
+                    encode: Some(Curve1DType::Pq125InvEotf),
+                })
+            }
+            PlaneColorConversion::ScRgbToSrgb => Some(ScanoutColorTransform {
+                decode: None,
+                multiplier: 1.0,
+                ctm: None,
+                encode: Some(Curve1DType::SrgbInvEotf),
+            }),
+            PlaneColorConversion::PqToSrgb => {
+                let ctm = [
+                    1.6604910, -0.5876411, -0.0728499, 0.0, -0.1245505, 1.1328999, -0.0083494, 0.0,
+                    -0.0181508, -0.1005789, 1.1187297, 0.0,
+                ];
+                Some(ScanoutColorTransform {
+                    decode: Some(Curve1DType::Pq125Eotf),
+                    multiplier: 80.0 / 203.0,
+                    ctm: Some(ctm),
+                    encode: Some(Curve1DType::SrgbInvEotf),
+                })
+            }
+            PlaneColorConversion::HlgToSrgb => {
+                let ctm = [
+                    1.6604910, -0.5876411, -0.0728499, 0.0, -0.1245505, 1.1328999, -0.0083494, 0.0,
+                    -0.0181508, -0.1005789, 1.1187297, 0.0,
+                ];
+                Some(ScanoutColorTransform {
+                    decode: Some(Curve1DType::Bt2020InvOetf),
+                    multiplier: 80.0 / 1000.0,
+                    ctm: Some(ctm),
+                    encode: Some(Curve1DType::SrgbInvEotf),
+                })
+            }
+        }
+    }
 }
 
 /// The scanout execution plan evaluated for a fullscreen client surface,
@@ -842,6 +922,8 @@ pub struct DrmScanoutCapabilities {
     pub crtc_color: CrtcColorCapabilities,
     /// Whether the primary plane supports DRM COLOR_PIPELINE (colorop).
     pub supports_plane_colorop: bool,
+    /// The discovered color pipelines on the primary plane.
+    pub primary_plane_color_pipelines: Vec<ColorPipeline>,
     /// Supported pixel formats on the primary plane.
     pub primary_plane_formats: FormatSet,
     /// Whether the primary plane supports FP16 formats (e.g. ABGR16161616F / XBGR16161616F).
@@ -851,6 +933,42 @@ pub struct DrmScanoutCapabilities {
 }
 
 impl DrmScanoutCapabilities {
+    /// Tests whether the primary plane's colorop pipeline hardware can execute the given conversion.
+    ///
+    /// This directly tests the conversion against each discovered [`ColorPipeline`] by invoking
+    /// its planning algorithm. If a pipeline is found that can satisfy all stages of the transform
+    /// (or with post-blend encode offload if supported), returns true.
+    pub fn can_plane_colorop_execute(&self, conv: PlaneColorConversion) -> bool {
+        if !self.supports_plane_colorop || self.primary_plane_color_pipelines.is_empty() {
+            return false;
+        }
+        let Some(tr) = conv.to_scanout_color_transform() else {
+            return false;
+        };
+        // 1. Direct hardware pipeline match
+        if self
+            .primary_plane_color_pipelines
+            .iter()
+            .any(|p| tr.plan(p).is_some())
+        {
+            return true;
+        }
+        // 2. Post-blend encode offload (e.g. for NVIDIA linear pipelines)
+        if self.supports_post_blend_encode() {
+            let pb = PostBlendEncode::for_hdr(1000.0);
+            if let Some(linear_tr) = pb.linear_transform(tr) {
+                if self
+                    .primary_plane_color_pipelines
+                    .iter()
+                    .any(|p| linear_tr.plan(p).is_some())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Whether the hardware can directly scan out scRGB FP16 content via CRTC color management.
     pub fn supports_scrgb_hardware_scanout(&self) -> bool {
         self.supports_fp16 && self.crtc_color.has_gamma_lut && self.crtc_color.has_ctm
@@ -910,7 +1028,7 @@ impl DrmScanoutCapabilities {
                 {
                     // scRGB FP16 on SDR output
                     let conv = PlaneColorConversion::ScRgbToSrgb;
-                    if self.supports_plane_colorop && self.supports_fp16 {
+                    if self.can_plane_colorop_execute(conv) && self.supports_fp16 {
                         ScanoutPlan::PlaneColorop(conv)
                     } else if self.supports_fp16 && self.crtc_color.has_gamma_lut {
                         ScanoutPlan::CrtcHardware(conv)
@@ -921,7 +1039,7 @@ impl DrmScanoutCapabilities {
                 Some(desc) if desc.is_pq_bt2020() => {
                     // PQ BT.2020 on SDR output
                     let conv = PlaneColorConversion::PqToSrgb;
-                    if self.supports_plane_colorop {
+                    if self.can_plane_colorop_execute(conv) {
                         ScanoutPlan::PlaneColorop(conv)
                     } else if self.crtc_color.has_degamma_lut
                         && self.crtc_color.has_ctm
@@ -935,7 +1053,7 @@ impl DrmScanoutCapabilities {
                 Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
                     // HLG on SDR output
                     let conv = PlaneColorConversion::HlgToSrgb;
-                    if self.supports_plane_colorop {
+                    if self.can_plane_colorop_execute(conv) {
                         ScanoutPlan::PlaneColorop(conv)
                     } else if self.crtc_color.has_degamma_lut
                         && self.crtc_color.has_ctm
@@ -1018,7 +1136,7 @@ impl DrmScanoutCapabilities {
                         let conv = PlaneColorConversion::ScRgbToPq {
                             reference_white: eff_ref_white,
                         };
-                        if self.supports_plane_colorop && self.supports_fp16 {
+                        if self.can_plane_colorop_execute(conv) && self.supports_fp16 {
                             // Tier 2A: Plane COLOR_PIPELINE (colorop)
                             ScanoutPlan::PlaneColorop(conv)
                         } else if self.supports_scrgb_hardware_scanout() {
@@ -1046,7 +1164,7 @@ impl DrmScanoutCapabilities {
                         let conv = PlaneColorConversion::HlgToPq {
                             reference_white: eff_ref_white,
                         };
-                        if self.supports_plane_colorop {
+                        if self.can_plane_colorop_execute(conv) {
                             // Tier 2A: Plane COLOR_PIPELINE (colorop)
                             ScanoutPlan::PlaneColorop(conv)
                         } else if self.supports_hlg_to_hdr_hardware_scanout() {
@@ -1068,7 +1186,7 @@ impl DrmScanoutCapabilities {
                     let conv = PlaneColorConversion::SrgbToPq {
                         reference_white: effective_ref_white,
                     };
-                    if self.supports_plane_colorop {
+                    if self.can_plane_colorop_execute(conv) {
                         // Tier 2A: Plane COLOR_PIPELINE (colorop)
                         ScanoutPlan::PlaneColorop(conv)
                     } else if self.supports_sdr_to_hdr_hardware_scanout() {
@@ -1089,7 +1207,7 @@ impl DrmScanoutCapabilities {
                     let conv = PlaneColorConversion::SrgbToPq {
                         reference_white: effective_ref_white,
                     };
-                    if self.supports_plane_colorop {
+                    if self.can_plane_colorop_execute(conv) {
                         // Tier 2A: Plane COLOR_PIPELINE (colorop)
                         ScanoutPlan::PlaneColorop(conv)
                     } else if self.supports_sdr_to_hdr_hardware_scanout() {
@@ -1372,22 +1490,132 @@ mod tests {
         assert!((r0 - scale).abs() < 2e-6, "r0={r0} scale={scale}");
     }
 
+    fn query_real_primary_plane_pipelines() -> Option<Vec<ColorPipeline>> {
+        use crate::backend::drm::device::DrmDeviceFd;
+        use crate::utils::DeviceFd;
+        use drm::Device as BasicDevice;
+        use drm::control::Device as ControlDevice;
+        use std::fs::OpenOptions;
+        use std::os::unix::io::OwnedFd;
+
+        let candidates = ["/dev/dri/card1", "/dev/dri/card0", "/dev/dri/card2"];
+        for path in candidates {
+            let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+                continue;
+            };
+            let dev_fd = DeviceFd::from(OwnedFd::from(file));
+            let drm_fd = DrmDeviceFd::new(dev_fd);
+            let _ = drm_fd.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+            let _ = drm_fd.set_client_capability(drm::ClientCapability::PlaneColorPipeline, true);
+            let Ok(planes) = drm_fd.plane_handles() else {
+                continue;
+            };
+            for plane in &planes {
+                let Ok(props) = drm_fd.get_properties(*plane) else {
+                    continue;
+                };
+                let (prop_ids, prop_vals) = props.as_props_and_values();
+                let is_primary = prop_ids.iter().zip(prop_vals.iter()).any(|(id, val)| {
+                    drm_fd
+                        .get_property(*id)
+                        .ok()
+                        .map_or(false, |info| info.name().to_string_lossy() == "type" && *val == 1)
+                });
+                if is_primary {
+                    if let Ok(pipes) = crate::backend::drm::colorop::plane_color_pipelines(&drm_fd, *plane) {
+                        if !pipes.is_empty() {
+                            return Some(pipes);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn synthetic_test_pipeline() -> ColorPipeline {
+        use crate::backend::drm::colorop::{ColorOp, ColorOpKind, Curve1DType};
+        use std::collections::HashMap;
+
+        let all_curves = [
+            Curve1DType::SrgbEotf,
+            Curve1DType::SrgbInvEotf,
+            Curve1DType::Pq125Eotf,
+            Curve1DType::Pq125InvEotf,
+            Curve1DType::Bt2020InvOetf,
+            Curve1DType::Bt2020Oetf,
+            Curve1DType::Gamma22,
+            Curve1DType::Gamma22Inv,
+        ];
+        ColorPipeline {
+            id: 1,
+            ops: vec![
+                ColorOp {
+                    id: 1,
+                    kind: ColorOpKind::Curve1D {
+                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
+                    },
+                    bypassable: true,
+                    props: HashMap::new(),
+                },
+                ColorOp {
+                    id: 2,
+                    kind: ColorOpKind::Multiplier,
+                    bypassable: true,
+                    props: HashMap::new(),
+                },
+                ColorOp {
+                    id: 3,
+                    kind: ColorOpKind::Ctm3x4,
+                    bypassable: true,
+                    props: HashMap::new(),
+                },
+                ColorOp {
+                    id: 4,
+                    kind: ColorOpKind::Curve1D {
+                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
+                    },
+                    bypassable: true,
+                    props: HashMap::new(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn scanout_plan_evaluation() {
         use crate::wayland::color::management::ImageDescription;
+        let test_pipelines =
+            query_real_primary_plane_pipelines().unwrap_or_else(|| vec![synthetic_test_pipeline()]);
         let mut caps = DrmScanoutCapabilities {
             crtc_color: CrtcColorCapabilities {
-                has_gamma_lut: true,
-                gamma_lut_size: 4096,
                 has_degamma_lut: true,
                 degamma_lut_size: 4096,
                 has_ctm: true,
+                has_gamma_lut: true,
+                gamma_lut_size: 4096,
             },
             supports_plane_colorop: false,
+            primary_plane_color_pipelines: test_pipelines.clone(),
             primary_plane_formats: FormatSet::default(),
             supports_fp16: true,
             supports_10bit: true,
         };
+
+        // Guard test: If supports_plane_colorop is true BUT pipelines is empty,
+        // it MUST NOT claim colorop is supported (preventing false positive misclassification).
+        caps.supports_plane_colorop = true;
+        caps.primary_plane_color_pipelines.clear();
+        assert!(!caps.can_plane_colorop_execute(PlaneColorConversion::ScRgbToSrgb));
+        let empty_pipeline_plan =
+            caps.evaluate_scanout_plan(false, Some(&ImageDescription::WINDOWS_SCRGB), 203);
+        assert_eq!(
+            empty_pipeline_plan,
+            ScanoutPlan::CrtcHardware(PlaneColorConversion::ScRgbToSrgb)
+        );
+        // Restore pipelines and disable colorop for baseline
+        caps.primary_plane_color_pipelines = test_pipelines;
+        caps.supports_plane_colorop = false;
 
         // 1. Tier 1: SDR on SDR (zero transform)
         let plan = caps.evaluate_scanout_plan(false, Some(&ImageDescription::SRGB), 203);
@@ -1527,6 +1755,7 @@ mod tests {
             supports_fp16: true,
             supports_10bit: true,
             supports_plane_colorop: false,
+            primary_plane_color_pipelines: Vec::new(),
             primary_plane_formats: FormatSet::default(),
             crtc_color: CrtcColorCapabilities {
                 has_degamma_lut: true,
@@ -1894,6 +2123,7 @@ mod tests {
             let mut primary_supports_fp16 = false;
             let mut primary_supports_10bit = false;
             let mut primary_supports_colorop = false;
+            let mut primary_color_pipelines = Vec::new();
             let primary_format_set = FormatSet::default();
 
             for plane_handle in &planes {
@@ -1951,13 +2181,36 @@ mod tests {
                         primary_supports_fp16 = has_fp16;
                         primary_supports_10bit = has_10bit;
                         primary_supports_colorop = has_colorop;
+                        if has_colorop && primary_color_pipelines.is_empty() {
+                            if let Ok(pipes) =
+                                crate::backend::drm::colorop::plane_color_pipelines(&drm_fd, *plane_handle)
+                            {
+                                primary_color_pipelines = pipes;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !primary_color_pipelines.is_empty() {
+                println!("\n  --- Discovered Primary Plane Color Pipelines (from DRM uAPI) ---");
+                for (i, p) in primary_color_pipelines.iter().enumerate() {
+                    println!("    • Pipeline #{i} (ID: {}), {} operations:", p.id, p.ops.len());
+                    for (op_idx, op) in p.ops.iter().enumerate() {
+                        let bypass_tag = if op.bypassable { "Bypassable" } else { "Mandatory" };
+                        println!(
+                            "        [Op {op_idx}] ID: {} | {} ({bypass_tag})",
+                            op.id,
+                            op.kind.name()
+                        );
                     }
                 }
             }
 
             let scanout_caps = DrmScanoutCapabilities {
                 crtc_color: best_crtc_color,
-                supports_plane_colorop: primary_supports_colorop,
+                supports_plane_colorop: primary_supports_colorop && !primary_color_pipelines.is_empty(),
+                primary_plane_color_pipelines: primary_color_pipelines,
                 primary_plane_formats: primary_format_set,
                 supports_fp16: primary_supports_fp16,
                 supports_10bit: primary_supports_10bit,

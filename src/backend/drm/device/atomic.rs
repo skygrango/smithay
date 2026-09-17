@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::io::AsFd;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -86,20 +87,46 @@ pub struct AtomicDrmDevice {
     pub(crate) active: Arc<AtomicBool>,
     old_state: OldState,
     pub(crate) prop_mapping: Arc<RwLock<PropMapping>>,
+    pub(crate) has_plane_color_pipeline: bool,
     pub(super) span: tracing::Span,
 }
 
 impl AtomicDrmDevice {
     pub fn new(fd: DrmDeviceFd, active: Arc<AtomicBool>, disable_connectors: bool) -> Result<Self, Error> {
         let span = info_span!("drm_atomic");
+
+        let disable_color_pipeline = std::env::var("SMITHAY_NO_PLANE_COLOR_PIPELINE")
+            .map(|x| {
+                x == "1" || x.to_lowercase() == "true" || x.to_lowercase() == "yes" || x.to_lowercase() == "y"
+            })
+            .unwrap_or(false);
+        let has_plane_color_pipeline = !disable_color_pipeline
+            && drm_ffi::set_capability(
+                fd.as_fd(),
+                drm_ffi::DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE as u64,
+                true,
+            )
+            .is_ok();
+
         let mut dev = AtomicDrmDevice {
             fd,
             active,
             old_state: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             prop_mapping: Default::default(),
+            has_plane_color_pipeline,
             span,
         };
         let _guard = dev.span.enter();
+        debug!(
+            "Plane color pipelines (drm_colorop) {}",
+            if dev.has_plane_color_pipeline {
+                "enabled"
+            } else if disable_color_pipeline {
+                "disabled by SMITHAY_NO_PLANE_COLOR_PIPELINE"
+            } else {
+                "not supported by the kernel"
+            }
+        );
 
         // Enumerate (and save) the current device state.
         let res_handles = dev.fd.resource_handles().map_err(|source| {

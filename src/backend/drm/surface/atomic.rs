@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::ops::RangeInclusive;
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -628,6 +628,7 @@ impl AtomicDrmSurface {
                     damage_clips: None,
                     fb: test_buffer.fb,
                     fence: None,
+                    color_pipeline: None,
                 }),
             };
 
@@ -705,6 +706,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                color_pipeline: None,
             }),
         };
 
@@ -769,6 +771,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                color_pipeline: None,
             }),
         };
         // re-resolve the pending color state for the new connector set
@@ -835,6 +838,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                color_pipeline: None,
             }),
         };
         let req = AtomicRequest::build_request(
@@ -1025,6 +1029,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                color_pipeline: None,
             }),
         };
 
@@ -1275,6 +1280,7 @@ impl AtomicDrmSurface {
                 damage_clips: None,
                 fb: test_buffer.fb,
                 fence: None,
+                color_pipeline: None,
             }),
         };
 
@@ -1522,6 +1528,7 @@ impl AtomicDrmSurface {
                     damage_clips: None,
                     fb: test_buffer.fb,
                     fence: None,
+                    color_pipeline: None,
                 }),
             };
 
@@ -2185,6 +2192,7 @@ struct AtomicRequest<'a> {
     crtc_props: HashMap<crtc::Handle, HashMap<&'static str, property::Value<'a>>>,
     connector_props: HashMap<connector::Handle, HashMap<&'static str, property::Value<'a>>>,
     plane_props: HashMap<plane::Handle, HashMap<&'static str, property::Value<'a>>>,
+    colorop_props: Vec<(drm::control::RawResourceHandle, property::Handle, u64)>,
 }
 
 #[cfg(not(debug_assertions))]
@@ -2213,6 +2221,7 @@ impl<'a> AtomicRequest<'a> {
             crtc_props: HashMap::new(),
             connector_props: HashMap::new(),
             plane_props: HashMap::new(),
+            colorop_props: Vec::new(),
         }
     }
 
@@ -2380,6 +2389,19 @@ impl<'a> AtomicRequest<'a> {
                     name: "IN_FENCE_FD",
                 });
             }
+            if self.mapping.plane_prop_handle(handle, "COLOR_PIPELINE").is_ok() {
+                if let Some(pipeline) = config.color_pipeline {
+                    plane_props.insert("COLOR_PIPELINE", property::Value::Unknown(pipeline.pipeline_id()));
+                    self.colorop_props.extend_from_slice(pipeline.props());
+                } else {
+                    plane_props.insert("COLOR_PIPELINE", property::Value::Unknown(0));
+                }
+            } else if config.color_pipeline.is_some() {
+                return Err(Error::UnknownProperty {
+                    handle: handle.into(),
+                    name: "COLOR_PIPELINE",
+                });
+            }
         } else {
             self.reset_plane(handle)?;
         }
@@ -2418,6 +2440,9 @@ impl<'a> AtomicRequest<'a> {
         if self.mapping.plane_prop_handle(plane, "IN_FENCE_FD").is_ok() {
             plane_props.insert("IN_FENCE_FD", property::Value::SignedRange(-1));
         }
+        if self.mapping.plane_prop_handle(plane, "COLOR_PIPELINE").is_ok() {
+            plane_props.insert("COLOR_PIPELINE", property::Value::Unknown(0));
+        }
         Ok(())
     }
 
@@ -2438,6 +2463,9 @@ impl<'a> AtomicRequest<'a> {
             for (name, value) in props {
                 req.add_property(*plane, self.mapping.plane_prop_handle(*plane, name)?, *value);
             }
+        }
+        for &(colorop, prop, value) in &self.colorop_props {
+            req.add_raw_property(colorop, prop, value);
         }
 
         Ok(req)
@@ -2679,6 +2707,23 @@ impl<'a> AtomicRequest<'a> {
                     name: "IN_FENCE_FD",
                 });
             }
+            if let Ok(prop) = self.mapping.plane_prop_handle(handle, "COLOR_PIPELINE") {
+                if let Some(pipeline) = config.color_pipeline {
+                    self.request
+                        .add_property(handle, prop, property::Value::Unknown(pipeline.pipeline_id()));
+                    for &(colorop, colorop_prop, value) in pipeline.props() {
+                        self.request.add_raw_property(colorop, colorop_prop, value);
+                    }
+                } else {
+                    self.request
+                        .add_property(handle, prop, property::Value::Unknown(0));
+                }
+            } else if config.color_pipeline.is_some() {
+                return Err(Error::UnknownProperty {
+                    handle: handle.into(),
+                    name: "COLOR_PIPELINE",
+                });
+            }
         } else {
             self.reset_plane(handle)?;
         }
@@ -2762,6 +2807,10 @@ impl<'a> AtomicRequest<'a> {
         if let Ok(prop) = self.mapping.plane_prop_handle(plane, "IN_FENCE_FD") {
             self.request
                 .add_property(plane, prop, property::Value::SignedRange(-1));
+        }
+        if let Ok(prop) = self.mapping.plane_prop_handle(plane, "COLOR_PIPELINE") {
+            self.request
+                .add_property(plane, prop, property::Value::Unknown(0));
         }
         Ok(())
     }
