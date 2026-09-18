@@ -226,7 +226,7 @@ pub fn sdr_color_to_pq(
     let stretch = gamut_stretch.clamp(0.0, 1.0);
     let mix = |converted: f32, native: f32| converted + (native - converted) * stretch;
     let scale = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
-    let eff_alpha = alpha;
+    let eff_alpha = optical_alpha_pq(alpha, reference_white);
     Color32F::new(
         encode_pq(mix(0.627404 * r + 0.329282 * g + 0.043314 * b, r) * scale) * eff_alpha,
         encode_pq(mix(0.069097 * r + 0.919540 * g + 0.011362 * b, g) * scale) * eff_alpha,
@@ -284,5 +284,13 @@ mod tests {
         assert_eq!(config.max_luminance, 350.0);
         assert!(config.is_sdr);
         assert_eq!(config.sdr_gamma, 0.0);
+    }
+
+    #[test]
+    fn test_sdr_color_to_pq_optical_alpha() {
+        let translucent_white = Color32F::new(0.5, 0.5, 0.5, 0.5);
+        let pq_color = sdr_color_to_pq(translucent_white, 203.0, 2.2, 0.0);
+        let expected_alpha = optical_alpha_pq(0.5, 203.0);
+        assert!((pq_color.a() - expected_alpha).abs() < 1e-5);
     }
 }
