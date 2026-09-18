@@ -1101,6 +1101,12 @@ impl Renderer for VulkanRenderer {
         self.dmabuf_cache.retain(|weak, _| weak.upgrade().is_some());
         Ok(())
     }
+
+    fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
+        self.dmabuf_cache.clear();
+        let _ = self.cleanup();
+        Ok(())
+    }
 }
 
 impl ImportMem for VulkanRenderer {
@@ -1198,17 +1204,26 @@ impl ImportMem for VulkanRenderer {
 }
 
 impl ImportDma for VulkanRenderer {
+    #[profiling::function]
     fn import_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoords>]>,
     ) -> Result<Self::TextureId, Self::Error> {
-        VulkanImage::new_from_dmabuf(
-            &self.device,
-            dmabuf,
-            ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC,
-        )
-        .map_err(Error::ImageError)
+        let required_usage = ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC;
+        if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
+            if image.vk_usage().contains(required_usage) {
+                trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
+                image.set_needs_acquire(true);
+                return Ok(image.clone());
+            }
+        }
+
+        let image =
+            VulkanImage::new_from_dmabuf(&self.device, dmabuf, required_usage).map_err(Error::ImageError)?;
+
+        self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
+        Ok(image)
     }
 
     fn dmabuf_formats(&self) -> FormatSet {
