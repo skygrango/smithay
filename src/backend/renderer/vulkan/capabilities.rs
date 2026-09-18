@@ -8,8 +8,9 @@ use ash::{
     vk::{
         ExternalSemaphoreFeatureFlags, ExternalSemaphoreHandleTypeFlags, ExternalSemaphoreProperties,
         PhysicalDeviceExternalSemaphoreInfo, PhysicalDeviceFeatures2, PhysicalDeviceHostImageCopyFeaturesEXT,
-        PhysicalDeviceVulkan11Features, PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features,
-        SemaphoreType, SemaphoreTypeCreateInfo,
+        PhysicalDeviceMemoryPriorityFeaturesEXT, PhysicalDeviceVulkan11Features,
+        PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, SemaphoreType,
+        SemaphoreTypeCreateInfo,
     },
 };
 
@@ -30,6 +31,9 @@ pub enum Capability {
     DescriptorIndexing,
     MultiDrawIndirect,
     ShaderDrawParameters,
+    MemoryPriority,
+    GlobalPriorityKhr,
+    GlobalPriorityExt,
 }
 
 pub struct Features {
@@ -37,6 +41,7 @@ pub struct Features {
     features_11: PhysicalDeviceVulkan11Features<'static>,
     features_12: PhysicalDeviceVulkan12Features<'static>,
     features_ext_host_image_copy: PhysicalDeviceHostImageCopyFeaturesEXT<'static>,
+    features_memory_priority: PhysicalDeviceMemoryPriorityFeaturesEXT<'static>,
     // we require vulkan 1.2 at minimum
     features_13: Option<PhysicalDeviceVulkan13Features<'static>>,
     self_ref: std::marker::PhantomPinned,
@@ -49,6 +54,7 @@ impl Features {
             features_11: PhysicalDeviceVulkan11Features::default(),
             features_12: PhysicalDeviceVulkan12Features::default(),
             features_ext_host_image_copy: PhysicalDeviceHostImageCopyFeaturesEXT::default(),
+            features_memory_priority: PhysicalDeviceMemoryPriorityFeaturesEXT::default(),
             features_13: None,
             self_ref: std::marker::PhantomPinned,
         });
@@ -58,10 +64,12 @@ impl Features {
             features.features.p_next = &mut features.features_11 as *mut _ as *mut c_void;
             features.features_11.p_next = &mut features.features_12 as *mut _ as *mut c_void;
             features.features_12.p_next = &mut features.features_ext_host_image_copy as *mut _ as *mut c_void;
+            features.features_ext_host_image_copy.p_next =
+                &mut features.features_memory_priority as *mut _ as *mut c_void;
 
             if version >= &Version::VERSION_1_3 {
                 features.features_13 = Some(PhysicalDeviceVulkan13Features::default());
-                features.features_ext_host_image_copy.p_next =
+                features.features_memory_priority.p_next =
                     features.features_13.as_mut().unwrap() as *mut _ as *mut c_void;
             }
         }
@@ -79,6 +87,15 @@ impl Features {
 
     pub fn descriptor_indexing(&self) -> bool {
         self.features_12.descriptor_indexing == 1 || self.features_12.runtime_descriptor_array == 1
+    }
+
+    pub fn memory_priority(&self) -> bool {
+        self.features_memory_priority.memory_priority == 1
+    }
+
+    pub fn enable_memory_priority(self: &mut Pin<Box<Self>>) {
+        let features = unsafe { self.as_mut().get_unchecked_mut() };
+        features.features_memory_priority.memory_priority = 1;
     }
 
     pub fn required_features() -> Pin<Box<Self>> {
@@ -280,6 +297,22 @@ impl Capability {
             .then_some(Capability::ShaderDrawParameters)
     }
 
+    pub fn supports_memory_priority(phd: &PhysicalDevice) -> Option<Capability> {
+        let features = Features::supported_features(phd);
+        (phd.has_device_extension(ash::vk::EXT_MEMORY_PRIORITY_NAME) && features.memory_priority())
+            .then_some(Capability::MemoryPriority)
+    }
+
+    pub fn supports_global_priority(phd: &PhysicalDevice) -> Option<Capability> {
+        if phd.has_device_extension(ash::vk::KHR_GLOBAL_PRIORITY_NAME) {
+            Some(Capability::GlobalPriorityKhr)
+        } else if phd.has_device_extension(ash::vk::EXT_GLOBAL_PRIORITY_NAME) {
+            Some(Capability::GlobalPriorityExt)
+        } else {
+            None
+        }
+    }
+
     pub fn as_extensions(caps: &[Capability]) -> Vec<&CStr> {
         caps.iter()
             .flat_map(|cap| match cap {
@@ -297,6 +330,9 @@ impl Capability {
                 Capability::DescriptorIndexing => &[] as &'static [&CStr],
                 Capability::MultiDrawIndirect => &[] as &'static [&CStr],
                 Capability::ShaderDrawParameters => &[] as &'static [&CStr],
+                Capability::MemoryPriority => &[ash::vk::EXT_MEMORY_PRIORITY_NAME],
+                Capability::GlobalPriorityKhr => &[ash::vk::KHR_GLOBAL_PRIORITY_NAME],
+                Capability::GlobalPriorityExt => &[ash::vk::EXT_GLOBAL_PRIORITY_NAME],
             })
             .copied()
             .collect()

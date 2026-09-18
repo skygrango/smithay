@@ -251,9 +251,13 @@ impl Lut3dTexture {
             })
             .unwrap_or(0);
 
-        let alloc_info = vk::MemoryAllocateInfo::default()
+        let mut priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type_index);
+        if device.has_memory_priority() {
+            alloc_info = alloc_info.push_next(&mut priority_info);
+        }
 
         let memory = unsafe {
             device

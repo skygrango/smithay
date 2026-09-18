@@ -136,6 +136,7 @@ impl VulkanSuballocator {
         host_visible: bool,
         tiling: ImageTiling,
         buffer_image_granularity: vk::DeviceSize,
+        has_memory_priority: bool,
     ) -> Result<(vk::DeviceMemory, vk::DeviceSize, Option<*mut u8>), vk::Result> {
         let align = alignment.max(1);
         let new_class = TilingClass::from_tiling(tiling);
@@ -219,16 +220,24 @@ impl VulkanSuballocator {
         // No suitable existing block found – allocate a new one.
         // Try a tiered size first; fall back to exact size on OOM.
         let block_size = select_tier_block_size(size);
-        let alloc_info = vk::MemoryAllocateInfo::default()
+        let mut priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(block_size)
             .memory_type_index(memory_type_index);
+        if has_memory_priority {
+            alloc_info = alloc_info.push_next(&mut priority_info);
+        }
 
         let (memory, total_size) = match unsafe { vk_device.allocate_memory(&alloc_info, None) } {
             Ok(mem) => (mem, block_size),
             Err(err) if block_size > size => {
-                let fallback_info = vk::MemoryAllocateInfo::default()
+                let mut fallback_priority = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
+                let mut fallback_info = vk::MemoryAllocateInfo::default()
                     .allocation_size(size)
                     .memory_type_index(memory_type_index);
+                if has_memory_priority {
+                    fallback_info = fallback_info.push_next(&mut fallback_priority);
+                }
                 let mem = unsafe { vk_device.allocate_memory(&fallback_info, None)? };
                 (mem, size)
             }

@@ -521,6 +521,11 @@ impl VulkanImage {
         let mut import_memory_info: vk::ImportMemoryFdInfoKHR<'_>;
         let mut memory_export_info: vk::ExportMemoryAllocateInfo<'_>;
         let mut memory_dedicated_info: vk::MemoryDedicatedAllocateInfo<'_>;
+        let mut memory_priority_info: vk::MemoryPriorityAllocateInfoEXT<'_>;
+        if device.has_memory_priority() {
+            memory_priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
+            alloc_create_info = alloc_create_info.push_next(&mut memory_priority_info);
+        }
         // vkAllocateMemory takes ownership of the fd *only* on success.  We keep it as an OwnedFd
         // until the call succeeds so Rust's Drop will close it on any early return / error path.
         // The fd is surrendered to Vulkan via ManuallyDrop::into_raw_fd() after the call succeeds.

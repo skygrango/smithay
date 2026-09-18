@@ -407,6 +407,12 @@ impl VulkanRenderer {
         capabilities.extend(Capability::supports_descriptor_indexing(phd));
         capabilities.extend(Capability::supports_multi_draw_indirect(phd));
         capabilities.extend(Capability::supports_shader_draw_parameters(phd));
+        capabilities.extend(Capability::supports_memory_priority(phd));
+        capabilities.extend(Capability::supports_global_priority(phd));
+
+        if capabilities.contains(&Capability::MemoryPriority) {
+            required_features.enable_memory_priority();
+        }
 
         // Get extensions
         let extensions = Capability::as_extensions(&capabilities);

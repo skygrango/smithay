@@ -88,9 +88,23 @@ impl Device {
                 .get_physical_device_memory_properties(phd.handle())
         };
 
-        let queue_info = DeviceQueueCreateInfo::default()
+        let has_memory_priority = extensions
+            .iter()
+            .any(|&ext| ext == ash::vk::EXT_MEMORY_PRIORITY_NAME);
+        let has_global_priority = extensions
+            .iter()
+            .any(|&ext| ext == ash::vk::KHR_GLOBAL_PRIORITY_NAME || ext == ash::vk::EXT_GLOBAL_PRIORITY_NAME);
+
+        let mut global_priority_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
+            .global_priority(vk::QueueGlobalPriorityKHR::HIGH);
+
+        let mut queue_info = DeviceQueueCreateInfo::default()
             .queue_family_index(queue_index as u32)
-            .queue_priorities(&[0.0]);
+            .queue_priorities(&[1.0]);
+
+        if has_global_priority {
+            queue_info = queue_info.push_next(&mut global_priority_info);
+        }
 
         let queue_create_infos: &[DeviceQueueCreateInfo<'_>] = &[queue_info];
 
@@ -99,11 +113,33 @@ impl Device {
             .enabled_extension_names(&extension_pointers)
             .push_next(required_features);
 
-        let device = unsafe {
+        let device = match unsafe {
             phd.instance()
                 .handle()
                 .create_device(phd.handle(), &device_info, None)
-                .map_err(DeviceError::Vk)?
+        } {
+            Ok(dev) => dev,
+            Err(err) if has_global_priority => {
+                tracing::warn!(
+                    "Vulkan Device creation with global priority failed: {:?}; falling back to default priority",
+                    err
+                );
+                let fallback_queue_info = DeviceQueueCreateInfo::default()
+                    .queue_family_index(queue_index as u32)
+                    .queue_priorities(&[1.0]);
+                let fallback_queue_create_infos: &[DeviceQueueCreateInfo<'_>] = &[fallback_queue_info];
+                let fallback_device_info = DeviceCreateInfo::default()
+                    .queue_create_infos(fallback_queue_create_infos)
+                    .enabled_extension_names(&extension_pointers)
+                    .push_next(required_features);
+                unsafe {
+                    phd.instance()
+                        .handle()
+                        .create_device(phd.handle(), &fallback_device_info, None)
+                        .map_err(DeviceError::Vk)?
+                }
+            }
+            Err(err) => return Err(DeviceError::Vk(err)),
         };
 
         let queue = unsafe { device.get_device_queue(queue_index as u32, 0) };
@@ -184,6 +220,7 @@ impl Device {
             allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
             pipeline_cache_uuid,
             buffer_image_granularity,
+            has_memory_priority,
         })))
     }
 
@@ -259,8 +296,13 @@ impl Device {
                 host_visible,
                 tiling,
                 self.0.buffer_image_granularity,
+                self.0.has_memory_priority,
             )
         }
+    }
+
+    pub fn has_memory_priority(&self) -> bool {
+        self.0.has_memory_priority
     }
 
     pub fn buffer_image_granularity(&self) -> vk::DeviceSize {
@@ -315,6 +357,7 @@ struct InnerDevice {
     /// this value to align allocations and avoid the undefined behaviour
     /// described in Vulkan spec section 12.7.1.
     pub(super) buffer_image_granularity: vk::DeviceSize,
+    pub(super) has_memory_priority: bool,
 }
 
 impl fmt::Debug for InnerDevice {
