@@ -5,7 +5,7 @@ use crate::backend::{
 use ash::{
     Device as VkDevice, ext, khr,
     vk::{
-        self, DeviceCreateInfo, DeviceQueueCreateInfo, PhysicalDeviceFeatures2,
+        self, DeviceCreateInfo, DeviceQueueCreateInfo, ImageTiling, PhysicalDeviceFeatures2,
         PhysicalDeviceMemoryProperties, Queue, QueueFlags,
     },
 };
@@ -158,6 +158,7 @@ impl Device {
         let mut props = vk::PhysicalDeviceProperties2::default();
         unsafe { phd.get_properties(&mut props) };
         let pipeline_cache_uuid = props.properties.pipeline_cache_uuid;
+        let buffer_image_granularity = props.properties.limits.buffer_image_granularity;
 
         Ok(Device(Arc::new(InnerDevice {
             vk: device,
@@ -182,6 +183,7 @@ impl Device {
             context: ContextId::new(),
             allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
             pipeline_cache_uuid,
+            buffer_image_granularity,
         })))
     }
 
@@ -242,12 +244,27 @@ impl Device {
         size: vk::DeviceSize,
         alignment: vk::DeviceSize,
         memory_type_index: u32,
+        tiling: ImageTiling,
     ) -> Result<(vk::DeviceMemory, vk::DeviceSize, Option<*mut u8>), vk::Result> {
         let host_visible = self.0.mem_properties.memory_types[memory_type_index as usize]
             .property_flags
             .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
         let mut alloc = self.0.allocator.lock().unwrap();
-        unsafe { alloc.allocate(&self.0.vk, size, alignment, memory_type_index, host_visible) }
+        unsafe {
+            alloc.allocate(
+                &self.0.vk,
+                size,
+                alignment,
+                memory_type_index,
+                host_visible,
+                tiling,
+                self.0.buffer_image_granularity,
+            )
+        }
+    }
+
+    pub fn buffer_image_granularity(&self) -> vk::DeviceSize {
+        self.0.buffer_image_granularity
     }
 
     pub(crate) fn free_suballocation(
@@ -290,6 +307,14 @@ struct InnerDevice {
     context: ContextId<VulkanImage>,
     allocator: std::sync::Mutex<super::allocator::VulkanSuballocator>,
     pipeline_cache_uuid: [u8; 16],
+    /// `VkPhysicalDeviceLimits::bufferImageGranularity`.
+    ///
+    /// On some hardware, a Linear image and an Optimal image placed
+    /// in the same `VkDeviceMemory` block must not share the same
+    /// "granularity page" (typically 64 KiB).  The suballocator uses
+    /// this value to align allocations and avoid the undefined behaviour
+    /// described in Vulkan spec section 12.7.1.
+    pub(super) buffer_image_granularity: vk::DeviceSize,
 }
 
 impl fmt::Debug for InnerDevice {

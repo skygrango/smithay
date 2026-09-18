@@ -1,4 +1,8 @@
-use std::{fmt, io, os::fd::IntoRawFd, sync::Arc};
+use std::{
+    fmt, io,
+    os::fd::{AsRawFd, IntoRawFd, OwnedFd},
+    sync::Arc,
+};
 
 pub use ash::vk::ImageUsageFlags;
 use ash::vk::{self, ImageTiling, MemoryPropertyFlags};
@@ -332,7 +336,73 @@ impl VulkanImage {
                 .get_image_memory_requirements2(&image_mem_req_info, &mut mem_reqs2);
         }
         let memory_reqs = mem_reqs2.memory_requirements;
-        let mut alloc_create_info = vk::MemoryAllocateInfo::default().allocation_size(memory_reqs.size);
+
+        // When importing an external DMA-BUF the fd itself has a set of compatible memory types
+        // reported by vkGetMemoryFdPropertiesKHR (VK_KHR_external_memory_fd spec §5.6.1).
+        // We MUST intersect this with the image requirements; otherwise drivers may reject
+        // vkAllocateMemory with VK_ERROR_INVALID_EXTERNAL_HANDLE on cross-GPU / hybrid-GPU setups.
+        let effective_memory_type_bits = if let Some(dmabuf) = dmabuf {
+            let fd_bits = device
+                .vk_khr_external_memory_fd()
+                .and_then(|ext| {
+                    let handle = dmabuf.handles().next()?;
+                    let cloned: OwnedFd = handle.try_clone_to_owned().ok()?;
+                    let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+                    let result = unsafe {
+                        ext.get_memory_fd_properties(
+                            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                            cloned.into_raw_fd(),
+                            &mut fd_props,
+                        )
+                    };
+                    match result {
+                        Ok(()) => Some(fd_props.memory_type_bits),
+                        Err(err) => {
+                            tracing::warn!(
+                                "VulkanImage::new_internal: get_memory_fd_properties failed: {:?}; \
+                                 falling back to image-only memory type bits",
+                                err
+                            );
+                            None
+                        }
+                    }
+                })
+                .unwrap_or(!0u32); // if unavailable: no additional restriction
+            memory_reqs.memory_type_bits & fd_bits
+        } else {
+            memory_reqs.memory_type_bits
+        };
+
+        // The producer (GBM, V4L2, VA-API …) may have allocated the buffer with page-level padding
+        // beyond what Vulkan's memory_reqs.size predicts for this image description.
+        // vkAllocateMemory when importing a DMA-BUF must receive the actual byte-size of the fd,
+        // otherwise some drivers reject the import.  Use lseek(SEEK_END) to obtain it.
+        let dmabuf_fd_size: Option<vk::DeviceSize> = dmabuf.and_then(|dmabuf| {
+            let handle = dmabuf.handles().next()?;
+            match rustix::fs::seek(&handle, rustix::fs::SeekFrom::End(0)) {
+                Ok(sz) if sz >= memory_reqs.size => Some(sz),
+                Ok(sz) => {
+                    tracing::warn!(
+                        "VulkanImage::new_internal: DMA-BUF fd size {} < memory_reqs.size {}; \
+                         using memory_reqs.size",
+                        sz,
+                        memory_reqs.size
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "VulkanImage::new_internal: lseek(SEEK_END) on DMA-BUF fd failed: {:?}; \
+                         using memory_reqs.size",
+                        err
+                    );
+                    None
+                }
+            }
+        });
+        let allocation_size = dmabuf_fd_size.unwrap_or(memory_reqs.size);
+
+        let mut alloc_create_info = vk::MemoryAllocateInfo::default().allocation_size(allocation_size);
 
         let mut mem_bits = None;
         if linear {
@@ -344,7 +414,7 @@ impl VulkanImage {
                 .iter()
                 .enumerate()
             {
-                if (memory_reqs.memory_type_bits & (1 << i)) != 0
+                if (effective_memory_type_bits & (1 << i)) != 0
                     && types.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
                 {
                     let flags = types.property_flags;
@@ -382,7 +452,7 @@ impl VulkanImage {
                 .iter()
                 .enumerate()
             {
-                if (memory_reqs.memory_type_bits & (1 << i)) != 0
+                if (effective_memory_type_bits & (1 << i)) != 0
                     && types.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
                 {
                     alloc_create_info = alloc_create_info.memory_type_index(i as u32);
@@ -399,7 +469,7 @@ impl VulkanImage {
                 .iter()
                 .enumerate()
             {
-                if (memory_reqs.memory_type_bits & (1 << i)) != 0 {
+                if (effective_memory_type_bits & (1 << i)) != 0 {
                     alloc_create_info = alloc_create_info.memory_type_index(i as u32);
                     mem_bits = Some(types.property_flags.clone());
                     break;
@@ -410,7 +480,7 @@ impl VulkanImage {
         let Some(mem_bits) = mem_bits else {
             if width > 1 || height > 1 {
                 tracing::error!(
-                    "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
+                    "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}, effective_bits={:#b}",
                     width,
                     height,
                     fourcc,
@@ -418,30 +488,43 @@ impl VulkanImage {
                     vk_usage,
                     linear,
                     tiling,
-                    memory_reqs.memory_type_bits
+                    memory_reqs.memory_type_bits,
+                    effective_memory_type_bits,
                 );
             } else {
                 tracing::debug!(
-                    "VulkanImage::new_internal probe NoMemoryAvailable: vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}",
+                    "VulkanImage::new_internal probe NoMemoryAvailable: vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}, effective_bits={:#b}",
                     vk_usage,
                     linear,
                     tiling,
-                    memory_reqs.memory_type_bits
+                    memory_reqs.memory_type_bits,
+                    effective_memory_type_bits,
                 );
             }
             return Err(Error::NoMemoryAvailable);
         };
 
+        // Only force dedicated allocation when truly required:
+        //  - DMA-BUF export/import paths (the fd must represent a self-contained buffer)
+        //  - The driver explicitly requires or prefers dedicated allocation for this image
+        //
+        // Removed: `vk_usage.contains(COLOR_ATTACHMENT)` — internal render targets should use the
+        // suballocator just like any other image. Forcing dedicated allocation for every COLOR_ATTACHMENT
+        // would quickly exhaust `maxMemoryAllocationCount` (typically 4096) with shadow passes,
+        // blur intermediates, and per-surface compositor buffers.
         let is_dedicated = modifiers.is_some()
             || dmabuf.is_some()
             || inner.dmabuf_exportable
-            || vk_usage.contains(ImageUsageFlags::COLOR_ATTACHMENT)
             || dedicated_reqs.requires_dedicated_allocation != 0
             || dedicated_reqs.prefers_dedicated_allocation != 0;
 
         let mut import_memory_info: vk::ImportMemoryFdInfoKHR<'_>;
         let mut memory_export_info: vk::ExportMemoryAllocateInfo<'_>;
         let mut memory_dedicated_info: vk::MemoryDedicatedAllocateInfo<'_>;
+        // vkAllocateMemory takes ownership of the fd *only* on success.  We keep it as an OwnedFd
+        // until the call succeeds so Rust's Drop will close it on any early return / error path.
+        // The fd is surrendered to Vulkan via ManuallyDrop::into_raw_fd() after the call succeeds.
+        let mut import_fd_owner: Option<OwnedFd> = None;
 
         if is_dedicated {
             memory_dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(inner.image);
@@ -455,12 +538,14 @@ impl VulkanImage {
 
             if let Some(dmabuf) = dmabuf {
                 let handle = dmabuf.handles().next().unwrap();
+                let cloned: OwnedFd = handle.try_clone_to_owned().map_err(Error::DmabufFdError)?;
+                // Temporarily store the raw fd in the Vulkan struct; `import_fd_owner` retains
+                // the OwnedFd so it is closed on any error before allocate_memory is called.
+                // After a successful call Vulkan owns the fd, so we disarm the guard.
                 import_memory_info = vk::ImportMemoryFdInfoKHR::default()
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                    .fd(handle
-                        .try_clone_to_owned()
-                        .map_err(Error::DmabufFdError)?
-                        .into_raw_fd());
+                    .fd(cloned.as_raw_fd());
+                import_fd_owner = Some(cloned);
                 alloc_create_info = alloc_create_info.push_next(&mut import_memory_info);
             }
 
@@ -477,9 +562,15 @@ impl VulkanImage {
                         );
                         Error::VulkanAllocate(err)
                     })?;
+                // vkAllocateMemory succeeded → Vulkan now owns the fd.  Disarm the guard so
+                // Rust's Drop does not close it a second time.
+                if let Some(owned) = import_fd_owner.take() {
+                    // SAFETY: we are intentionally leaking the fd here; Vulkan takes ownership.
+                    let _ = owned.into_raw_fd();
+                }
                 inner.memory_offset = 0;
                 inner.suballocated = false;
-                inner.allocation_size = memory_reqs.size;
+                inner.allocation_size = allocation_size;
 
                 device
                     .vk()
@@ -494,6 +585,7 @@ impl VulkanImage {
                 memory_reqs.size,
                 memory_reqs.alignment,
                 alloc_create_info.memory_type_index,
+                tiling,
             );
 
             match suballoc_res {
