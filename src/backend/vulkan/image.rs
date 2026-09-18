@@ -346,12 +346,11 @@ impl VulkanImage {
                 .vk_khr_external_memory_fd()
                 .and_then(|ext| {
                     let handle = dmabuf.handles().next()?;
-                    let cloned: OwnedFd = handle.try_clone_to_owned().ok()?;
                     let mut fd_props = vk::MemoryFdPropertiesKHR::default();
                     let result = unsafe {
                         ext.get_memory_fd_properties(
                             vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                            cloned.into_raw_fd(),
+                            handle.as_raw_fd(),
                             &mut fd_props,
                         )
                     };
@@ -380,8 +379,12 @@ impl VulkanImage {
         let dmabuf_fd_size: Option<vk::DeviceSize> = dmabuf.and_then(|dmabuf| {
             let handle = dmabuf.handles().next()?;
             match rustix::fs::seek(&handle, rustix::fs::SeekFrom::End(0)) {
-                Ok(sz) if sz >= memory_reqs.size => Some(sz),
+                Ok(sz) if sz >= memory_reqs.size => {
+                    let _ = rustix::fs::seek(&handle, rustix::fs::SeekFrom::Start(0));
+                    Some(sz)
+                }
                 Ok(sz) => {
+                    let _ = rustix::fs::seek(&handle, rustix::fs::SeekFrom::Start(0));
                     tracing::warn!(
                         "VulkanImage::new_internal: DMA-BUF fd size {} < memory_reqs.size {}; \
                          using memory_reqs.size",
@@ -391,6 +394,7 @@ impl VulkanImage {
                     None
                 }
                 Err(err) => {
+                    let _ = rustix::fs::seek(&handle, rustix::fs::SeekFrom::Start(0));
                     tracing::warn!(
                         "VulkanImage::new_internal: lseek(SEEK_END) on DMA-BUF fd failed: {:?}; \
                          using memory_reqs.size",

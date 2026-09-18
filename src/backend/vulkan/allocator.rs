@@ -162,8 +162,8 @@ impl VulkanSuballocator {
                         buffer_image_granularity,
                     )
                 {
-                    // Advance to the start of the next granularity page.
-                    aligned_offset = align_up(aligned_offset + 1, buffer_image_granularity);
+                    // Advance to the start of the next granularity page and re-align.
+                    aligned_offset = align_up(align_up(aligned_offset + 1, buffer_image_granularity), align);
                 }
 
                 let padding = aligned_offset - chunk.offset;

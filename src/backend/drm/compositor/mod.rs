@@ -1041,6 +1041,7 @@ enum PreparedFrameKind {
 struct PreparedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> {
     frame: CompositorFrameState<A, F>,
     kind: PreparedFrameKind,
+    requires_modeset: bool,
 }
 
 impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame<A, F> {
@@ -1063,6 +1064,7 @@ where
         f.debug_struct("PreparedFrame")
             .field("frame", &self.frame)
             .field("kind", &self.kind)
+            .field("requires_modeset", &self.requires_modeset)
             .finish()
     }
 }
@@ -2276,6 +2278,7 @@ where
                         .unwrap_or(true);
                 modifies_crtc || primary_format_or_pipeline_changed
             });
+        let allow_partial_update = allow_partial_update && !requires_modeset;
         let test_res = next_frame_state.test_state_complete(
             previous_state,
             &self.surface,
@@ -2602,6 +2605,7 @@ where
                 PreparedFrameKind::Full
             },
             frame: next_frame_state,
+            requires_modeset,
         };
         let frame_reference: RenderFrameResult<'a, A::Buffer, F::Framebuffer, E> = RenderFrameResult {
             is_empty: next_frame.is_empty(),
@@ -2755,6 +2759,7 @@ where
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
         trace!(
             commit_pending = self.surface.commit_pending(),
+            requires_modeset = prepared_frame.requires_modeset,
             supports_fencing = self.supports_fencing,
             allow_partial_update,
             planes_count = prepared_frame.frame.planes.len(),
@@ -2773,7 +2778,7 @@ where
                 "  plane in frame"
             );
         }
-        let flip = if self.surface.commit_pending() {
+        let flip = if self.surface.commit_pending() || prepared_frame.requires_modeset {
             prepared_frame
                 .frame
                 .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
