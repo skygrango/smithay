@@ -40,7 +40,13 @@ use ash::vk::{
 use gbm::Modifier;
 use indexmap::IndexSet;
 
-use std::{collections::HashMap, ffi::CStr, fmt, ptr::NonNull, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::CStr,
+    fmt,
+    ptr::NonNull,
+    sync::Arc,
+};
 
 use super::{Blit, BlitFrame, Color32F, HdrOutputConfig, TextureFilter, sdr_color_to_hdr, sync::SyncPoint};
 use tracing::trace;
@@ -97,6 +103,19 @@ pub struct QueuedSubmit {
     pub point: u64,
     pub descs: Vec<self::shaders::DescriptorSet>,
     pub images: Vec<Arc<ImageInner>>,
+}
+
+pub(crate) struct DeferredDestruction {
+    pub point: u64,
+    pub callback: Box<dyn FnOnce(&Device) + Send>,
+}
+
+impl fmt::Debug for DeferredDestruction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredDestruction")
+            .field("point", &self.point)
+            .finish()
+    }
 }
 
 pub struct PendingVulkanShmCopy {
@@ -236,6 +255,7 @@ pub struct VulkanRenderer {
 
     imported_timelines: HashMap<WeakDrmTimeline, vk::Semaphore>,
     pending_waits: Vec<DrmSyncPoint>,
+    deferred_destructions: VecDeque<DeferredDestruction>,
 
     // A bunch of the previous structs contain Weak-device references.
     // So we want to drop this last for proper cleanup and avoiding accidental
@@ -254,6 +274,9 @@ impl Drop for VulkanRenderer {
                     .free_command_buffers(self.cmd_pool.vk(), &[q.cmd_buffer]);
             }
             self.cmd_pool.clean_old_buffers(u64::MAX);
+            for destruction in self.deferred_destructions.drain(..) {
+                (destruction.callback)(&self.device);
+            }
             self.dmabuf_cache.clear();
             if let Some(mut lut) = self.lut3d.take() {
                 lut.destroy(&self.device);
@@ -564,6 +587,7 @@ impl VulkanRenderer {
             bindless_pool,
             batch_submits: false,
             queued_submits: Vec::new(),
+            deferred_destructions: VecDeque::new(),
         })
     }
 
@@ -708,6 +732,14 @@ impl VulkanRenderer {
         }
     }
 
+    /// Defers execution of a destruction closure until the GPU timeline semaphore reaches `point`.
+    pub(crate) fn defer_cleanup(&mut self, point: u64, f: impl FnOnce(&Device) + Send + 'static) {
+        self.deferred_destructions.push_back(DeferredDestruction {
+            point,
+            callback: Box::new(f),
+        });
+    }
+
     pub fn update_3d_lut(&mut self, ref_white: f32, max_content: f32, max_dest: f32) {
         let params = (ref_white as u32, max_content as u32, max_dest as u32);
         if let Some(lut) = self.lut3d.as_ref() {
@@ -718,9 +750,10 @@ impl VulkanRenderer {
         let data = generate_ictcp_tonemap_lut(33, ref_white, 203.0, max_content, max_dest);
         if let Ok(new_lut) = Lut3dTexture::new(&self.device, &data, 33, params) {
             if let Some(mut old) = self.lut3d.take() {
-                unsafe {
-                    old.destroy(&self.device);
-                }
+                let seq = self.seq_no;
+                self.defer_cleanup(seq, move |device| unsafe {
+                    old.destroy(device);
+                });
             }
             self.lut3d = Some(new_lut);
         }
@@ -773,6 +806,18 @@ impl VulkanRenderer {
                 ib.reset();
             }
         }
+
+        // Retire deferred destructions whose timeline point <= val
+        let idx = self.deferred_destructions.iter().position(|d| d.point > val);
+        let ready = if let Some(idx) = idx {
+            self.deferred_destructions.drain(..idx)
+        } else {
+            self.deferred_destructions.drain(..)
+        };
+        for destruction in ready {
+            (destruction.callback)(&self.device);
+        }
+
         self.imported_timelines.retain(|weak, sem| {
             if weak.upgrade().is_none() {
                 unsafe { self.device.vk().destroy_semaphore(*sem, None) };
@@ -2553,7 +2598,12 @@ impl VulkanFrame<'_, '_> {
                     vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
                     false,
                 )?;
-                self.depth_image = Some(img);
+                let old = self.depth_image.replace(img);
+                if let Some(old_depth) = old {
+                    if !self.images.iter().any(|i| Arc::ptr_eq(i, &old_depth.inner)) {
+                        self.images.push(old_depth.inner.clone());
+                    }
+                }
             }
 
             let depth_img = self.depth_image.as_ref().unwrap();
@@ -3631,6 +3681,11 @@ impl Frame for VulkanFrame<'_, '_> {
         let mut images = std::mem::take(&mut self.images);
         if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
             images.push(self.fb.0.inner.clone());
+        }
+        if let Some(depth) = self.depth_image.take() {
+            if !images.iter().any(|img| Arc::ptr_eq(img, &depth.inner)) {
+                images.push(depth.inner.clone());
+            }
         }
 
         if self.renderer.batch_submits {
