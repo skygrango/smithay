@@ -69,6 +69,11 @@ impl PixelShaderElement {
         self.commit_counter.increment();
     }
 
+    /// Returns the additional uniforms of this element
+    pub fn additional_uniforms(&self) -> &[Uniform<'static>] {
+        &self.additional_uniforms
+    }
+
     /// Creates a dummy pixel shader element that performs no rendering.
     pub fn dummy() -> Self {
         Self::new(

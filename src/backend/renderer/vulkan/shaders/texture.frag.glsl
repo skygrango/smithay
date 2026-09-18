@@ -8,13 +8,55 @@ layout(binding = 0) uniform sampler2D tex;
 layout(push_constant, std140) uniform PushConstants {
     vec4 dstRect;
     vec2 screenSize;
-    vec2 _pad0;
+    float depth;
+    float _pad0;
     vec4 srcRect;
     uint srcTransform;
     float alpha;
     uint hasAlpha;
     uint _pad1;
+    vec4 clipRect;
+    vec4 cornerRadius;
 } params;
+
+float get_clip_alpha() {
+    if (params.clipRect.z <= 0.0 && params.cornerRadius == vec4(0.0)) {
+        return 1.0;
+    }
+    vec2 pixel = params.dstRect.xy + v_pos * params.dstRect.zw;
+    vec2 coords = pixel - params.clipRect.xy;
+    vec2 size = params.clipRect.zw;
+
+    if (coords.x < 0.0 || coords.x > size.x || coords.y < 0.0 || coords.y > size.y) {
+        return 0.0;
+    }
+
+    if (params.cornerRadius == vec4(0.0)) {
+        return 1.0;
+    }
+
+    vec2 center;
+    float radius;
+
+    if (coords.x < params.cornerRadius.x && coords.y < params.cornerRadius.x) {
+        radius = params.cornerRadius.x;
+        center = vec2(radius, radius);
+    } else if (size.x - params.cornerRadius.y < coords.x && coords.y < params.cornerRadius.y) {
+        radius = params.cornerRadius.y;
+        center = vec2(size.x - radius, radius);
+    } else if (size.x - params.cornerRadius.z < coords.x && size.y - params.cornerRadius.z < coords.y) {
+        radius = params.cornerRadius.z;
+        center = vec2(size.x - radius, size.y - radius);
+    } else if (coords.x < params.cornerRadius.w && size.y - params.cornerRadius.w < coords.y) {
+        radius = params.cornerRadius.w;
+        center = vec2(radius, size.y - radius);
+    } else {
+        return 1.0;
+    }
+
+    float dist = distance(coords, center);
+    return 1.0 - smoothstep(radius - 0.5, radius + 0.5, dist);
+}
 
 vec2 applyTransform(vec2 uv, uint transform) {
     switch (transform) {
@@ -39,6 +81,11 @@ vec2 applyTransform(vec2 uv, uint transform) {
 }
 
 void main() {
+    float clip_a = get_clip_alpha();
+    if (clip_a <= 0.0) {
+        discard;
+    }
+
     uvec2 texSize = textureSize(tex, 0);
     vec2 srcUV = ((v_pos * params.srcRect.zw) + params.srcRect.xy) / vec2(texSize);
     vec2 uv = applyTransform(srcUV, params.srcTransform);
@@ -46,5 +93,5 @@ void main() {
     if (params.hasAlpha == 0) {
         raw.a = 1.0;
     }
-    outColor = raw * params.alpha;
+    outColor = raw * (params.alpha * clip_a);
 }

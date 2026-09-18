@@ -33,6 +33,14 @@ pub const SPEC_MODE_SDR: u32 = 2;
 pub const SPEC_MODE_PQ: u32 = 3;
 pub const SPEC_MODE_LUT3D: u32 = 4;
 
+pub const HDR_FLAG_HARDWARE_OFFLOAD: u32 = 1 << 0;
+pub const HDR_FLAG_TARGET_IS_SDR: u32 = 1 << 1;
+pub const HDR_FLAG_INPUT_IS_PQ: u32 = 1 << 2;
+pub const HDR_FLAG_INPUT_IS_HLG: u32 = 1 << 3;
+pub const HDR_FLAG_INPUT_PRIMARIES_SHIFT: u32 = 4;
+pub const HDR_FLAG_INPUT_PRIMARIES_MASK: u32 = 3 << 4;
+pub const HDR_FLAG_SKIP_COLOR_TRANSFORM: u32 = 1 << 6;
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, NoUninit)]
 pub struct HdrTexPushConstants {
@@ -49,12 +57,9 @@ pub struct HdrTexPushConstants {
     pub gamut_stretch: f32,
     pub max_content_luminance: f32,
     pub max_destination_luminance: f32,
-    pub hardware_offload: u32,
-    pub target_is_sdr: u32,
-    pub input_is_pq: u32,
-    pub input_is_hlg: u32,
-    pub input_primaries: u32,
-    pub skip_color_transform: u32,
     pub content_reference: f32,
-    pub _pad1: u32,
+    pub flags: u32,
+    pub _pad1: [u32; 2],
+    pub clip_rect: Rectangle<f32, Physical>,
+    pub corner_radius: [f32; 4],
 }

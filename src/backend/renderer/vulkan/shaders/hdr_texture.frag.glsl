@@ -28,15 +28,58 @@ layout(push_constant, std140) uniform PushConstants {
     float gamutStretch;
     float maxContentLuminance;
     float maxDestinationLuminance;
-    uint hardwareOffload;
-    uint targetIsSdr;
-    uint inputIsPq;
-    uint inputIsHlg;
-    uint inputPrimaries;
-    uint skipColorTransform;
     float contentReference;
-    uint _pad1;
+    uint flags;
+    vec2 _pad1;
+    vec4 clipRect;
+    vec4 cornerRadius;
 } params;
+
+bool flag_hardware_offload()     { return (params.flags & (1u << 0)) != 0u; }
+bool flag_target_is_sdr()        { return (params.flags & (1u << 1)) != 0u; }
+bool flag_input_is_pq()          { return (params.flags & (1u << 2)) != 0u; }
+bool flag_input_is_hlg()         { return (params.flags & (1u << 3)) != 0u; }
+uint flag_input_primaries()      { return (params.flags >> 4u) & 3u; }
+bool flag_skip_color_transform() { return (params.flags & (1u << 6)) != 0u; }
+
+float get_clip_alpha() {
+    if (params.clipRect.z <= 0.0 && params.cornerRadius == vec4(0.0)) {
+        return 1.0;
+    }
+    vec2 pixel = params.dstRect.xy + v_pos * params.dstRect.zw;
+    vec2 coords = pixel - params.clipRect.xy;
+    vec2 size = params.clipRect.zw;
+
+    if (coords.x < 0.0 || coords.x > size.x || coords.y < 0.0 || coords.y > size.y) {
+        return 0.0;
+    }
+
+    if (params.cornerRadius == vec4(0.0)) {
+        return 1.0;
+    }
+
+    vec2 center;
+    float radius;
+
+    if (coords.x < params.cornerRadius.x && coords.y < params.cornerRadius.x) {
+        radius = params.cornerRadius.x;
+        center = vec2(radius, radius);
+    } else if (size.x - params.cornerRadius.y < coords.x && coords.y < params.cornerRadius.y) {
+        radius = params.cornerRadius.y;
+        center = vec2(size.x - radius, radius);
+    } else if (size.x - params.cornerRadius.z < coords.x && size.y - params.cornerRadius.z < coords.y) {
+        radius = params.cornerRadius.z;
+        center = vec2(size.x - radius, size.y - radius);
+    } else if (coords.x < params.cornerRadius.w && size.y - params.cornerRadius.w < coords.y) {
+        radius = params.cornerRadius.w;
+        center = vec2(radius, size.y - radius);
+    } else {
+        return 1.0;
+    }
+
+    float dist = distance(coords, center);
+    return 1.0 - smoothstep(radius - 0.5, radius + 0.5, dist);
+}
 
 // Linear Rec.709 to linear BT.2020. Column-major GLSL constructor.
 const mat3 rec709_to_bt2020 = mat3(
@@ -179,12 +222,12 @@ vec3 tonemap_ictcp(vec3 linear_10k) {
 }
 
 vec3 source_to_linear_10k(vec3 raw_rgb) {
-    if (SPEC_MODE == 3u || (SPEC_MODE == 0u && params.inputIsPq != 0)) {
+    if (SPEC_MODE == 3u || (SPEC_MODE == 0u && flag_input_is_pq())) {
         vec3 linear_10k = pq_to_linear_v(raw_rgb);
         float ref_scale = clamp(params.referenceWhite, 80.0, 10000.0) / max(params.contentReference, 80.0);
         linear_10k *= ref_scale;
         return tonemap_ictcp(linear_10k);
-    } else if (SPEC_MODE == 0u && params.inputIsHlg != 0) {
+    } else if (SPEC_MODE == 0u && flag_input_is_hlg()) {
         vec3 scene = vec3(
             hlg_to_scene(raw_rgb.r),
             hlg_to_scene(raw_rgb.g),
@@ -198,9 +241,9 @@ vec3 source_to_linear_10k(vec3 raw_rgb) {
     } else {
         vec3 linear_input = decode_sdr_v(raw_rgb, params.sdrGamma);
         vec3 linear_bt2020;
-        if (SPEC_MODE == 0u && params.inputPrimaries == 1) {
+        if (SPEC_MODE == 0u && flag_input_primaries() == 1u) {
             linear_bt2020 = p3_to_bt2020 * linear_input;
-        } else if (SPEC_MODE == 0u && params.inputPrimaries == 2) {
+        } else if (SPEC_MODE == 0u && flag_input_primaries() == 2u) {
             linear_bt2020 = linear_input;
         } else {
             linear_bt2020 = mix(rec709_to_bt2020 * linear_input, linear_input, clamp(params.gamutStretch, 0.0, 1.0));
@@ -234,14 +277,31 @@ vec2 applyTransform(vec2 uv, uint transform) {
     return uv;
 }
 
-float optical_alpha_pq(float a, float ref_white) {
-    if (params.targetIsSdr != 0 || params.hardwareOffload != 0) {
+float optical_alpha_pq(float a, float ref_white, vec3 rgb) {
+    if (flag_target_is_sdr() || flag_hardware_offload()) {
         return a;
     }
     if (a <= 0.0001) return 0.0;
     if (a >= 0.9999) return 1.0;
     float white_norm = clamp(ref_white, 80.0, 10000.0) / 10000.0;
     float pq_white = encode_pq(white_norm);
+
+    // Drop shadows and absorbing occluders (rgb == 0) attenuate ambient background
+    // light rather than emitting optical light. In non-linear PQ framebuffers,
+    // hardware blending with ONE_MINUS_SRC_ALPHA performs:
+    //   E_dst_new = E_dst * (1.0 - alpha_blend)
+    // To match the physical luminance attenuation (1 - a)^gamma of SDR blending:
+    //   E_dst * (1.0 - alpha_pq) = PQ(L_bg * (1 - a)^gamma)
+    // Solving for alpha_pq gives:
+    //   alpha_pq = 1.0 - PQ(white_norm * (1 - a)^gamma) / pq_white
+    // This perfectly preserves the smooth Gaussian gradient falloff to zero and
+    // prevents shadow darkening distortion on HDR displays.
+    if (max(rgb.r, max(rgb.g, rgb.b)) < 0.001) {
+        float gamma = params.sdrGamma > 0.0 ? params.sdrGamma : 2.2;
+        float atten = pow(clamp(1.0 - a, 0.0, 1.0), gamma);
+        float pq_atten = encode_pq(white_norm * atten);
+        return clamp(1.0 - (pq_atten / max(pq_white, 0.001)), 0.0, 1.0);
+    }
     float pq_lum = encode_pq(white_norm * a);
     return clamp(pq_lum / max(pq_white, 0.001), 0.0, 1.0);
 }
@@ -299,6 +359,11 @@ vec3 tetrahedral_sample(sampler3D lut, vec3 color, float lut_size) {
 }
 
 void main() {
+    float clip_a = get_clip_alpha();
+    if (clip_a <= 0.0) {
+        discard;
+    }
+
     uvec2 texSize = textureSize(tex, 0);
     vec2 srcUV = ((v_pos * params.srcRect.zw) + params.srcRect.xy) / vec2(texSize);
     vec2 uv = applyTransform(srcUV, params.srcTransform);
@@ -309,25 +374,28 @@ void main() {
 
     float src_a = raw.a;
     vec3 raw_rgb = src_a > 0.00001 ? raw.rgb / src_a : vec3(0.0);
-    float eff_alpha = clamp(src_a * params.alpha, 0.0, 1.0);
+    float eff_alpha = clamp(src_a * params.alpha * clip_a, 0.0, 1.0);
+    if (eff_alpha <= 0.0001) {
+        discard;
+    }
 
-    bool skip_transform = (SPEC_MODE == 1u) || (SPEC_MODE == 0u && params.skipColorTransform != 0);
+    bool skip_transform = (SPEC_MODE == 1u) || (SPEC_MODE == 0u && flag_skip_color_transform());
     if (skip_transform) {
-        if (params.targetIsSdr != 0) {
+        if (flag_target_is_sdr()) {
             outColor = vec4(raw_rgb * eff_alpha, eff_alpha);
             return;
         }
-        float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite);
+        float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite, raw_rgb);
         outColor = vec4(raw_rgb * opt_a, opt_a);
         return;
     }
 
     if (SPEC_MODE == 4u) {
         vec3 mapped_rgb = tetrahedral_sample(lut3d, raw_rgb, 33.0);
-        if (params.targetIsSdr != 0) {
+        if (flag_target_is_sdr()) {
             outColor = vec4(mapped_rgb * eff_alpha, eff_alpha);
         } else {
-            float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite);
+            float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite, mapped_rgb);
             outColor = vec4(mapped_rgb * opt_a, opt_a);
         }
         return;
@@ -335,7 +403,7 @@ void main() {
 
     vec3 src_linear_10k = source_to_linear_10k(raw_rgb);
 
-    if (params.targetIsSdr != 0) {
+    if (flag_target_is_sdr()) {
         float inv_white = 10000.0 / clamp(params.referenceWhite, 80.0, 10000.0);
         vec3 linear_sdr_bt2020 = src_linear_10k * inv_white;
         vec3 rec709 = clamp(bt2020_to_rec709 * linear_sdr_bt2020, vec3(0.0), vec3(1.0));
@@ -344,7 +412,7 @@ void main() {
         return;
     }
 
-    if (params.hardwareOffload != 0) {
+    if (flag_hardware_offload()) {
         float ref_white = clamp(params.referenceWhite, 80.0, 10000.0);
         vec3 src_linear = src_linear_10k * (10000.0 / ref_white);
         outColor = vec4(src_linear * eff_alpha, eff_alpha);
@@ -352,6 +420,6 @@ void main() {
     }
 
     vec3 out_pq = encode_pq_v(src_linear_10k);
-    float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite);
+    float opt_a = optical_alpha_pq(eff_alpha, params.referenceWhite, raw_rgb);
     outColor = vec4(out_pq * opt_a, opt_a);
 }

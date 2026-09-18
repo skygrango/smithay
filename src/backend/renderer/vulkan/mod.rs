@@ -1062,6 +1062,7 @@ impl Renderer for VulkanRenderer {
             _marker: std::marker::PhantomData,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
+            active_clip: None,
             is_blit: false,
             rendering: false,
             depth_enabled: false,
@@ -2256,6 +2257,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<crate::wayland::color::management::ImageDescription>,
+    active_clip: Option<(Rectangle<i32, Physical>, [f32; 4])>,
     is_blit: bool,
     rendering: bool,
     pub(crate) depth_enabled: bool,
@@ -2955,6 +2957,20 @@ impl VulkanFrame<'_, '_> {
     }
 }
 
+pub fn transform_corner_radius(radii: [f32; 4], transform: Transform) -> [f32; 4] {
+    let [tl, tr, br, bl] = radii;
+    match transform {
+        Transform::Normal => [tl, tr, br, bl],
+        Transform::_90 => [bl, tl, tr, br],
+        Transform::_180 => [br, bl, tl, tr],
+        Transform::_270 => [tr, br, bl, tl],
+        Transform::Flipped => [tr, tl, bl, br],
+        Transform::Flipped90 => [tl, bl, br, tr],
+        Transform::Flipped180 => [bl, br, tr, tl],
+        Transform::Flipped270 => [br, tr, tl, bl],
+    }
+}
+
 impl Frame for VulkanFrame<'_, '_> {
     type Error = Error;
     type TextureId = VulkanImage;
@@ -2965,6 +2981,10 @@ impl Frame for VulkanFrame<'_, '_> {
         desc: Option<&crate::wayland::color::management::ImageDescription>,
     ) {
         self.active_color_description = desc.cloned();
+    }
+
+    fn set_surface_clip(&mut self, clip: Option<(Rectangle<i32, Physical>, [f32; 4])>) {
+        self.active_clip = clip;
     }
 
     fn context_id(&self) -> ContextId<Self::TextureId> {
@@ -3059,6 +3079,105 @@ impl Frame for VulkanFrame<'_, '_> {
         color: Color32F,
     ) -> Result<(), Self::Error> {
         self.draw_color(dst, damage, color, true)
+    }
+
+    fn draw_rounded_outline(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        thickness: f32,
+        radius: [f32; 4],
+        color: Color32F,
+    ) -> Result<(), Self::Error> {
+        trace!(
+            ?dst,
+            damage_len = damage.len(),
+            thickness,
+            ?radius,
+            ?color,
+            fb_size = ?self.size,
+            "VulkanFrame::draw_rounded_outline executing"
+        );
+        if damage.is_empty() {
+            return Ok(());
+        }
+        let untransformed_dst = dst;
+        let transformed_dst = self.transform.transform_rect_in(dst, &self.size);
+        let transformed_radii = transform_corner_radius(radius, self.transform);
+
+        let color = if let Some(config) = self.renderer.hdr_config {
+            sdr_color_to_hdr(
+                color,
+                config.reference_white,
+                config.sdr_gamma,
+                config.gamut_stretch,
+                config.hardware_offload,
+                config.is_sdr,
+            )
+        } else {
+            color
+        };
+
+        let fb_format = self.fb.0.format();
+        let format_pipelines = self
+            .renderer
+            .pipelines
+            .get_or_create_format_pipelines(fb_format, self.depth_enabled)?;
+        let pipeline = format_pipelines.outline_blend_pipeline;
+        let layout = *self.renderer.pipelines.outline_pipeline_layout();
+
+        let buf = self.ensure_rendering()?;
+        self.has_draws = true;
+
+        unsafe {
+            self.renderer
+                .device
+                .vk()
+                .cmd_bind_pipeline(buf, PipelineBindPoint::GRAPHICS, pipeline);
+        }
+
+        let dst_rect = Rectangle::new(
+            Point::new(transformed_dst.loc.x as f32, transformed_dst.loc.y as f32),
+            Size::new(transformed_dst.size.w as f32, transformed_dst.size.h as f32),
+        );
+        let screen_size = [self.size.w as f32, self.size.h as f32];
+        let depth_val = if self.depth_enabled {
+            self.current_depth
+        } else {
+            0.0
+        };
+
+        let push_constants = shaders::OutlinePushConstants {
+            dst_rect,
+            screen_size,
+            depth: depth_val,
+            thickness,
+            color: color.components(),
+            corner_radius: transformed_radii,
+        };
+
+        unsafe {
+            self.renderer.device.vk().cmd_push_constants(
+                buf,
+                layout,
+                ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&push_constants),
+            );
+        }
+
+        let scissors = calculate_damage_scissors(
+            damage,
+            untransformed_dst,
+            self.transform,
+            &self.size,
+            self.fb.width(),
+            self.fb.height(),
+        );
+
+        self.draw_quads(buf, &scissors);
+
+        Ok(())
     }
 
     fn render_texture_from_to(
@@ -3280,6 +3399,23 @@ impl Frame for VulkanFrame<'_, '_> {
             0.0
         };
 
+        let (clip_rect, corner_radius) = if let Some((geo, radii)) = self.active_clip {
+            let transformed_geo = self.transform.transform_rect_in(geo, &self.size);
+            let transformed_radii = transform_corner_radius(radii, self.transform);
+            (
+                Rectangle::new(
+                    Point::new(transformed_geo.loc.x as f32, transformed_geo.loc.y as f32),
+                    Size::new(transformed_geo.size.w as f32, transformed_geo.size.h as f32),
+                ),
+                transformed_radii,
+            )
+        } else {
+            (
+                Rectangle::new(Point::new(0.0, 0.0), Size::new(0.0, 0.0)),
+                [0.0; 4],
+            )
+        };
+
         let (layout, pipeline, hdr_push_constants) = if is_hdr {
             let (config, is_hdr_to_sdr) = if let Some(ref blit_cfg) = self.hdr_to_sdr {
                 (*blit_cfg, true)
@@ -3390,6 +3526,24 @@ impl Frame for VulkanFrame<'_, '_> {
                 }
             }
 
+            let mut flags = 0u32;
+            if hardware_offload != 0 {
+                flags |= shaders::HDR_FLAG_HARDWARE_OFFLOAD;
+            }
+            if target_is_sdr != 0 {
+                flags |= shaders::HDR_FLAG_TARGET_IS_SDR;
+            }
+            if input_is_pq != 0 {
+                flags |= shaders::HDR_FLAG_INPUT_IS_PQ;
+            }
+            if input_is_hlg != 0 {
+                flags |= shaders::HDR_FLAG_INPUT_IS_HLG;
+            }
+            flags |= (input_primaries & 3) << shaders::HDR_FLAG_INPUT_PRIMARIES_SHIFT;
+            if skip_color_transform != 0 {
+                flags |= shaders::HDR_FLAG_SKIP_COLOR_TRANSFORM;
+            }
+
             let push_constants = HdrTexPushConstants {
                 dst_rect,
                 screen_size,
@@ -3404,14 +3558,11 @@ impl Frame for VulkanFrame<'_, '_> {
                 gamut_stretch,
                 max_content_luminance,
                 max_destination_luminance,
-                hardware_offload,
-                target_is_sdr,
-                input_is_pq,
-                input_is_hlg,
-                input_primaries,
-                skip_color_transform,
                 content_reference,
-                _pad1: 0,
+                flags,
+                _pad1: [0; 2],
+                clip_rect,
+                corner_radius,
             };
 
             let chosen_pipeline = if should_blend {
@@ -3498,6 +3649,8 @@ impl Frame for VulkanFrame<'_, '_> {
                 alpha,
                 has_alpha,
                 _pad1: 0,
+                clip_rect,
+                corner_radius,
             };
 
             unsafe {
@@ -3804,6 +3957,7 @@ impl Blit for VulkanRenderer {
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
+            active_clip: None,
             is_blit: true,
             rendering: false,
             depth_enabled: false,
@@ -3870,6 +4024,7 @@ impl Blit for VulkanRenderer {
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
+            active_clip: None,
             is_blit: true,
             rendering: false,
             depth_enabled: false,
@@ -4283,18 +4438,41 @@ mod test {
 
     #[test]
     fn test_push_constants_memory_layout() {
-        use super::shaders::{ClearPushConstants, HdrTexPushConstants, TexPushConstants};
+        use super::shaders::{
+            ClearPushConstants, HdrTexPushConstants, OutlinePushConstants, TexPushConstants,
+        };
 
         // Push constant blocks must have 16-byte alignment and fit in 128 bytes
         assert_eq!(align_of::<ClearPushConstants>(), 16);
         assert_eq!(size_of::<ClearPushConstants>(), 48);
 
         assert_eq!(align_of::<TexPushConstants>(), 16);
-        assert_eq!(size_of::<TexPushConstants>(), 64);
+        assert_eq!(size_of::<TexPushConstants>(), 96);
+        assert!(size_of::<TexPushConstants>() <= 128);
 
         assert_eq!(align_of::<HdrTexPushConstants>(), 16);
-        assert_eq!(size_of::<HdrTexPushConstants>(), 112);
+        assert_eq!(size_of::<HdrTexPushConstants>(), 128);
         assert!(size_of::<HdrTexPushConstants>() <= 128);
+
+        assert_eq!(align_of::<OutlinePushConstants>(), 16);
+        assert_eq!(size_of::<OutlinePushConstants>(), 64);
+        assert!(size_of::<OutlinePushConstants>() <= 128);
+    }
+
+    #[test]
+    fn test_transform_corner_radius() {
+        let r = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            transform_corner_radius(r, Transform::Normal),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(transform_corner_radius(r, Transform::_90), [4.0, 1.0, 2.0, 3.0]);
+        assert_eq!(transform_corner_radius(r, Transform::_180), [3.0, 4.0, 1.0, 2.0]);
+        assert_eq!(transform_corner_radius(r, Transform::_270), [2.0, 3.0, 4.0, 1.0]);
+        assert_eq!(
+            transform_corner_radius(r, Transform::Flipped),
+            [2.0, 1.0, 4.0, 3.0]
+        );
     }
 
     #[test]

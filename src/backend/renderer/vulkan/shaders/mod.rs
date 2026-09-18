@@ -11,17 +11,22 @@ use crate::backend::{
 mod clear;
 mod descriptor;
 mod hdr_texture;
+mod outline;
 mod texture;
 use self::clear::*;
 pub use self::descriptor::DescriptorSet;
 use self::hdr_texture::*;
+use self::outline::*;
 use self::texture::*;
 pub use self::{
     clear::ClearPushConstants,
     hdr_texture::{
-        HdrTexPushConstants, SPEC_MODE_GENERIC, SPEC_MODE_LUT3D, SPEC_MODE_PASSTHROUGH, SPEC_MODE_PQ,
-        SPEC_MODE_SDR,
+        HDR_FLAG_HARDWARE_OFFLOAD, HDR_FLAG_INPUT_IS_HLG, HDR_FLAG_INPUT_IS_PQ,
+        HDR_FLAG_INPUT_PRIMARIES_MASK, HDR_FLAG_INPUT_PRIMARIES_SHIFT, HDR_FLAG_SKIP_COLOR_TRANSFORM,
+        HDR_FLAG_TARGET_IS_SDR, HdrTexPushConstants, SPEC_MODE_GENERIC, SPEC_MODE_LUT3D,
+        SPEC_MODE_PASSTHROUGH, SPEC_MODE_PQ, SPEC_MODE_SDR,
     },
+    outline::OutlinePushConstants,
     texture::TexPushConstants,
 };
 
@@ -50,6 +55,8 @@ pub struct FormatPipelines {
     pub hdr_pq_blend_pipeline: Pipeline,
     pub hdr_lut3d_pipeline: Pipeline,
     pub hdr_lut3d_blend_pipeline: Pipeline,
+    pub outline_pipeline: Pipeline,
+    pub outline_blend_pipeline: Pipeline,
 }
 
 #[derive(Debug)]
@@ -61,6 +68,7 @@ pub struct Pipelines {
     clear_layout: PipelineLayout,
     tex_layout: PipelineLayout,
     hdr_tex_layout: PipelineLayout,
+    outline_layout: PipelineLayout,
 
     tex_desc_pool: DescriptorAllocator,
     hdr_tex_desc_pool: DescriptorAllocator,
@@ -69,6 +77,7 @@ pub struct Pipelines {
     clear_frag: vk::ShaderModule,
     tex_frag: vk::ShaderModule,
     hdr_tex_frag: vk::ShaderModule,
+    outline_frag: vk::ShaderModule,
 
     format_pipelines: HashMap<(vk::Format, bool), FormatPipelines>,
 }
@@ -165,6 +174,14 @@ impl Pipelines {
                 .map_err(Error::Shader)?
         };
 
+        let create_info = vk::ShaderModuleCreateInfo::default().code(spirv_u32(OUTLINE_SHADER));
+        let outline_frag = unsafe {
+            device
+                .vk()
+                .create_shader_module(&create_info, None)
+                .map_err(Error::Shader)?
+        };
+
         let layout_flags = if device.vk_khr_push_descriptor().is_some() {
             vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
         } else {
@@ -178,6 +195,19 @@ impl Pipelines {
             .size(std::mem::size_of::<ClearPushConstants>() as u32)];
         let create_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&constants);
         let clear_layout = unsafe {
+            device
+                .vk()
+                .create_pipeline_layout(&create_info, None)
+                .map_err(Error::PipelineLayout)?
+        };
+
+        // Outline pipeline layout (0 descriptor sets)
+        let constants = [vk::PushConstantRange::default()
+            .stage_flags(ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<OutlinePushConstants>() as u32)];
+        let create_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&constants);
+        let outline_layout = unsafe {
             device
                 .vk()
                 .create_pipeline_layout(&create_info, None)
@@ -246,6 +276,7 @@ impl Pipelines {
             clear_layout,
             tex_layout,
             hdr_tex_layout,
+            outline_layout,
 
             tex_desc_pool,
             hdr_tex_desc_pool,
@@ -254,6 +285,7 @@ impl Pipelines {
             clear_frag,
             tex_frag,
             hdr_tex_frag,
+            outline_frag,
 
             format_pipelines: HashMap::new(),
         })
@@ -287,6 +319,11 @@ impl Pipelines {
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
             .module(self.tex_frag);
+
+        let outline_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.outline_frag);
 
         let spec_entry = [vk::SpecializationMapEntry::default()
             .constant_id(0)
@@ -415,6 +452,12 @@ impl Pipelines {
         let mut r13 = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_attachment_formats)
             .depth_attachment_format(depth_format);
+        let mut r14 = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_attachment_formats)
+            .depth_attachment_format(depth_format);
+        let mut r15 = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_attachment_formats)
+            .depth_attachment_format(depth_format);
 
         let opaque_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(has_depth)
@@ -451,6 +494,7 @@ impl Pipelines {
         let hdr_sdr_stages = [vertex_stage, hdr_sdr_stage];
         let hdr_pq_stages = [vertex_stage, hdr_pq_stage];
         let hdr_lut3d_stages = [vertex_stage, hdr_lut3d_stage];
+        let outline_stages = [vertex_stage, outline_stage];
 
         let base_ci = vk::GraphicsPipelineCreateInfo::default()
             .vertex_input_state(&vertex_input)
@@ -559,6 +603,20 @@ impl Pipelines {
                 .color_blend_state(&alpha_blend_state)
                 .depth_stencil_state(&blend_depth_stencil)
                 .layout(self.hdr_tex_layout),
+            // 14: outline opaque
+            base_ci
+                .push_next(&mut r14)
+                .stages(&outline_stages)
+                .color_blend_state(&opaque_blend_state)
+                .depth_stencil_state(&opaque_depth_stencil)
+                .layout(self.outline_layout),
+            // 15: outline blend
+            base_ci
+                .push_next(&mut r15)
+                .stages(&outline_stages)
+                .color_blend_state(&alpha_blend_state)
+                .depth_stencil_state(&blend_depth_stencil)
+                .layout(self.outline_layout),
         ];
 
         let pipelines = unsafe {
@@ -589,6 +647,8 @@ impl Pipelines {
             hdr_pq_blend_pipeline: pipelines[11],
             hdr_lut3d_pipeline: pipelines[12],
             hdr_lut3d_blend_pipeline: pipelines[13],
+            outline_pipeline: pipelines[14],
+            outline_blend_pipeline: pipelines[15],
         };
 
         self.format_pipelines
@@ -644,6 +704,10 @@ impl Pipelines {
         &self.hdr_tex_layout
     }
 
+    pub fn outline_pipeline_layout(&self) -> &PipelineLayout {
+        &self.outline_layout
+    }
+
     pub fn alloc_descriptor_set(&mut self, shader: BuiltinShader) -> Result<DescriptorSet, Error> {
         match shader {
             BuiltinShader::Clear => self.tex_desc_pool.alloc_descriptor_set().map_err(Into::into),
@@ -675,15 +739,19 @@ impl Drop for Pipelines {
                     device.vk().destroy_pipeline(p.hdr_pq_blend_pipeline, None);
                     device.vk().destroy_pipeline(p.hdr_lut3d_pipeline, None);
                     device.vk().destroy_pipeline(p.hdr_lut3d_blend_pipeline, None);
+                    device.vk().destroy_pipeline(p.outline_pipeline, None);
+                    device.vk().destroy_pipeline(p.outline_blend_pipeline, None);
                 }
                 device.vk().destroy_shader_module(self.quad_vert, None);
                 device.vk().destroy_shader_module(self.clear_frag, None);
                 device.vk().destroy_shader_module(self.tex_frag, None);
                 device.vk().destroy_shader_module(self.hdr_tex_frag, None);
+                device.vk().destroy_shader_module(self.outline_frag, None);
 
                 device.vk().destroy_pipeline_layout(self.clear_layout, None);
                 device.vk().destroy_pipeline_layout(self.tex_layout, None);
                 device.vk().destroy_pipeline_layout(self.hdr_tex_layout, None);
+                device.vk().destroy_pipeline_layout(self.outline_layout, None);
                 device.vk().destroy_pipeline_cache(self.cache, None);
             }
         }

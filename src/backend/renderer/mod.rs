@@ -296,6 +296,19 @@ pub trait Frame {
         color: Color32F,
     ) -> Result<(), Self::Error>;
 
+    /// Draw a rounded outline (or filled rounded rectangle if thickness <= 0) to the current target.
+    fn draw_rounded_outline(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        thickness: f32,
+        radius: [f32; 4],
+        color: Color32F,
+    ) -> Result<(), Self::Error> {
+        let _ = (dst, damage, thickness, radius, color);
+        Ok(())
+    }
+
     /// Sets the color description of the surface currently being drawn.
     #[cfg(feature = "wayland_frontend")]
     fn set_surface_color_description(
@@ -303,6 +316,9 @@ pub trait Frame {
         _desc: Option<&crate::wayland::color::management::ImageDescription>,
     ) {
     }
+
+    /// Sets the clipping parameters (geometry and corner radii in physical pixels) of the surface currently being drawn.
+    fn set_surface_clip(&mut self, _clip: Option<(Rectangle<i32, Physical>, [f32; 4])>) {}
 
     /// Render a texture to the current target as a flat 2d-plane at a given
     /// position and applying the given transformation with the given alpha value.

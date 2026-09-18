@@ -31,4 +31,6 @@ pub struct TexPushConstants {
     pub alpha: f32,
     pub has_alpha: u32,
     pub _pad1: u32,
+    pub clip_rect: Rectangle<f32, Physical>,
+    pub corner_radius: [f32; 4],
 }

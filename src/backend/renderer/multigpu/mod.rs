@@ -2108,6 +2108,27 @@ where
 
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
+    fn draw_rounded_outline(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        thickness: f32,
+        radius: [f32; 4],
+        color: Color32F,
+    ) -> Result<(), Self::Error> {
+        self.damage.extend(damage.iter().copied().map(|mut rect| {
+            rect.loc += dst.loc;
+            rect
+        }));
+        self.frame
+            .as_mut()
+            .unwrap()
+            .draw_rounded_outline(dst, damage, thickness, radius, color)
+            .map_err(Error::Render)
+    }
+
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
     fn render_texture_from_to(
         &mut self,
         texture: &MultiTexture,
@@ -2192,6 +2213,12 @@ where
     ) {
         if let Some(frame) = self.frame.as_mut() {
             frame.set_surface_color_description(desc);
+        }
+    }
+
+    fn set_surface_clip(&mut self, clip: Option<(Rectangle<i32, Physical>, [f32; 4])>) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_surface_clip(clip);
         }
     }
 }

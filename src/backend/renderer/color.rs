@@ -209,6 +209,23 @@ pub fn optical_alpha_pq(alpha: f32, reference_white: f32) -> f32 {
     (pq_lum / pq_white.max(0.001)).clamp(0.0, 1.0)
 }
 
+/// Computes the optical alpha compensation in PQ space for absorbing occluders and shadows.
+pub fn optical_alpha_shadow_pq(alpha: f32, reference_white: f32, sdr_gamma: f32) -> f32 {
+    let a = alpha.clamp(0.0, 1.0);
+    if a <= 0.0001 {
+        return 0.0;
+    }
+    if a >= 0.9999 {
+        return 1.0;
+    }
+    let white_norm = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
+    let pq_white = encode_pq(white_norm);
+    let gamma = if sdr_gamma > 0.0 { sdr_gamma } else { 2.2 };
+    let atten = (1.0 - a).clamp(0.0, 1.0).powf(gamma);
+    let pq_atten = encode_pq(white_norm * atten);
+    (1.0 - (pq_atten / pq_white.max(0.001))).clamp(0.0, 1.0)
+}
+
 /// Transforms an SDR color to PQ space with optical alpha compensation.
 pub fn sdr_color_to_pq(
     color: Color32F,
@@ -226,7 +243,11 @@ pub fn sdr_color_to_pq(
     let stretch = gamut_stretch.clamp(0.0, 1.0);
     let mix = |converted: f32, native: f32| converted + (native - converted) * stretch;
     let scale = reference_white.clamp(80.0, 10_000.0) / 10_000.0;
-    let eff_alpha = optical_alpha_pq(alpha, reference_white);
+    let eff_alpha = if color.r() < 0.001 && color.g() < 0.001 && color.b() < 0.001 {
+        optical_alpha_shadow_pq(alpha, reference_white, sdr_gamma)
+    } else {
+        optical_alpha_pq(alpha, reference_white)
+    };
     Color32F::new(
         encode_pq(mix(0.627404 * r + 0.329282 * g + 0.043314 * b, r) * scale) * eff_alpha,
         encode_pq(mix(0.069097 * r + 0.919540 * g + 0.011362 * b, g) * scale) * eff_alpha,
@@ -292,5 +313,42 @@ mod tests {
         let pq_color = sdr_color_to_pq(translucent_white, 203.0, 2.2, 0.0);
         let expected_alpha = optical_alpha_pq(0.5, 203.0);
         assert!((pq_color.a() - expected_alpha).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_optical_alpha_shadow_pq() {
+        assert_eq!(optical_alpha_shadow_pq(0.0, 203.0, 2.2), 0.0);
+        assert_eq!(optical_alpha_shadow_pq(1.0, 203.0, 2.2), 1.0);
+
+        let ref_white = 203.0;
+        let white_norm = ref_white / 10_000.0;
+        let e_bg = encode_pq(white_norm);
+
+        let mut prev_a = -0.1;
+        for &a in &[0.001, 0.01, 0.05, 0.10, 0.20, 0.35, 0.45, 0.80] {
+            let opt_a = optical_alpha_shadow_pq(a, ref_white, 2.2);
+            assert!(opt_a > prev_a, "Shadow alpha must be strictly monotonic");
+            prev_a = opt_a;
+
+            // When blended in PQ framebuffer: E_new = E_bg * (1 - opt_a)
+            let e_new = e_bg * (1.0 - opt_a);
+            let l_new = decode_pq(e_new) * 10_000.0;
+
+            // Expected physical luminance under SDR gamma attenuation (1 - a)^2.2
+            let expected_l = ref_white * (1.0 - a).powf(2.2);
+            assert!(
+                (l_new - expected_l).abs() < 0.2,
+                "Luminance {} must match expected SDR luminance {} at a={}",
+                l_new,
+                expected_l,
+                a
+            );
+        }
+
+        // Test black shadow Color32F uses optical_alpha_shadow_pq
+        let shadow_black = Color32F::new(0.0, 0.0, 0.0, 0.45);
+        let pq_shadow = sdr_color_to_pq(shadow_black, ref_white, 2.2, 0.0);
+        let expected_shadow_alpha = optical_alpha_shadow_pq(0.45, ref_white, 2.2);
+        assert!((pq_shadow.a() - expected_shadow_alpha).abs() < 1e-5);
     }
 }

@@ -326,6 +326,21 @@ impl Frame for GlowFrame<'_, '_> {
     }
 
     #[profiling::function]
+    fn draw_rounded_outline(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        thickness: f32,
+        radius: [f32; 4],
+        color: Color32F,
+    ) -> Result<(), Self::Error> {
+        self.frame
+            .as_mut()
+            .unwrap()
+            .draw_rounded_outline(dst, damage, thickness, radius, color)
+    }
+
+    #[profiling::function]
     fn render_texture_from_to(
         &mut self,
         texture: &Self::TextureId,
@@ -362,6 +377,12 @@ impl Frame for GlowFrame<'_, '_> {
     ) {
         if let Some(frame) = self.frame.as_mut() {
             frame.set_surface_color_description(desc);
+        }
+    }
+
+    fn set_surface_clip(&mut self, clip: Option<(Rectangle<i32, Physical>, [f32; 4])>) {
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_surface_clip(clip);
         }
     }
 
