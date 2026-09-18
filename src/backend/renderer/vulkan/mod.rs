@@ -255,6 +255,7 @@ pub struct VulkanRenderer {
 
     imported_timelines: HashMap<WeakDrmTimeline, vk::Semaphore>,
     pending_waits: Vec<DrmSyncPoint>,
+    pub(crate) depth_image: Option<VulkanImage>,
     deferred_destructions: VecDeque<DeferredDestruction>,
 
     // A bunch of the previous structs contain Weak-device references.
@@ -274,6 +275,7 @@ impl Drop for VulkanRenderer {
                     .free_command_buffers(self.cmd_pool.vk(), &[q.cmd_buffer]);
             }
             self.cmd_pool.clean_old_buffers(u64::MAX);
+            self.depth_image.take();
             for destruction in self.deferred_destructions.drain(..) {
                 (destruction.callback)(&self.device);
             }
@@ -593,6 +595,7 @@ impl VulkanRenderer {
             bindless_pool,
             batch_submits: false,
             queued_submits: Vec::new(),
+            depth_image: None,
             deferred_destructions: VecDeque::new(),
         })
     }
@@ -814,14 +817,13 @@ impl VulkanRenderer {
         }
 
         // Retire deferred destructions whose timeline point <= val
-        let idx = self.deferred_destructions.iter().position(|d| d.point > val);
-        let ready = if let Some(idx) = idx {
-            self.deferred_destructions.drain(..idx)
-        } else {
-            self.deferred_destructions.drain(..)
-        };
-        for destruction in ready {
-            (destruction.callback)(&self.device);
+        while let Some(front) = self.deferred_destructions.front() {
+            if front.point <= val {
+                let d = self.deferred_destructions.pop_front().unwrap();
+                (d.callback)(&self.device);
+            } else {
+                break;
+            }
         }
 
         self.imported_timelines.retain(|weak, sem| {
@@ -1064,7 +1066,6 @@ impl Renderer for VulkanRenderer {
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
-            depth_image: None,
             pending_clears: Vec::new(),
             pending_waits,
             hdr_to_sdr: None,
@@ -2259,7 +2260,6 @@ pub struct VulkanFrame<'frame, 'buffer> {
     rendering: bool,
     pub(crate) depth_enabled: bool,
     pub(crate) current_depth: f32,
-    pub(crate) depth_image: Option<VulkanImage>,
     pub(crate) pending_clears: Vec<(Color32F, Vec<vk::ClearRect>)>,
     pub(crate) pending_waits: Vec<DrmSyncPoint>,
     pub(crate) hdr_to_sdr: Option<HdrOutputConfig>,
@@ -2592,6 +2592,7 @@ impl VulkanFrame<'_, '_> {
             let width = render_width.max(1);
             let height = render_height.max(1);
             let needs_alloc = self
+                .renderer
                 .depth_image
                 .as_ref()
                 .map_or(true, |img| img.width() != width || img.height() != height);
@@ -2604,7 +2605,7 @@ impl VulkanFrame<'_, '_> {
                     vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
                     false,
                 )?;
-                let old = self.depth_image.replace(img);
+                let old = self.renderer.depth_image.replace(img);
                 if let Some(old_depth) = old {
                     if !self.images.iter().any(|i| Arc::ptr_eq(i, &old_depth.inner)) {
                         self.images.push(old_depth.inner.clone());
@@ -2612,7 +2613,7 @@ impl VulkanFrame<'_, '_> {
                 }
             }
 
-            let depth_img = self.depth_image.as_ref().unwrap();
+            let depth_img = self.renderer.depth_image.as_ref().unwrap();
             let depth_old_layout = depth_img.current_layout();
             let depth_barrier = ImageMemoryBarrier2::default()
                 .image(*depth_img.vk())
@@ -3688,9 +3689,11 @@ impl Frame for VulkanFrame<'_, '_> {
         if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
             images.push(self.fb.0.inner.clone());
         }
-        if let Some(depth) = self.depth_image.take() {
-            if !images.iter().any(|img| Arc::ptr_eq(img, &depth.inner)) {
-                images.push(depth.inner.clone());
+        if self.depth_enabled {
+            if let Some(depth) = self.renderer.depth_image.as_ref() {
+                if !images.iter().any(|img| Arc::ptr_eq(img, &depth.inner)) {
+                    images.push(depth.inner.clone());
+                }
             }
         }
 
@@ -3805,7 +3808,6 @@ impl Blit for VulkanRenderer {
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
-            depth_image: None,
             pending_clears: Vec::new(),
             pending_waits,
             hdr_to_sdr: None,
@@ -3872,7 +3874,6 @@ impl Blit for VulkanRenderer {
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
-            depth_image: None,
             pending_clears: Vec::new(),
             pending_waits,
             hdr_to_sdr: Some(*config),
