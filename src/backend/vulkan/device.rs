@@ -87,10 +87,14 @@ impl Device {
                 .handle()
                 .get_physical_device_memory_properties(phd.handle())
         };
+        let memory_preferences = super::memory::MemoryPreferences::new(&mem_properties);
 
         let has_memory_priority = extensions
             .iter()
             .any(|&ext| ext == ash::vk::EXT_MEMORY_PRIORITY_NAME);
+        let has_memory_budget = extensions
+            .iter()
+            .any(|&ext| ext == ash::vk::EXT_MEMORY_BUDGET_NAME);
         let has_global_priority = extensions
             .iter()
             .any(|&ext| ext == ash::vk::KHR_GLOBAL_PRIORITY_NAME || ext == ash::vk::EXT_GLOBAL_PRIORITY_NAME);
@@ -195,9 +199,11 @@ impl Device {
         unsafe { phd.get_properties(&mut props) };
         let pipeline_cache_uuid = props.properties.pipeline_cache_uuid;
         let buffer_image_granularity = props.properties.limits.buffer_image_granularity;
+        let non_coherent_atom_size = props.properties.limits.non_coherent_atom_size;
 
         Ok(Device(Arc::new(InnerDevice {
             vk: device,
+            phd: phd.clone(),
             khr_external_semaphore_fd,
             khr_external_memory_fd,
             ext_image_drm_format_modifier,
@@ -205,6 +211,7 @@ impl Device {
             khr_push_descriptor,
 
             mem_properties,
+            memory_preferences,
             formats: phd.drm_formats(),
             #[cfg(feature = "backend_drm")]
             node: phd
@@ -220,7 +227,9 @@ impl Device {
             allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
             pipeline_cache_uuid,
             buffer_image_granularity,
+            non_coherent_atom_size,
             has_memory_priority,
+            has_memory_budget,
         })))
     }
 
@@ -283,11 +292,23 @@ impl Device {
         memory_type_index: u32,
         tiling: ImageTiling,
     ) -> Result<(vk::DeviceMemory, vk::DeviceSize, Option<*mut u8>), vk::Result> {
-        let host_visible = self.0.mem_properties.memory_types[memory_type_index as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let flags = self.0.mem_properties.memory_types[memory_type_index as usize].property_flags;
+        let host_visible = flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        let host_coherent = flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+
+        // Vulkan spec §6.6.1: Suballocating non-coherent host-visible memory requires
+        // offset and size to be aligned to nonCoherentAtomSize to avoid cache line tearing.
+        let (size, alignment) = if host_visible && !host_coherent {
+            let atom = self.0.non_coherent_atom_size.max(1);
+            let aligned_size = (size + atom - 1) & !(atom - 1);
+            let aligned_req = alignment.max(atom);
+            (aligned_size, aligned_req)
+        } else {
+            (size, alignment)
+        };
+
         let mut alloc = self.0.allocator.lock().unwrap();
-        unsafe {
+        let res = unsafe {
             alloc.allocate(
                 &self.0.vk,
                 size,
@@ -298,6 +319,27 @@ impl Device {
                 self.0.buffer_image_granularity,
                 self.0.has_memory_priority,
             )
+        };
+
+        match res {
+            Ok(val) => Ok(val),
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+                // Out of memory: purge completely empty cached blocks to reclaim VRAM, then retry once!
+                unsafe { alloc.trim(&self.0.vk) };
+                unsafe {
+                    alloc.allocate(
+                        &self.0.vk,
+                        size,
+                        alignment,
+                        memory_type_index,
+                        host_visible,
+                        tiling,
+                        self.0.buffer_image_granularity,
+                        self.0.has_memory_priority,
+                    )
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -307,6 +349,45 @@ impl Device {
 
     pub fn buffer_image_granularity(&self) -> vk::DeviceSize {
         self.0.buffer_image_granularity
+    }
+
+    pub fn non_coherent_atom_size(&self) -> vk::DeviceSize {
+        self.0.non_coherent_atom_size
+    }
+
+    /// Purge all completely empty cached memory blocks across all pools.
+    pub fn trim_memory(&self) {
+        let mut alloc = self.0.allocator.lock().unwrap();
+        unsafe { alloc.trim(&self.0.vk) };
+    }
+
+    /// Check if the physical device supports `VK_EXT_memory_budget`.
+    pub fn supports_memory_budget(&self) -> bool {
+        self.0.has_memory_budget
+    }
+
+    /// Query the current memory budget and usage for all heaps using `VK_EXT_memory_budget`.
+    pub fn memory_budget(&self) -> Option<super::memory::MemoryBudgetInfo> {
+        if !self.0.has_memory_budget {
+            return None;
+        }
+
+        let mut budget_prop = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut mem_prop2 = vk::PhysicalDeviceMemoryProperties2::default();
+        mem_prop2.p_next = &mut budget_prop as *mut _ as *mut _;
+
+        unsafe {
+            self.0
+                .phd
+                .instance()
+                .handle()
+                .get_physical_device_memory_properties2(self.0.phd.handle(), &mut mem_prop2);
+        }
+
+        Some(super::memory::MemoryBudgetInfo {
+            heap_budget: budget_prop.heap_budget,
+            heap_usage: budget_prop.heap_usage,
+        })
     }
 
     pub(crate) fn free_suballocation(
@@ -321,6 +402,38 @@ impl Device {
 
     pub fn pipeline_cache_uuid(&self) -> [u8; 16] {
         self.0.pipeline_cache_uuid
+    }
+
+    /// Access the precomputed memory preferences.
+    pub fn memory_preferences(&self) -> &super::memory::MemoryPreferences {
+        &self.0.memory_preferences
+    }
+
+    /// Find the single best memory type matching `type_bits` for the specified `preference`.
+    pub fn find_memory_type(
+        &self,
+        type_bits: u32,
+        preference: super::memory::MemoryUsagePreference,
+    ) -> Option<super::memory::MemoryTypeRank> {
+        self.0.memory_preferences.find_best(type_bits, preference)
+    }
+
+    /// Find the index of the best memory type matching `type_bits` for the specified `preference`.
+    pub fn find_memory_type_index(
+        &self,
+        type_bits: u32,
+        preference: super::memory::MemoryUsagePreference,
+    ) -> Option<u32> {
+        self.find_memory_type(type_bits, preference).map(|r| r.type_index)
+    }
+
+    /// Return an iterator over memory type candidates that match `type_bits`, ordered from most to least preferred.
+    pub fn ranked_memory_types(
+        &self,
+        type_bits: u32,
+        preference: super::memory::MemoryUsagePreference,
+    ) -> impl Iterator<Item = super::memory::MemoryTypeRank> + '_ {
+        self.0.memory_preferences.filter_candidates(type_bits, preference)
     }
 }
 
@@ -339,6 +452,7 @@ struct InnerDevice {
     khr_push_descriptor: Option<khr::push_descriptor::Device>,
 
     mem_properties: PhysicalDeviceMemoryProperties,
+    memory_preferences: super::memory::MemoryPreferences,
     formats: super::FormatList,
     #[cfg(feature = "backend_drm")]
     node: Option<DrmNode>,
@@ -357,7 +471,10 @@ struct InnerDevice {
     /// this value to align allocations and avoid the undefined behaviour
     /// described in Vulkan spec section 12.7.1.
     pub(super) buffer_image_granularity: vk::DeviceSize,
+    pub(super) non_coherent_atom_size: vk::DeviceSize,
     pub(super) has_memory_priority: bool,
+    pub(super) has_memory_budget: bool,
+    pub(super) phd: PhysicalDevice,
 }
 
 impl fmt::Debug for InnerDevice {

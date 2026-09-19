@@ -12,28 +12,9 @@ use crate::backend::{
     vulkan::{
         Device,
         device::{DeviceError, WeakDevice},
+        memory::MemoryUsagePreference,
     },
 };
-
-fn find_memory_type_index(
-    mem_props: &PhysicalDeviceMemoryProperties,
-    type_bits: u32,
-    flags: MemoryPropertyFlags,
-) -> Option<u32> {
-    mem_props
-        .memory_types_as_slice()
-        .iter()
-        .enumerate()
-        .find_map(|(idx, type_)| {
-            let matches_type = (type_bits & (1 << idx)) != 0;
-            let matches_flags = (type_.property_flags & flags) == flags;
-            if matches_type && matches_flags {
-                Some(idx as u32)
-            } else {
-                None
-            }
-        })
-}
 
 /// Buffer for storing `VkDrawIndirectCommand` structures for multi-draw indirect calls.
 #[derive(Debug)]
@@ -73,19 +54,9 @@ impl DrawIndirectBuffer {
 
         let mem_reqs = unsafe { device.vk().get_buffer_memory_requirements(buffer) };
 
-        let mem_idx = find_memory_type_index(
-            device.memory_properties(),
-            mem_reqs.memory_type_bits,
-            MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .or_else(|| {
-            find_memory_type_index(
-                device.memory_properties(),
-                mem_reqs.memory_type_bits,
-                MemoryPropertyFlags::HOST_VISIBLE,
-            )
-        })
-        .ok_or(Error::DeviceError(DeviceError::NoUsableQueue))?;
+        let mem_idx = device
+            .find_memory_type_index(mem_reqs.memory_type_bits, MemoryUsagePreference::HostVisible)
+            .ok_or(Error::DeviceError(DeviceError::NoUsableQueue))?;
 
         let mut priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
         let mut alloc_info = MemoryAllocateInfo::default()

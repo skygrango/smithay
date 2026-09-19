@@ -21,6 +21,7 @@ use crate::{
             device::{Device, DeviceError, QueueType, WeakDevice},
             format::{get_drm_format, get_vk_format, known_formats},
             image::{Error as ImageError, ImageInner, ImageUsageFlags, VulkanImage},
+            memory::MemoryUsagePreference,
             version::Version,
         },
     },
@@ -66,30 +67,7 @@ pub use self::shaders::Error as PipelineError;
 use self::shaders::Pipelines;
 pub use self::sync::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryBudgetInfo {
-    pub heap_budget: [vk::DeviceSize; vk::MAX_MEMORY_HEAPS],
-    pub heap_usage: [vk::DeviceSize; vk::MAX_MEMORY_HEAPS],
-}
-
-impl MemoryBudgetInfo {
-    pub fn total_budget(&self) -> vk::DeviceSize {
-        self.heap_budget.iter().copied().sum()
-    }
-
-    pub fn total_usage(&self) -> vk::DeviceSize {
-        self.heap_usage.iter().copied().sum()
-    }
-
-    pub fn usage_ratio(&self) -> f32 {
-        let budget = self.total_budget();
-        if budget == 0 {
-            0.0
-        } else {
-            self.total_usage() as f32 / budget as f32
-        }
-    }
-}
+pub use crate::backend::vulkan::memory::MemoryBudgetInfo;
 
 mod lut3d;
 use lut3d::{Lut3dTexture, generate_ictcp_tonemap_lut};
@@ -1461,51 +1439,21 @@ impl VulkanRenderer {
 
         let mem_reqs = unsafe { self.device.vk().get_buffer_memory_requirements(staging_buffer) };
 
-        let mut mem_type_index = None;
-        let mut is_coherent = false;
-        for (i, mem_type) in self
+        let mem_type = self
             .device
-            .memory_properties()
-            .memory_types_as_slice()
-            .iter()
-            .enumerate()
-        {
-            if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                && mem_type
-                    .property_flags
-                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
-            {
-                mem_type_index = Some(i as u32);
-                is_coherent = true;
-                break;
-            }
-        }
-        if mem_type_index.is_none() {
-            for (i, mem_type) in self
-                .device
-                .memory_properties()
-                .memory_types_as_slice()
-                .iter()
-                .enumerate()
-            {
-                if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                    && mem_type
-                        .property_flags
-                        .contains(MemoryPropertyFlags::HOST_VISIBLE)
-                {
-                    mem_type_index = Some(i as u32);
-                    is_coherent = false;
-                    break;
-                }
-            }
-        }
+            .find_memory_type(mem_reqs.memory_type_bits, MemoryUsagePreference::HostVisible);
 
-        let Some(mem_type_index) = mem_type_index else {
+        let Some(mem_type) = mem_type else {
             unsafe {
                 self.device.vk().destroy_buffer(staging_buffer, None);
             }
             return Err(Error::ImageError(ImageError::NoMemoryAvailable));
         };
+
+        let mem_type_index = mem_type.type_index;
+        let is_coherent = mem_type
+            .property_flags
+            .contains(MemoryPropertyFlags::HOST_COHERENT);
 
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
@@ -1792,51 +1740,21 @@ impl VulkanRenderer {
 
         let mem_reqs = unsafe { self.device.vk().get_buffer_memory_requirements(staging_buffer) };
 
-        let mut mem_type_index = None;
-        let mut is_coherent = false;
-        for (i, mem_type) in self
+        let mem_type = self
             .device
-            .memory_properties()
-            .memory_types_as_slice()
-            .iter()
-            .enumerate()
-        {
-            if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                && mem_type
-                    .property_flags
-                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
-            {
-                mem_type_index = Some(i as u32);
-                is_coherent = true;
-                break;
-            }
-        }
-        if mem_type_index.is_none() {
-            for (i, mem_type) in self
-                .device
-                .memory_properties()
-                .memory_types_as_slice()
-                .iter()
-                .enumerate()
-            {
-                if (mem_reqs.memory_type_bits & (1 << i)) != 0
-                    && mem_type
-                        .property_flags
-                        .contains(MemoryPropertyFlags::HOST_VISIBLE)
-                {
-                    mem_type_index = Some(i as u32);
-                    is_coherent = false;
-                    break;
-                }
-            }
-        }
+            .find_memory_type(mem_reqs.memory_type_bits, MemoryUsagePreference::HostVisible);
 
-        let Some(mem_type_index) = mem_type_index else {
+        let Some(mem_type) = mem_type else {
             unsafe {
                 self.device.vk().destroy_buffer(staging_buffer, None);
             }
             return Err(Error::ImageError(ImageError::NoMemoryAvailable));
         };
+
+        let mem_type_index = mem_type.type_index;
+        let is_coherent = mem_type
+            .property_flags
+            .contains(MemoryPropertyFlags::HOST_COHERENT);
 
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)

@@ -1,7 +1,7 @@
 use ash::vk;
 
 use super::Error;
-use crate::backend::vulkan::{Device, image::Error as ImageError};
+use crate::backend::vulkan::{Device, image::Error as ImageError, memory::MemoryUsagePreference};
 
 /// Convert an f32 to a half-precision (16-bit) float IEEE 754.
 #[inline]
@@ -241,14 +241,8 @@ impl Lut3dTexture {
         };
 
         let mem_reqs = unsafe { device.vk().get_image_memory_requirements(image) };
-        let phd_props = device.memory_properties();
-        let mem_type_index = (0..phd_props.memory_type_count)
-            .find(|&i| {
-                (mem_reqs.memory_type_bits & (1 << i)) != 0
-                    && phd_props.memory_types[i as usize]
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            })
+        let mem_type_index = device
+            .find_memory_type_index(mem_reqs.memory_type_bits, MemoryUsagePreference::DeviceLocal)
             .unwrap_or(0);
 
         let mut priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
@@ -323,13 +317,8 @@ impl Lut3dTexture {
         };
 
         let staging_reqs = unsafe { device.vk().get_buffer_memory_requirements(staging_buf) };
-        let staging_mem_index = (0..phd_props.memory_type_count)
-            .find(|&i| {
-                (staging_reqs.memory_type_bits & (1 << i)) != 0
-                    && phd_props.memory_types[i as usize].property_flags.contains(
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )
-            })
+        let staging_mem_index = device
+            .find_memory_type_index(staging_reqs.memory_type_bits, MemoryUsagePreference::HostVisible)
             .unwrap_or(0);
 
         let staging_alloc = vk::MemoryAllocateInfo::default()

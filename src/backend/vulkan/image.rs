@@ -11,7 +11,11 @@ use drm::node::DrmNode;
 
 use crate::backend::{
     allocator::{Buffer, Format, Fourcc, Modifier, dmabuf::Dmabuf, format::has_alpha},
-    vulkan::{Device, format::component_mapping_for_format},
+    vulkan::{
+        Device,
+        format::component_mapping_for_format,
+        memory::{MemoryTypeRank, MemoryUsagePreference},
+    },
 };
 
 /// Vulkan image object.
@@ -406,104 +410,22 @@ impl VulkanImage {
         });
         let allocation_size = dmabuf_fd_size.unwrap_or(memory_reqs.size);
 
-        let mem_props = device.memory_properties();
-        let memory_types = mem_props.memory_types_as_slice();
-        let memory_heaps = mem_props.memory_heaps_as_slice();
-
-        // Check if a memory type belongs to a small/constrained BAR1 aperture (<= 512 MB).
-        // When Resizable BAR is disabled in BIOS, NVIDIA GPUs typically expose a 256 MiB BAR1 aperture.
-        // Attempting to allocate large compositor images (e.g. 17MB) in a 256MB BAR1 heap
-        // causes severe aperture exhaustion / GSP-RM failures under open kernel modules.
-        let is_small_bar = |type_idx: usize| -> bool {
-            if type_idx >= memory_types.len() {
-                return false;
-            }
-            let heap_idx = memory_types[type_idx].heap_index as usize;
-            if heap_idx < memory_heaps.len() {
-                let heap = &memory_heaps[heap_idx];
-                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) && heap.size <= 512 * 1024 * 1024
-            } else {
-                false
-            }
+        let preference = if linear {
+            MemoryUsagePreference::HostVisible
+        } else if vk_usage.contains(vk::ImageUsageFlags::HOST_TRANSFER_EXT) {
+            MemoryUsagePreference::HostTransfer
+        } else {
+            MemoryUsagePreference::DeviceLocal
         };
 
-        let mut candidates: Vec<(u32, MemoryPropertyFlags, i32)> = Vec::new();
-
-        for (i, types) in memory_types.iter().enumerate() {
-            if (effective_memory_type_bits & (1 << i)) == 0 {
-                continue;
-            }
-            let flags = types.property_flags;
-            let small_bar = is_small_bar(i);
-
-            let score = if linear {
-                if !flags.contains(MemoryPropertyFlags::HOST_VISIBLE) {
-                    continue;
-                }
-
-                if flags.contains(MemoryPropertyFlags::HOST_COHERENT)
-                    && !flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
-                {
-                    // System RAM (GTT): host coherent, gigabytes available, 100% immune to BAR1 aperture exhaustion!
-                    1000
-                } else if flags
-                    .contains(MemoryPropertyFlags::HOST_COHERENT | MemoryPropertyFlags::DEVICE_LOCAL)
-                {
-                    if !small_bar {
-                        // Large ReBAR available (> 512 MB)
-                        900
-                    } else {
-                        // Small BAR1 (<= 512 MB): limited 256MB window. Deprioritize below System RAM!
-                        700
-                    }
-                } else if flags.contains(MemoryPropertyFlags::HOST_COHERENT) {
-                    850
-                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
-                    if !small_bar { 800 } else { 600 }
-                } else {
-                    500
-                }
-            } else if vk_usage.contains(vk::ImageUsageFlags::HOST_TRANSFER_EXT) {
-                // For host transfer images (e.g. wl_shm surfaces via VK_EXT_host_image_copy):
-                // System RAM (HOST_VISIBLE | HOST_COHERENT) provides abundant memory, avoids BAR1 limits,
-                // and avoids PCIe bus contention during CPU writes.
-                if flags.contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
-                    && !flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
-                {
-                    1000
-                } else if flags
-                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::DEVICE_LOCAL)
-                {
-                    if !small_bar { 900 } else { 700 }
-                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
-                    850
-                } else if flags.contains(MemoryPropertyFlags::HOST_VISIBLE) {
-                    800
-                } else {
-                    400
-                }
-            } else {
-                // For regular textures, render targets, compositor swapchain, framebuffer attachments:
-                // VRAM Best Practice: Pure DEVICE_LOCAL without HOST_VISIBLE!
-                // Textures reside in high-bandwidth GDDR6/GDDR7 VRAM, optimal tiling, DCC enabled, zero BAR1 consumption.
-                if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
-                    && !flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
-                {
-                    1000
-                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
-                    800
-                } else {
-                    400
-                }
-            };
-
-            candidates.push((i as u32, flags, score));
+        let mut candidates = [MemoryTypeRank::default(); 32];
+        let mut candidates_count = 0;
+        for c in device.ranked_memory_types(effective_memory_type_bits, preference) {
+            candidates[candidates_count] = c;
+            candidates_count += 1;
         }
 
-        // Sort descending by preference score
-        candidates.sort_by(|a, b| b.2.cmp(&a.2));
-
-        if candidates.is_empty() {
+        if candidates_count == 0 {
             if width > 1 || height > 1 {
                 tracing::error!(
                     "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}, effective_bits={:#b}",
@@ -563,7 +485,11 @@ impl VulkanImage {
         let mut final_mem_bits = None;
         let mut last_error = None;
 
-        for &(candidate_index, candidate_flags, _) in &candidates {
+        for &MemoryTypeRank {
+            type_index: candidate_index,
+            property_flags: candidate_flags,
+        } in &candidates[..candidates_count]
+        {
             let mut alloc_create_info = base_alloc_info.memory_type_index(candidate_index);
 
             if is_dedicated {
@@ -582,7 +508,11 @@ impl VulkanImage {
                     import_fd_owner = Some(cloned);
                 }
 
-                let alloc_res = unsafe { device.vk().allocate_memory(&alloc_create_info, None) };
+                let mut alloc_res = unsafe { device.vk().allocate_memory(&alloc_create_info, None) };
+                if let Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) = alloc_res {
+                    device.trim_memory();
+                    alloc_res = unsafe { device.vk().allocate_memory(&alloc_create_info, None) };
+                }
                 match alloc_res {
                     Ok(memory) => {
                         if let Some(owned) = import_fd_owner.take() {

@@ -79,11 +79,17 @@ pub mod device;
 pub mod format;
 pub mod image;
 pub mod instance;
+pub mod memory;
 pub mod phd;
 pub mod version;
 
 pub use self::{
-    device::Device, format::FormatList, instance::Instance, phd::PhysicalDevice, version::Version,
+    device::Device,
+    format::FormatList,
+    instance::Instance,
+    memory::{MemoryBudgetInfo, MemoryPreferences, MemoryTypeRank, MemoryUsagePreference},
+    phd::PhysicalDevice,
+    version::Version,
 };
 pub use ash;
 
