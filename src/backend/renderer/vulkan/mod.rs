@@ -4237,19 +4237,15 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
         format: Fourcc,
         size: Size<i32, BufferCoords>,
     ) -> Result<VulkanImage, Self::Error> {
-        let mut usage = ImageUsageFlags::COLOR_ATTACHMENT
+        let usage = ImageUsageFlags::COLOR_ATTACHMENT
             | ImageUsageFlags::TRANSFER_SRC
             | ImageUsageFlags::TRANSFER_DST
             | ImageUsageFlags::SAMPLED;
-        if self.supports_optimal_host_copy {
-            usage |= ImageUsageFlags::HOST_TRANSFER_EXT;
-        }
         tracing::debug!(
-            "VulkanRenderer::create_buffer: format={:?}, size={:?}, usage={:?}, supports_optimal_host_copy={}",
+            "VulkanRenderer::create_buffer: format={:?}, size={:?}, usage={:?}",
             format,
             size,
             usage,
-            self.supports_optimal_host_copy
         );
         VulkanImage::new_with_fourcc(&self.device, size.w as u32, size.h as u32, format, usage, false)
             .or_else(|err| {
@@ -4257,13 +4253,10 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
                     "VulkanRenderer::create_buffer optimal tiling failed ({:?}), falling back to linear",
                     err
                 );
-                let mut linear_usage = ImageUsageFlags::COLOR_ATTACHMENT
+                let linear_usage = ImageUsageFlags::COLOR_ATTACHMENT
                     | ImageUsageFlags::TRANSFER_SRC
                     | ImageUsageFlags::TRANSFER_DST
                     | ImageUsageFlags::SAMPLED;
-                if self.device.vk_ext_host_image_copy().is_some() {
-                    linear_usage |= ImageUsageFlags::HOST_TRANSFER_EXT;
-                }
                 VulkanImage::new_with_fourcc(
                     &self.device,
                     size.w as u32,

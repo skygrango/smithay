@@ -406,82 +406,104 @@ impl VulkanImage {
         });
         let allocation_size = dmabuf_fd_size.unwrap_or(memory_reqs.size);
 
-        let mut alloc_create_info = vk::MemoryAllocateInfo::default().allocation_size(allocation_size);
+        let mem_props = device.memory_properties();
+        let memory_types = mem_props.memory_types_as_slice();
+        let memory_heaps = mem_props.memory_heaps_as_slice();
 
-        let mut mem_bits = None;
-        if linear {
-            let mut best_index = None;
-            let mut best_flags = MemoryPropertyFlags::empty();
-            for (i, types) in device
-                .memory_properties()
-                .memory_types_as_slice()
-                .iter()
-                .enumerate()
-            {
-                if (effective_memory_type_bits & (1 << i)) != 0
-                    && types.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
+        // Check if a memory type belongs to a small/constrained BAR1 aperture (<= 512 MB).
+        // When Resizable BAR is disabled in BIOS, NVIDIA GPUs typically expose a 256 MiB BAR1 aperture.
+        // Attempting to allocate large compositor images (e.g. 17MB) in a 256MB BAR1 heap
+        // causes severe aperture exhaustion / GSP-RM failures under open kernel modules.
+        let is_small_bar = |type_idx: usize| -> bool {
+            if type_idx >= memory_types.len() {
+                return false;
+            }
+            let heap_idx = memory_types[type_idx].heap_index as usize;
+            if heap_idx < memory_heaps.len() {
+                let heap = &memory_heaps[heap_idx];
+                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) && heap.size <= 512 * 1024 * 1024
+            } else {
+                false
+            }
+        };
+
+        let mut candidates: Vec<(u32, MemoryPropertyFlags, i32)> = Vec::new();
+
+        for (i, types) in memory_types.iter().enumerate() {
+            if (effective_memory_type_bits & (1 << i)) == 0 {
+                continue;
+            }
+            let flags = types.property_flags;
+            let small_bar = is_small_bar(i);
+
+            let score = if linear {
+                if !flags.contains(MemoryPropertyFlags::HOST_VISIBLE) {
+                    continue;
+                }
+
+                if flags.contains(MemoryPropertyFlags::HOST_COHERENT)
+                    && !flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
                 {
-                    let flags = types.property_flags;
-                    if flags.contains(
-                        MemoryPropertyFlags::HOST_VISIBLE
-                            | MemoryPropertyFlags::HOST_COHERENT
-                            | MemoryPropertyFlags::DEVICE_LOCAL,
-                    ) {
-                        best_index = Some(i as u32);
-                        best_flags = flags;
-                        break;
-                    } else if flags
-                        .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
-                    {
-                        if best_index.is_none() || !best_flags.contains(MemoryPropertyFlags::HOST_COHERENT) {
-                            best_index = Some(i as u32);
-                            best_flags = flags;
-                        }
-                    } else if best_index.is_none() {
-                        best_index = Some(i as u32);
-                        best_flags = flags;
+                    // System RAM (GTT): host coherent, gigabytes available, 100% immune to BAR1 aperture exhaustion!
+                    1000
+                } else if flags
+                    .contains(MemoryPropertyFlags::HOST_COHERENT | MemoryPropertyFlags::DEVICE_LOCAL)
+                {
+                    if !small_bar {
+                        // Large ReBAR available (> 512 MB)
+                        900
+                    } else {
+                        // Small BAR1 (<= 512 MB): limited 256MB window. Deprioritize below System RAM!
+                        700
                     }
+                } else if flags.contains(MemoryPropertyFlags::HOST_COHERENT) {
+                    850
+                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
+                    if !small_bar { 800 } else { 600 }
+                } else {
+                    500
                 }
-            }
-            if let Some(index) = best_index {
-                alloc_create_info = alloc_create_info.memory_type_index(index);
-                mem_bits = Some(best_flags);
-            }
-        }
-
-        if mem_bits.is_none() {
-            for (i, types) in device
-                .memory_properties()
-                .memory_types_as_slice()
-                .iter()
-                .enumerate()
-            {
-                if (effective_memory_type_bits & (1 << i)) != 0
-                    && types.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
+            } else if vk_usage.contains(vk::ImageUsageFlags::HOST_TRANSFER_EXT) {
+                // For host transfer images (e.g. wl_shm surfaces via VK_EXT_host_image_copy):
+                // System RAM (HOST_VISIBLE | HOST_COHERENT) provides abundant memory, avoids BAR1 limits,
+                // and avoids PCIe bus contention during CPU writes.
+                if flags.contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT)
+                    && !flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
                 {
-                    alloc_create_info = alloc_create_info.memory_type_index(i as u32);
-                    mem_bits = Some(types.property_flags.clone());
-                    break;
+                    1000
+                } else if flags
+                    .contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::DEVICE_LOCAL)
+                {
+                    if !small_bar { 900 } else { 700 }
+                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
+                    850
+                } else if flags.contains(MemoryPropertyFlags::HOST_VISIBLE) {
+                    800
+                } else {
+                    400
                 }
-            }
+            } else {
+                // For regular textures, render targets, compositor swapchain, framebuffer attachments:
+                // VRAM Best Practice: Pure DEVICE_LOCAL without HOST_VISIBLE!
+                // Textures reside in high-bandwidth GDDR6/GDDR7 VRAM, optimal tiling, DCC enabled, zero BAR1 consumption.
+                if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL)
+                    && !flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
+                {
+                    1000
+                } else if flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
+                    800
+                } else {
+                    400
+                }
+            };
+
+            candidates.push((i as u32, flags, score));
         }
 
-        if mem_bits.is_none() {
-            for (i, types) in device
-                .memory_properties()
-                .memory_types_as_slice()
-                .iter()
-                .enumerate()
-            {
-                if (effective_memory_type_bits & (1 << i)) != 0 {
-                    alloc_create_info = alloc_create_info.memory_type_index(i as u32);
-                    mem_bits = Some(types.property_flags.clone());
-                    break;
-                }
-            }
-        }
+        // Sort descending by preference score
+        candidates.sort_by(|a, b| b.2.cmp(&a.2));
 
-        let Some(mem_bits) = mem_bits else {
+        if candidates.is_empty() {
             if width > 1 || height > 1 {
                 tracing::error!(
                     "VulkanImage::new_internal: NoMemoryAvailable! width={}, height={}, fourcc={:?}, vk_format={:?}, vk_usage={:?}, linear={}, tiling={:?}, memory_type_bits={:#b}, effective_bits={:#b}",
@@ -506,150 +528,152 @@ impl VulkanImage {
                 );
             }
             return Err(Error::NoMemoryAvailable);
-        };
+        }
 
         // Only force dedicated allocation when truly required:
         //  - DMA-BUF export/import paths (the fd must represent a self-contained buffer)
         //  - The driver explicitly requires or prefers dedicated allocation for this image
-        //
-        // Removed: `vk_usage.contains(COLOR_ATTACHMENT)` — internal render targets should use the
-        // suballocator just like any other image. Forcing dedicated allocation for every COLOR_ATTACHMENT
-        // would quickly exhaust `maxMemoryAllocationCount` (typically 4096) with shadow passes,
-        // blur intermediates, and per-surface compositor buffers.
         let is_dedicated = modifiers.is_some()
             || dmabuf.is_some()
             || inner.dmabuf_exportable
             || dedicated_reqs.requires_dedicated_allocation != 0
             || dedicated_reqs.prefers_dedicated_allocation != 0;
 
-        let mut import_memory_info: vk::ImportMemoryFdInfoKHR<'_>;
         let mut memory_export_info: vk::ExportMemoryAllocateInfo<'_>;
         let mut memory_dedicated_info: vk::MemoryDedicatedAllocateInfo<'_>;
         let mut memory_priority_info: vk::MemoryPriorityAllocateInfoEXT<'_>;
+
+        let mut base_alloc_info = vk::MemoryAllocateInfo::default().allocation_size(allocation_size);
         if device.has_memory_priority() {
             memory_priority_info = vk::MemoryPriorityAllocateInfoEXT::default().priority(1.0);
-            alloc_create_info = alloc_create_info.push_next(&mut memory_priority_info);
+            base_alloc_info = base_alloc_info.push_next(&mut memory_priority_info);
         }
-        // vkAllocateMemory takes ownership of the fd *only* on success.  We keep it as an OwnedFd
-        // until the call succeeds so Rust's Drop will close it on any early return / error path.
-        // The fd is surrendered to Vulkan via ManuallyDrop::into_raw_fd() after the call succeeds.
-        let mut import_fd_owner: Option<OwnedFd> = None;
 
         if is_dedicated {
             memory_dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(inner.image);
-            alloc_create_info = alloc_create_info.push_next(&mut memory_dedicated_info);
+            base_alloc_info = base_alloc_info.push_next(&mut memory_dedicated_info);
 
             if inner.dmabuf_exportable && dmabuf.is_none() {
                 memory_export_info = vk::ExportMemoryAllocateInfo::default()
                     .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                alloc_create_info = alloc_create_info.push_next(&mut memory_export_info);
-            }
-
-            if let Some(dmabuf) = dmabuf {
-                let handle = dmabuf.handles().next().unwrap();
-                let cloned: OwnedFd = handle.try_clone_to_owned().map_err(Error::DmabufFdError)?;
-                // Temporarily store the raw fd in the Vulkan struct; `import_fd_owner` retains
-                // the OwnedFd so it is closed on any error before allocate_memory is called.
-                // After a successful call Vulkan owns the fd, so we disarm the guard.
-                import_memory_info = vk::ImportMemoryFdInfoKHR::default()
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                    .fd(cloned.as_raw_fd());
-                import_fd_owner = Some(cloned);
-                alloc_create_info = alloc_create_info.push_next(&mut import_memory_info);
-            }
-
-            unsafe {
-                inner.memory = device
-                    .vk()
-                    .allocate_memory(&alloc_create_info, None)
-                    .map_err(|err| {
-                        tracing::error!(
-                            "VulkanImage::new_internal dedicated allocate_memory failed: {:?}, size={}, type_index={}",
-                            err,
-                            alloc_create_info.allocation_size,
-                            alloc_create_info.memory_type_index
-                        );
-                        Error::VulkanAllocate(err)
-                    })?;
-                // vkAllocateMemory succeeded → Vulkan now owns the fd.  Disarm the guard so
-                // Rust's Drop does not close it a second time.
-                if let Some(owned) = import_fd_owner.take() {
-                    // SAFETY: we are intentionally leaking the fd here; Vulkan takes ownership.
-                    let _ = owned.into_raw_fd();
-                }
-                inner.memory_offset = 0;
-                inner.suballocated = false;
-                inner.allocation_size = allocation_size;
-
-                device
-                    .vk()
-                    .bind_image_memory(inner.image, inner.memory, 0)
-                    .map_err(|err| {
-                        tracing::error!("VulkanImage::new_internal: bind_image_memory failed: {:?}", err);
-                        Error::VulkanBind(err)
-                    })?;
-            }
-        } else {
-            let suballoc_res = device.suballocate_memory(
-                memory_reqs.size,
-                memory_reqs.alignment,
-                alloc_create_info.memory_type_index,
-                tiling,
-            );
-
-            match suballoc_res {
-                Ok((memory, memory_offset, mapped_ptr)) => {
-                    inner.memory = memory;
-                    inner.memory_offset = memory_offset;
-                    inner.suballocated = true;
-                    inner.allocation_size = memory_reqs.size;
-                    if let Some(ptr) = mapped_ptr {
-                        *inner.persistent_mapping.lock().unwrap() = Some(MappedPointer(ptr));
-                    }
-
-                    unsafe {
-                        device
-                            .vk()
-                            .bind_image_memory(inner.image, inner.memory, memory_offset)
-                            .map_err(|err| {
-                                tracing::error!(
-                                    "VulkanImage::new_internal: bind_image_memory (suballocated) failed: {:?}",
-                                    err
-                                );
-                                Error::VulkanBind(err)
-                            })?;
-                    }
-                }
-                Err(_) => unsafe {
-                    inner.memory = device
-                            .vk()
-                            .allocate_memory(&alloc_create_info, None)
-                            .map_err(|err| {
-                                tracing::error!(
-                                    "VulkanImage::new_internal: fallback direct allocate_memory failed: {:?}, size={}, type_index={}",
-                                    err,
-                                    alloc_create_info.allocation_size,
-                                    alloc_create_info.memory_type_index
-                                );
-                                Error::VulkanAllocate(err)
-                            })?;
-                    inner.memory_offset = 0;
-                    inner.suballocated = false;
-                    inner.allocation_size = memory_reqs.size;
-
-                    device
-                        .vk()
-                        .bind_image_memory(inner.image, inner.memory, 0)
-                        .map_err(|err| {
-                            tracing::error!(
-                                "VulkanImage::new_internal: fallback bind_image_memory failed: {:?}",
-                                err
-                            );
-                            Error::VulkanBind(err)
-                        })?;
-                },
+                base_alloc_info = base_alloc_info.push_next(&mut memory_export_info);
             }
         }
+
+        let mut final_mem_bits = None;
+        let mut last_error = None;
+
+        for &(candidate_index, candidate_flags, _) in &candidates {
+            let mut alloc_create_info = base_alloc_info.memory_type_index(candidate_index);
+
+            if is_dedicated {
+                let mut import_fd_owner: Option<OwnedFd> = None;
+                let mut import_memory_info: vk::ImportMemoryFdInfoKHR<'_>;
+                if let Some(dmabuf) = dmabuf {
+                    let handle = dmabuf.handles().next().unwrap();
+                    let cloned: OwnedFd = match handle.try_clone_to_owned() {
+                        Ok(fd) => fd,
+                        Err(err) => return Err(Error::DmabufFdError(err)),
+                    };
+                    import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                        .fd(cloned.as_raw_fd());
+                    alloc_create_info = alloc_create_info.push_next(&mut import_memory_info);
+                    import_fd_owner = Some(cloned);
+                }
+
+                let alloc_res = unsafe { device.vk().allocate_memory(&alloc_create_info, None) };
+                match alloc_res {
+                    Ok(memory) => {
+                        if let Some(owned) = import_fd_owner.take() {
+                            let _ = owned.into_raw_fd();
+                        }
+                        inner.memory = memory;
+                        inner.memory_offset = 0;
+                        inner.suballocated = false;
+                        inner.allocation_size = allocation_size;
+
+                        let bind_res = unsafe { device.vk().bind_image_memory(inner.image, inner.memory, 0) };
+                        if let Err(err) = bind_res {
+                            tracing::error!(
+                                "VulkanImage::new_internal: dedicated bind_image_memory failed on type {}: {:?}",
+                                candidate_index,
+                                err
+                            );
+                            unsafe { device.vk().free_memory(inner.memory, None) };
+                            inner.memory = vk::DeviceMemory::null();
+                            last_error = Some(Error::VulkanBind(err));
+                            continue;
+                        }
+                        final_mem_bits = Some(candidate_flags);
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "VulkanImage::new_internal dedicated allocate_memory failed on type {}: {:?}, size={}",
+                            candidate_index,
+                            err,
+                            alloc_create_info.allocation_size
+                        );
+                        last_error = Some(Error::VulkanAllocate(err));
+                        continue;
+                    }
+                }
+            } else {
+                let suballoc_res = device.suballocate_memory(
+                    memory_reqs.size,
+                    memory_reqs.alignment,
+                    candidate_index,
+                    tiling,
+                );
+
+                match suballoc_res {
+                    Ok((memory, memory_offset, mapped_ptr)) => {
+                        let bind_res =
+                            unsafe { device.vk().bind_image_memory(inner.image, memory, memory_offset) };
+                        match bind_res {
+                            Ok(()) => {
+                                inner.memory = memory;
+                                inner.memory_offset = memory_offset;
+                                inner.suballocated = true;
+                                inner.allocation_size = memory_reqs.size;
+                                if let Some(ptr) = mapped_ptr {
+                                    *inner.persistent_mapping.lock().unwrap() = Some(MappedPointer(ptr));
+                                }
+                                final_mem_bits = Some(candidate_flags);
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "VulkanImage::new_internal: bind_image_memory (suballocated) failed on type {}: {:?}",
+                                    candidate_index,
+                                    err
+                                );
+                                device.free_suballocation(memory, memory_offset, memory_reqs.size);
+                                last_error = Some(Error::VulkanBind(err));
+                                continue;
+                            }
+                        }
+                    }
+                    Err(suballoc_err) => {
+                        // suballocate_memory already attempts both tiered and exact-size allocation.
+                        // If it fails, that memory type is exhausted. Move directly to the next candidate
+                        // to preserve maxMemoryAllocationCount and prevent redundant driver OOM errors.
+                        tracing::debug!(
+                            "VulkanImage::new_internal: suballocate_memory failed on type {} ({:?}), trying next candidate...",
+                            candidate_index,
+                            suballoc_err
+                        );
+                        last_error = Some(Error::VulkanAllocate(suballoc_err));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let Some(mem_bits) = final_mem_bits else {
+            return Err(last_error.unwrap_or(Error::NoMemoryAvailable));
+        };
 
         let is_depth = vk_usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
             || vk_format == vk::Format::D16_UNORM
