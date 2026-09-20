@@ -915,10 +915,18 @@ impl VulkanRenderer {
                 }
 
                 if !image.mem_bits().contains(MemoryPropertyFlags::HOST_COHERENT) {
+                    let atom = self.device.non_coherent_atom_size().max(1);
+                    let flush_size = (layout.size + atom - 1) & !(atom - 1);
                     let range = vk::MappedMemoryRange::default()
                         .memory(image.inner.memory)
                         .offset(image.inner.memory_offset)
-                        .size(layout.size);
+                        .size(
+                            if !image.inner.suballocated && flush_size >= image.inner.allocation_size {
+                                vk::WHOLE_SIZE
+                            } else {
+                                flush_size
+                            },
+                        );
                     let _ = self.device.vk().flush_mapped_memory_ranges(&[range]);
                 }
             }
@@ -1394,6 +1402,24 @@ impl VulkanRenderer {
 
             let base_ptr = image.map().map_err(Error::HostImageCopyError)?;
             let ptr = unsafe { base_ptr.add(layout.offset as usize) };
+
+            if !image.mem_bits().contains(MemoryPropertyFlags::HOST_COHERENT) {
+                let atom = self.device.non_coherent_atom_size().max(1);
+                let inv_size = (layout.size + atom - 1) & !(atom - 1);
+                let range = vk::MappedMemoryRange::default()
+                    .memory(image.inner.memory)
+                    .offset(image.inner.memory_offset)
+                    .size(
+                        if !image.inner.suballocated && inv_size >= image.inner.allocation_size {
+                            vk::WHOLE_SIZE
+                        } else {
+                            inv_size
+                        },
+                    );
+                unsafe {
+                    let _ = self.device.vk().invalidate_mapped_memory_ranges(&[range]);
+                }
+            }
 
             Ok(VulkanMapping::Mapped(
                 unsafe { NonNull::new_unchecked(ptr as *mut _) },

@@ -799,6 +799,16 @@ impl ImageInner {
             return Ok(mapped.0);
         }
 
+        if self.suballocated {
+            // For suballocated images, the mapping lifecycle is managed entirely by VulkanSuballocator.
+            // If persistent_mapping was None, the underlying memory block is not host-visible or mapping failed.
+            // Suballocated images must never call vkMapMemory directly:
+            // 1. Invoking vkMapMemory on an already-mapped block violates VUID-vkMapMemory-memory-00678.
+            // 2. Mapping [0, allocation_size) and adding memory_offset produces an out-of-bounds host pointer if memory_offset > 0.
+            // 3. Drop for ImageInner does not unmap suballocated memory, which would leak the mapping.
+            return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
+        }
+
         if self.memory == vk::DeviceMemory::null() {
             return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
         }
