@@ -271,10 +271,12 @@ impl VulkanSuballocator {
 
             if is_empty {
                 let removed = self.blocks.swap_remove(i);
-                if removed.mapped_base.is_some() {
-                    vk_device.unmap_memory(removed.memory);
+                unsafe {
+                    if removed.mapped_base.is_some() {
+                        vk_device.unmap_memory(removed.memory);
+                    }
+                    vk_device.free_memory(removed.memory, None);
                 }
-                vk_device.free_memory(removed.memory, None);
             } else {
                 i += 1;
             }

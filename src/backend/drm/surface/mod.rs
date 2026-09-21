@@ -167,6 +167,10 @@ pub struct PlaneConfig<'a> {
     /// one); `Some` selects the resolved pipeline and programs its colorops in the same
     /// commit. See [`ScanoutColorTransform::resolve`](super::colorop::ScanoutColorTransform::resolve).
     pub color_pipeline: Option<&'a ResolvedColorPipeline>,
+    /// Optional raw value for COLOR_ENCODING property
+    pub color_encoding: Option<u64>,
+    /// Optional raw value for COLOR_RANGE property
+    pub color_range: Option<u64>,
 }
 
 /// VRR support state

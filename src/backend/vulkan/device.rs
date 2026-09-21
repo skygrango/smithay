@@ -1,6 +1,11 @@
 use crate::backend::{
     renderer::ContextId,
-    vulkan::{PhysicalDevice, format::FormatEntry, image::VulkanImage},
+    vulkan::{
+        PhysicalDevice,
+        format::FormatEntry,
+        image::VulkanImage,
+        ycbcr::{YcbcrConversion, YcbcrKey},
+    },
 };
 use ash::{
     Device as VkDevice, ext, khr,
@@ -225,12 +230,66 @@ impl Device {
 
             context: ContextId::new(),
             allocator: std::sync::Mutex::new(super::allocator::VulkanSuballocator::default()),
+            ycbcr_conversions: std::sync::Mutex::new(std::collections::HashMap::new()),
             pipeline_cache_uuid,
             buffer_image_granularity,
             non_coherent_atom_size,
             has_memory_priority,
             has_memory_budget,
         })))
+    }
+
+    pub fn get_or_create_ycbcr_conversion(&self, key: YcbcrKey) -> Result<Arc<YcbcrConversion>, vk::Result> {
+        let mut map = self.0.ycbcr_conversions.lock().unwrap();
+        if let Some(entry) = map.get(&key) {
+            return Ok(entry.clone());
+        }
+
+        let conv_info = vk::SamplerYcbcrConversionCreateInfo::default()
+            .format(key.format)
+            .ycbcr_model(key.model)
+            .ycbcr_range(key.range)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .x_chroma_offset(key.x_chroma_offset)
+            .y_chroma_offset(key.y_chroma_offset)
+            .chroma_filter(vk::Filter::LINEAR)
+            .force_explicit_reconstruction(false);
+
+        let conversion = unsafe { self.0.vk.create_sampler_ycbcr_conversion(&conv_info, None)? };
+
+        let mut conv_info_chain = vk::SamplerYcbcrConversionInfo::default().conversion(conversion);
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+            .push_next(&mut conv_info_chain);
+
+        let sampler = match unsafe { self.0.vk.create_sampler(&sampler_info, None) } {
+            Ok(s) => s,
+            Err(err) => {
+                unsafe {
+                    self.0.vk.destroy_sampler_ycbcr_conversion(conversion, None);
+                }
+                return Err(err);
+            }
+        };
+
+        let entry = Arc::new(YcbcrConversion {
+            key,
+            conversion,
+            sampler,
+        });
+
+        map.insert(key, entry.clone());
+        Ok(entry)
     }
 
     pub fn vk(&self) -> &VkDevice {
@@ -462,6 +521,7 @@ struct InnerDevice {
 
     context: ContextId<VulkanImage>,
     allocator: std::sync::Mutex<super::allocator::VulkanSuballocator>,
+    ycbcr_conversions: std::sync::Mutex<std::collections::HashMap<YcbcrKey, Arc<YcbcrConversion>>>,
     pipeline_cache_uuid: [u8; 16],
     /// `VkPhysicalDeviceLimits::bufferImageGranularity`.
     ///
@@ -486,6 +546,10 @@ impl fmt::Debug for InnerDevice {
 impl Drop for InnerDevice {
     fn drop(&mut self) {
         unsafe {
+            for entry in self.ycbcr_conversions.lock().unwrap().values() {
+                self.vk.destroy_sampler(entry.sampler, None);
+                self.vk.destroy_sampler_ycbcr_conversion(entry.conversion, None);
+            }
             self.allocator.lock().unwrap().destroy(&self.vk);
             self.vk.destroy_device(None);
         }

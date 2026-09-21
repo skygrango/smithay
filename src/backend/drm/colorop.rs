@@ -274,6 +274,56 @@ impl PartialEq for ColorPipeline {
 
 impl Eq for ColorPipeline {}
 
+impl ColorPipeline {
+    /// Creates a synthetic color pipeline with full support for 1D curve, multiplier, and 3x4 CTM operations,
+    /// suitable for tests and capability simulation.
+    pub fn synthetic() -> Self {
+        let all_curves = [
+            Curve1DType::SrgbEotf,
+            Curve1DType::SrgbInvEotf,
+            Curve1DType::Pq125Eotf,
+            Curve1DType::Pq125InvEotf,
+            Curve1DType::Bt2020InvOetf,
+            Curve1DType::Bt2020Oetf,
+            Curve1DType::Gamma22,
+            Curve1DType::Gamma22Inv,
+        ];
+        ColorPipeline {
+            id: 1,
+            ops: vec![
+                ColorOp {
+                    id: 1,
+                    kind: ColorOpKind::Curve1D {
+                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
+                    },
+                    bypassable: true,
+                    props: std::collections::HashMap::new(),
+                },
+                ColorOp {
+                    id: 2,
+                    kind: ColorOpKind::Multiplier,
+                    bypassable: true,
+                    props: std::collections::HashMap::new(),
+                },
+                ColorOp {
+                    id: 3,
+                    kind: ColorOpKind::Ctm3x4,
+                    bypassable: true,
+                    props: std::collections::HashMap::new(),
+                },
+                ColorOp {
+                    id: 4,
+                    kind: ColorOpKind::Curve1D {
+                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
+                    },
+                    bypassable: true,
+                    props: std::collections::HashMap::new(),
+                },
+            ],
+        }
+    }
+}
+
 /// Queries the color pipelines advertised on a plane.
 ///
 /// Returns an empty list when the plane has no `COLOR_PIPELINE` property (either the kernel

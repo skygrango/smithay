@@ -1,5 +1,3 @@
-#[cfg(feature = "backend_drm")]
-use crate::{backend::drm::sync::DrmSyncPoint, wayland::drm_syncobj::DrmSyncobjCachedState};
 use crate::{
     backend::renderer::{
         ContextId, ErasedContextId, ImportAll, Renderer, Texture, buffer_dimensions, buffer_has_alpha,
@@ -13,6 +11,18 @@ use crate::{
             with_surface_tree_downward, with_surface_tree_upward,
         },
         viewporter,
+    },
+};
+#[cfg(feature = "backend_drm")]
+use crate::{
+    backend::{
+        allocator::{Buffer as _, Fourcc, format::is_ycbcr},
+        drm::{DrmColorEncoding, DrmColorRange, sync::DrmSyncPoint},
+    },
+    wayland::{
+        color::representation::{Coefficients, Range, get_color_representation_from_states},
+        dmabuf::get_dmabuf,
+        drm_syncobj::DrmSyncobjCachedState,
     },
 };
 
@@ -86,6 +96,10 @@ struct InnerBuffer {
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
     release_point: Option<DrmSyncPoint>,
+    #[cfg(feature = "backend_drm")]
+    color_encoding: Option<DrmColorEncoding>,
+    #[cfg(feature = "backend_drm")]
+    color_range: Option<DrmColorRange>,
 }
 
 impl Drop for InnerBuffer {
@@ -117,6 +131,10 @@ impl Buffer {
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
                 release_point: None,
+                #[cfg(feature = "backend_drm")]
+                color_encoding: None,
+                #[cfg(feature = "backend_drm")]
+                color_range: None,
             }),
         }
     }
@@ -129,6 +147,10 @@ impl Buffer {
                 buffer,
                 acquire_point: Some(acquire_point),
                 release_point: Some(release_point),
+                #[cfg(feature = "backend_drm")]
+                color_encoding: None,
+                #[cfg(feature = "backend_drm")]
+                color_range: None,
             }),
         }
     }
@@ -137,6 +159,24 @@ impl Buffer {
     #[allow(dead_code)]
     pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
         self.inner.acquire_point.as_ref()
+    }
+
+    /// Returns the color encoding for this buffer if YCbCr.
+    #[cfg(feature = "backend_drm")]
+    pub fn color_encoding(&self) -> Option<DrmColorEncoding> {
+        self.inner.color_encoding
+    }
+
+    /// Returns the color range for this buffer if YCbCr.
+    #[cfg(feature = "backend_drm")]
+    pub fn color_range(&self) -> Option<DrmColorRange> {
+        self.inner.color_range
+    }
+
+    /// Returns true if this buffer has a YCbCr format.
+    #[cfg(feature = "backend_drm")]
+    pub fn is_ycbcr(&self) -> bool {
+        self.inner.color_encoding.is_some()
     }
 }
 
@@ -191,6 +231,44 @@ impl RendererSurfaceState {
                 self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                    #[cfg(feature = "backend_drm")]
+                    let (color_encoding, color_range) = {
+                        if let Ok(dmabuf) = get_dmabuf(&buffer) {
+                            let fourcc = dmabuf.format().code;
+                            if is_ycbcr(fourcc) {
+                                let color_rep = get_color_representation_from_states(states);
+                                let encoding = match color_rep.coefficients {
+                                    Some(Coefficients::Bt2020) => DrmColorEncoding::Bt2020,
+                                    Some(Coefficients::Bt601) => DrmColorEncoding::Bt601,
+                                    Some(Coefficients::Bt709) => DrmColorEncoding::Bt709,
+                                    _ => {
+                                        if matches!(
+                                            fourcc,
+                                            Fourcc::P010
+                                                | Fourcc::P210
+                                                | Fourcc::P012
+                                                | Fourcc::P016
+                                                | Fourcc::Q410
+                                        ) {
+                                            DrmColorEncoding::Bt2020
+                                        } else {
+                                            DrmColorEncoding::Bt709
+                                        }
+                                    }
+                                };
+                                let range = match color_rep.range {
+                                    Some(Range::Full) => DrmColorRange::Full,
+                                    _ => DrmColorRange::Limited,
+                                };
+                                (Some(encoding), Some(range))
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    };
+
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
@@ -198,6 +276,10 @@ impl RendererSurfaceState {
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]
                             release_point: syncobj_state.release_point.take(),
+                            #[cfg(feature = "backend_drm")]
+                            color_encoding,
+                            #[cfg(feature = "backend_drm")]
+                            color_range,
                         }),
                     });
                 }
@@ -390,6 +472,12 @@ impl RendererSurfaceState {
         self.color_description
             .as_ref()
             .is_some_and(|desc| desc.is_pq_bt2020())
+    }
+
+    /// Returns whether this surface attached buffer is YCbCr.
+    #[cfg(feature = "backend_drm")]
+    pub fn is_ycbcr(&self) -> bool {
+        self.buffer.as_ref().is_some_and(|b| b.is_ycbcr())
     }
 
     /// Updates color state from surface cached state.

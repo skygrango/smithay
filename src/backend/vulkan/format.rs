@@ -1,7 +1,10 @@
 //! Format conversions between Vulkan and DRM formats.
 
 use super::PhysicalDevice;
-use crate::backend::allocator::{Format, Modifier};
+use crate::backend::allocator::{
+    Format, Fourcc, Modifier,
+    format::{get_opaque, is_ycbcr},
+};
 
 use ash::vk;
 
@@ -191,6 +194,28 @@ pub fn component_mapping_for_format(_format: vk::Format, has_alpha: bool) -> vk:
     }
 }
 
+pub fn is_ycbcr_format(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::G8_B8R8_2PLANE_420_UNORM
+            | vk::Format::G8_B8R8_2PLANE_422_UNORM
+            | vk::Format::G8_B8_R8_3PLANE_420_UNORM
+            | vk::Format::G8_B8_R8_3PLANE_422_UNORM
+            | vk::Format::G8_B8_R8_3PLANE_444_UNORM
+            | vk::Format::B8G8R8G8_422_UNORM
+            | vk::Format::G8B8G8R8_422_UNORM
+            | vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
+            | vk::Format::G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16
+            | vk::Format::G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16
+            | vk::Format::G16_B16R16_2PLANE_420_UNORM
+            | vk::Format::G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16
+    )
+}
+
+pub fn is_ycbcr_fourcc(fourcc: Fourcc) -> bool {
+    is_ycbcr(fourcc)
+}
+
 impl PhysicalDevice {
     pub fn drm_formats(&self) -> FormatList {
         let mut list = Vec::new();
@@ -209,7 +234,7 @@ impl PhysicalDevice {
                     },
                     modifier_properties,
                 });
-                if let Some(opaque) = crate::backend::allocator::format::get_opaque(fourcc) {
+                if let Some(opaque) = get_opaque(fourcc) {
                     list.push(FormatEntry {
                         format: Format {
                             code: opaque,

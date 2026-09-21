@@ -35,7 +35,10 @@ use crate::backend::drm::error::AccessError;
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
     backend::{
-        allocator::format::{get_bpp, get_depth},
+        allocator::{
+            Fourcc,
+            format::{get_bpp, get_depth},
+        },
         drm::{
             DrmDeviceFd,
             device::DrmDeviceInternal,
@@ -488,10 +491,10 @@ impl AtomicDrmSurface {
     ) -> Result<TestBuffer, Error> {
         let needs_alpha = plane_type(&*self.fd, plane)? != PlaneType::Primary;
         let preferred_format = match (needs_alpha, is_hdr) {
-            (true, true) => crate::backend::allocator::Fourcc::Abgr2101010,
-            (false, true) => crate::backend::allocator::Fourcc::Xbgr2101010,
-            (true, false) => crate::backend::allocator::Fourcc::Argb8888,
-            (false, false) => crate::backend::allocator::Fourcc::Xrgb8888,
+            (true, true) => Fourcc::Abgr2101010,
+            (false, true) => Fourcc::Xbgr2101010,
+            (true, false) => Fourcc::Argb8888,
+            (false, false) => Fourcc::Xrgb8888,
         };
 
         if let Ok(buf) = self.create_test_buffer_format(size, preferred_format) {
@@ -499,18 +502,14 @@ impl AtomicDrmSurface {
         }
 
         let fallback_format = if needs_alpha {
-            crate::backend::allocator::Fourcc::Argb8888
+            Fourcc::Argb8888
         } else {
-            crate::backend::allocator::Fourcc::Xrgb8888
+            Fourcc::Xrgb8888
         };
         self.create_test_buffer_format(size, fallback_format)
     }
 
-    fn create_test_buffer_format(
-        &self,
-        size: (u16, u16),
-        format: crate::backend::allocator::Fourcc,
-    ) -> Result<TestBuffer, Error> {
+    fn create_test_buffer_format(&self, size: (u16, u16), format: Fourcc) -> Result<TestBuffer, Error> {
         let (w, h) = size;
         let db = self
             .fd
@@ -629,6 +628,8 @@ impl AtomicDrmSurface {
                     fb: test_buffer.fb,
                     fence: None,
                     color_pipeline: None,
+                    color_encoding: None,
+                    color_range: None,
                 }),
             };
 
@@ -707,6 +708,8 @@ impl AtomicDrmSurface {
                 fb: test_buffer.fb,
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
 
@@ -772,6 +775,8 @@ impl AtomicDrmSurface {
                 fb: test_buffer.fb,
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
         // re-resolve the pending color state for the new connector set
@@ -839,6 +844,8 @@ impl AtomicDrmSurface {
                 fb: test_buffer.fb,
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
         let req = AtomicRequest::build_request(
@@ -1030,6 +1037,8 @@ impl AtomicDrmSurface {
                 fb: test_buffer.fb,
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
 
@@ -1281,6 +1290,8 @@ impl AtomicDrmSurface {
                 fb: test_buffer.fb,
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
 
@@ -1529,6 +1540,8 @@ impl AtomicDrmSurface {
                     fb: test_buffer.fb,
                     fence: None,
                     color_pipeline: None,
+                    color_encoding: None,
+                    color_range: None,
                 }),
             };
 
@@ -2408,6 +2421,14 @@ impl<'a> AtomicRequest<'a> {
                     name: "COLOR_PIPELINE",
                 });
             }
+            if self.mapping.plane_prop_handle(handle, "COLOR_ENCODING").is_ok() {
+                let encoding = config.color_encoding.unwrap_or(0);
+                plane_props.insert("COLOR_ENCODING", property::Value::Unknown(encoding));
+            }
+            if self.mapping.plane_prop_handle(handle, "COLOR_RANGE").is_ok() {
+                let range = config.color_range.unwrap_or(0);
+                plane_props.insert("COLOR_RANGE", property::Value::Unknown(range));
+            }
         } else {
             self.reset_plane(handle)?;
         }
@@ -2448,6 +2469,12 @@ impl<'a> AtomicRequest<'a> {
         }
         if self.mapping.plane_prop_handle(plane, "COLOR_PIPELINE").is_ok() {
             plane_props.insert("COLOR_PIPELINE", property::Value::Unknown(0));
+        }
+        if self.mapping.plane_prop_handle(plane, "COLOR_ENCODING").is_ok() {
+            plane_props.insert("COLOR_ENCODING", property::Value::Unknown(0));
+        }
+        if self.mapping.plane_prop_handle(plane, "COLOR_RANGE").is_ok() {
+            plane_props.insert("COLOR_RANGE", property::Value::Unknown(0));
         }
         Ok(())
     }
@@ -2730,6 +2757,16 @@ impl<'a> AtomicRequest<'a> {
                     name: "COLOR_PIPELINE",
                 });
             }
+            if let Ok(prop) = self.mapping.plane_prop_handle(handle, "COLOR_ENCODING") {
+                let encoding = config.color_encoding.unwrap_or(0);
+                self.request
+                    .add_property(handle, prop, property::Value::Unknown(encoding));
+            }
+            if let Ok(prop) = self.mapping.plane_prop_handle(handle, "COLOR_RANGE") {
+                let range = config.color_range.unwrap_or(0);
+                self.request
+                    .add_property(handle, prop, property::Value::Unknown(range));
+            }
         } else {
             self.reset_plane(handle)?;
         }
@@ -2815,6 +2852,14 @@ impl<'a> AtomicRequest<'a> {
                 .add_property(plane, prop, property::Value::SignedRange(-1));
         }
         if let Ok(prop) = self.mapping.plane_prop_handle(plane, "COLOR_PIPELINE") {
+            self.request
+                .add_property(plane, prop, property::Value::Unknown(0));
+        }
+        if let Ok(prop) = self.mapping.plane_prop_handle(plane, "COLOR_ENCODING") {
+            self.request
+                .add_property(plane, prop, property::Value::Unknown(0));
+        }
+        if let Ok(prop) = self.mapping.plane_prop_handle(plane, "COLOR_RANGE") {
             self.request
                 .add_property(plane, prop, property::Value::Unknown(0));
         }

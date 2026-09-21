@@ -20,8 +20,12 @@
 //! `smithay-drm-extras`' `display_info` module and libdisplay-info's
 //! `Info::hdr_static_metadata()` / `Info::supported_signal_colorimetry()`.
 
-use super::colorop::{ColorPipeline, Curve1DType, PostBlendEncode, ScanoutColorTransform};
+use super::colorop::{
+    ColorPipeline, Curve1DType, PostBlendEncode, ScanoutColorTransform, plane_color_pipelines,
+};
 use crate::backend::allocator::format::FormatSet;
+#[cfg(feature = "wayland_frontend")]
+use crate::wayland::color::management::{ImageDescription, TransferFunction};
 
 /// Value of the `Colorspace` connector property.
 ///
@@ -927,6 +931,66 @@ impl ScanoutPlan {
     }
 }
 
+/// Context and metadata of a surface candidate for direct scanout evaluation.
+#[cfg(feature = "wayland_frontend")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanoutCandidate<'a> {
+    /// Color image description of the content, if provided by the client.
+    pub image_description: Option<&'a ImageDescription>,
+    /// Whether the underlying buffer format is a YCbCr / YUV pixel format.
+    pub is_yuv: bool,
+}
+
+#[cfg(feature = "wayland_frontend")]
+impl<'a> ScanoutCandidate<'a> {
+    /// Creates a candidate from an optional image description (assuming standard RGB).
+    pub fn rgb(desc: Option<&'a ImageDescription>) -> Self {
+        Self {
+            image_description: desc,
+            is_yuv: false,
+        }
+    }
+
+    /// Creates a candidate for a YUV buffer with optional color description.
+    pub fn yuv(desc: Option<&'a ImageDescription>) -> Self {
+        Self {
+            image_description: desc,
+            is_yuv: true,
+        }
+    }
+}
+
+/// Target display characteristics for scanout evaluation.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanoutTarget {
+    /// Whether the output CRTC is driving an HDR (e.g. BT.2020 PQ) signal.
+    pub hdr_enabled: bool,
+    /// Reference white luminance in nits (cd/m²). Standard SDR is 80 or 203.
+    pub reference_white: u16,
+    /// Maximum peak luminance of the sink in nits (from EDID or user override).
+    pub peak_luminance: Option<u16>,
+}
+
+impl ScanoutTarget {
+    /// Creates an SDR scanout target.
+    pub fn sdr(reference_white: u16) -> Self {
+        Self {
+            hdr_enabled: false,
+            reference_white,
+            peak_luminance: None,
+        }
+    }
+
+    /// Creates an HDR scanout target.
+    pub fn hdr(reference_white: u16, peak_luminance: Option<u16>) -> Self {
+        Self {
+            hdr_enabled: true,
+            reference_white,
+            peak_luminance,
+        }
+    }
+}
+
 /// Overall DRM hardware scanout capabilities for a display surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DrmScanoutCapabilities {
@@ -1022,36 +1086,94 @@ impl DrmScanoutCapabilities {
     /// Evaluates the appropriate scanout plan for a given content image description,
     /// following the strict efficiency hierarchy:
     /// DirectPassthrough -> PlaneColorop -> CrtcHardware -> VulkanFastDirectFlip
+    #[cfg(feature = "wayland_frontend")]
+    #[inline]
     pub fn evaluate_scanout_plan(
         &self,
         output_hdr_enabled: bool,
-        desc: Option<&crate::wayland::color::management::ImageDescription>,
+        desc: Option<&ImageDescription>,
         output_reference_white: u16,
     ) -> ScanoutPlan {
-        self.evaluate_scanout_plan_with_peak(output_hdr_enabled, desc, output_reference_white, None)
+        self.evaluate_scanout(
+            ScanoutCandidate::rgb(desc),
+            ScanoutTarget {
+                hdr_enabled: output_hdr_enabled,
+                reference_white: output_reference_white,
+                peak_luminance: None,
+            },
+        )
     }
 
-    /// Evaluates the appropriate scanout plan, taking the sink's peak luminance into account.
-    ///
-    /// When content peak luminance exceeds the destination display's peak luminance
-    /// (`content_max > output_peak * 1.05`), hardware direct scanout cannot perform
-    /// the non-linear ICtCp gamut-preserving tone mapping curve without clipping highlights.
-    /// In this case, it falls back to [`ScanoutPlan::VulkanFastDirectFlip`] so that the
-    /// Vulkan shader (`tonemap_ictcp` in `hdr_texture.frag.glsl`) can roll off the highlights.
-    pub fn evaluate_scanout_plan_with_peak(
-        &self,
-        output_hdr_enabled: bool,
-        desc: Option<&crate::wayland::color::management::ImageDescription>,
-        output_reference_white: u16,
-        output_peak_luminance: Option<u16>,
-    ) -> ScanoutPlan {
-        if !output_hdr_enabled {
+    /// Evaluates the appropriate scanout plan for a given candidate and target,
+    /// following the strict efficiency hierarchy:
+    /// DirectPassthrough -> PlaneColorop -> CrtcHardware -> VulkanFastDirectFlip
+    #[cfg(feature = "wayland_frontend")]
+    pub fn evaluate_scanout(&self, candidate: ScanoutCandidate<'_>, target: ScanoutTarget) -> ScanoutPlan {
+        let desc = candidate.image_description;
+        let is_yuv = candidate.is_yuv;
+        let output_hdr_enabled = target.hdr_enabled;
+        let output_reference_white = target.reference_white;
+        let output_peak_luminance = target.peak_luminance;
+
+        if is_yuv {
+            if !output_hdr_enabled {
+                match desc {
+                    Some(desc) if desc.is_hdr() || desc.is_pq_bt2020() => {
+                        // HDR YUV content on SDR output requires tone mapping; Colorop cannot handle YUV.
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                    Some(desc) if desc.transfer == TransferFunction::Hlg => {
+                        // HLG YUV content on SDR output requires tone mapping.
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                    _ => {
+                        // SDR YUV on SDR output: DRM plane hardware CSC converts BT.709/BT.601 YUV -> sRGB
+                        ScanoutPlan::DirectPassthrough
+                    }
+                }
+            } else {
+                // HDR output active (BT.2020 PQ signal)
+                match desc {
+                    Some(desc) if desc.is_pq_bt2020() => {
+                        let tonemap_needed = |desc: &ImageDescription, content_ref_white: u32| -> bool {
+                            if let Some(peak) = output_peak_luminance {
+                                if peak > 0 {
+                                    let content_explicit_max = desc
+                                        .max_cll
+                                        .or_else(|| desc.mastering_luminance.map(|(_, m)| m))
+                                        .or_else(|| desc.luminances.map(|(_, m, _)| m));
+
+                                    if let Some(max_lum) = content_explicit_max {
+                                        let ref_scale = (output_reference_white as f64)
+                                            / (content_ref_white as f64).max(1.0);
+                                        let scaled_max = (max_lum as f64) * ref_scale;
+                                        return scaled_max > (peak as f64) * 1.05;
+                                    }
+                                }
+                            }
+                            false
+                        };
+
+                        if !desc.windows_bt2100 && tonemap_needed(desc, desc.luminances_or_default().2) {
+                            ScanoutPlan::VulkanFastDirectFlip
+                        } else {
+                            // Native PQ BT.2020 YUV matches output HDR pipeline directly via plane CSC (BT.2020 YUV -> BT.2020 RGB).
+                            ScanoutPlan::DirectPassthrough
+                        }
+                    }
+                    _ => {
+                        // SDR YUV on HDR output requires sRGB-to-PQ conversion.
+                        // Linux DRM Plane COLOR_PIPELINE does not support YCbCr input.
+                        // CRTC color management also cannot convert YUV->linear before degamma LUT.
+                        // Force Vulkan fast flip so Vulkan VkSamplerYcbcrConversion samples YUV
+                        // and applies exact shader sRGB-to-PQ tone mapping.
+                        ScanoutPlan::VulkanFastDirectFlip
+                    }
+                }
+            }
+        } else if !output_hdr_enabled {
             match desc {
-                Some(desc)
-                    if desc.windows_scrgb
-                        || desc.transfer
-                            == crate::wayland::color::management::TransferFunction::ExtLinear =>
-                {
+                Some(desc) if desc.windows_scrgb || desc.transfer == TransferFunction::ExtLinear => {
                     // scRGB FP16 on SDR output
                     let conv = PlaneColorConversion::ScRgbToSrgb;
                     if self.can_plane_colorop_execute(conv) && self.supports_fp16 {
@@ -1076,7 +1198,7 @@ impl DrmScanoutCapabilities {
                         ScanoutPlan::VulkanFastDirectFlip
                     }
                 }
-                Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
+                Some(desc) if desc.transfer == TransferFunction::Hlg => {
                     // HLG on SDR output
                     let conv = PlaneColorConversion::HlgToSrgb;
                     if self.can_plane_colorop_execute(conv) {
@@ -1102,9 +1224,7 @@ impl DrmScanoutCapabilities {
         } else {
             // Helper to check whether content exceeds sink peak luminance and needs
             // shader-level ICtCp tone mapping (non-linear roll-off) rather than hardware scanout.
-            let tonemap_needed = |desc: &crate::wayland::color::management::ImageDescription,
-                                  content_ref_white: u32|
-             -> bool {
+            let tonemap_needed = |desc: &ImageDescription, content_ref_white: u32| -> bool {
                 if let Some(peak) = output_peak_luminance {
                     if peak > 0 {
                         // Only consider content for compositor tone mapping if it explicitly declared
@@ -1142,11 +1262,7 @@ impl DrmScanoutCapabilities {
                         ScanoutPlan::DirectPassthrough
                     }
                 }
-                Some(desc)
-                    if desc.windows_scrgb
-                        || desc.transfer
-                            == crate::wayland::color::management::TransferFunction::ExtLinear =>
-                {
+                Some(desc) if desc.windows_scrgb || desc.transfer == TransferFunction::ExtLinear => {
                     // scRGB FP16 on HDR
                     let ref_white = desc.luminances_or_default().2 as u16;
                     let eff_ref_white = if ref_white > 0 {
@@ -1174,7 +1290,7 @@ impl DrmScanoutCapabilities {
                         }
                     }
                 }
-                Some(desc) if desc.transfer == crate::wayland::color::management::TransferFunction::Hlg => {
+                Some(desc) if desc.transfer == TransferFunction::Hlg => {
                     // HLG on HDR
                     let ref_white = desc.luminances_or_default().2 as u16;
                     let eff_ref_white = if ref_white > 0 {
@@ -1247,6 +1363,51 @@ impl DrmScanoutCapabilities {
                 _ => ScanoutPlan::VulkanFastDirectFlip,
             }
         }
+    }
+
+    /// Evaluates the appropriate scanout plan, taking the sink's peak luminance into account.
+    #[cfg(feature = "wayland_frontend")]
+    #[inline]
+    pub fn evaluate_scanout_plan_with_peak(
+        &self,
+        output_hdr_enabled: bool,
+        desc: Option<&ImageDescription>,
+        output_reference_white: u16,
+        output_peak_luminance: Option<u16>,
+    ) -> ScanoutPlan {
+        self.evaluate_scanout(
+            ScanoutCandidate::rgb(desc),
+            ScanoutTarget {
+                hdr_enabled: output_hdr_enabled,
+                reference_white: output_reference_white,
+                peak_luminance: output_peak_luminance,
+            },
+        )
+    }
+
+    /// Evaluates the appropriate [`ScanoutPlan`] for a fullscreen surface, taking into account
+    /// HDR display status, image description, output peak luminance, and whether the buffer is YCbCr.
+    #[cfg(feature = "wayland_frontend")]
+    #[inline]
+    pub fn evaluate_scanout_plan_with_yuv(
+        &self,
+        output_hdr_enabled: bool,
+        desc: Option<&ImageDescription>,
+        output_reference_white: u16,
+        output_peak_luminance: Option<u16>,
+        is_yuv: bool,
+    ) -> ScanoutPlan {
+        self.evaluate_scanout(
+            ScanoutCandidate {
+                image_description: desc,
+                is_yuv,
+            },
+            ScanoutTarget {
+                hdr_enabled: output_hdr_enabled,
+                reference_white: output_reference_white,
+                peak_luminance: output_peak_luminance,
+            },
+        )
     }
 }
 
@@ -1548,7 +1709,7 @@ mod tests {
                         .map_or(false, |info| info.name().to_string_lossy() == "type" && *val == 1)
                 });
                 if is_primary {
-                    if let Ok(pipes) = crate::backend::drm::colorop::plane_color_pipelines(&drm_fd, *plane) {
+                    if let Ok(pipes) = plane_color_pipelines(&drm_fd, *plane) {
                         if !pipes.is_empty() {
                             return Some(pipes);
                         }
@@ -1560,57 +1721,11 @@ mod tests {
     }
 
     fn synthetic_test_pipeline() -> ColorPipeline {
-        use crate::backend::drm::colorop::{ColorOp, ColorOpKind, Curve1DType};
-        use std::collections::HashMap;
-
-        let all_curves = [
-            Curve1DType::SrgbEotf,
-            Curve1DType::SrgbInvEotf,
-            Curve1DType::Pq125Eotf,
-            Curve1DType::Pq125InvEotf,
-            Curve1DType::Bt2020InvOetf,
-            Curve1DType::Bt2020Oetf,
-            Curve1DType::Gamma22,
-            Curve1DType::Gamma22Inv,
-        ];
-        ColorPipeline {
-            id: 1,
-            ops: vec![
-                ColorOp {
-                    id: 1,
-                    kind: ColorOpKind::Curve1D {
-                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
-                    },
-                    bypassable: true,
-                    props: HashMap::new(),
-                },
-                ColorOp {
-                    id: 2,
-                    kind: ColorOpKind::Multiplier,
-                    bypassable: true,
-                    props: HashMap::new(),
-                },
-                ColorOp {
-                    id: 3,
-                    kind: ColorOpKind::Ctm3x4,
-                    bypassable: true,
-                    props: HashMap::new(),
-                },
-                ColorOp {
-                    id: 4,
-                    kind: ColorOpKind::Curve1D {
-                        supported: all_curves.iter().map(|&c| (c, c as u64)).collect(),
-                    },
-                    bypassable: true,
-                    props: HashMap::new(),
-                },
-            ],
-        }
+        ColorPipeline::synthetic()
     }
 
     #[test]
     fn scanout_plan_evaluation() {
-        use crate::wayland::color::management::ImageDescription;
         let test_pipelines =
             query_real_primary_plane_pipelines().unwrap_or_else(|| vec![synthetic_test_pipeline()]);
         let mut caps = DrmScanoutCapabilities {
@@ -1687,7 +1802,6 @@ mod tests {
         caps.crtc_color.has_degamma_lut = true;
 
         // 4. HLG on SDR output:
-        use crate::wayland::color::management::TransferFunction;
         let mut hlg_desc = ImageDescription::WINDOWS_BT2100;
         hlg_desc.transfer = TransferFunction::Hlg;
         // 4a. PlaneColorop
@@ -1775,8 +1889,6 @@ mod tests {
 
     #[test]
     fn test_evaluate_scanout_plan_peak_luminance_tonemap_fallback() {
-        use crate::wayland::color::management::ImageDescription;
-
         let mut caps = DrmScanoutCapabilities {
             supports_fp16: true,
             supports_10bit: true,
@@ -1851,6 +1963,43 @@ mod tests {
         caps.crtc_color.has_gamma_lut = true;
         caps.crtc_color.gamma_lut_size = 256;
         assert!(!caps.supports_post_blend_encode());
+    }
+
+    #[test]
+    fn test_evaluate_scanout_plan_with_yuv() {
+        let mut caps = DrmScanoutCapabilities::default();
+        caps.supports_plane_colorop = true;
+        caps.supports_fp16 = true;
+        caps.crtc_color.has_gamma_lut = true;
+        caps.crtc_color.has_degamma_lut = true;
+        caps.crtc_color.has_ctm = true;
+
+        let srgb_desc = ImageDescription::SRGB;
+        let bt2020_pq_desc = ImageDescription::WINDOWS_BT2100;
+
+        // 1. SDR output + SDR YUV buffer -> DirectPassthrough (plane fixed CSC BT.709 -> sRGB)
+        let plan = caps.evaluate_scanout_plan_with_yuv(false, Some(&srgb_desc), 203, None, true);
+        assert_eq!(plan, ScanoutPlan::DirectPassthrough);
+
+        let plan_untagged = caps.evaluate_scanout_plan_with_yuv(false, None, 203, None, true);
+        assert_eq!(plan_untagged, ScanoutPlan::DirectPassthrough);
+
+        // 2. SDR output + HDR YUV buffer -> VulkanFastDirectFlip (tone mapping required)
+        let plan_hdr_on_sdr =
+            caps.evaluate_scanout_plan_with_yuv(false, Some(&bt2020_pq_desc), 203, None, true);
+        assert_eq!(plan_hdr_on_sdr, ScanoutPlan::VulkanFastDirectFlip);
+
+        // 3. HDR output + HDR PQ BT.2020 YUV buffer -> DirectPassthrough (plane fixed CSC BT.2020 YUV -> BT.2020 RGB)
+        let plan_hdr_on_hdr =
+            caps.evaluate_scanout_plan_with_yuv(true, Some(&bt2020_pq_desc), 203, None, true);
+        assert_eq!(plan_hdr_on_hdr, ScanoutPlan::DirectPassthrough);
+
+        // 4. HDR output + SDR YUV buffer -> VulkanFastDirectFlip (requires SrgbToPq tone mapping; Colorop rejects YUV)
+        let plan_sdr_on_hdr = caps.evaluate_scanout_plan_with_yuv(true, Some(&srgb_desc), 203, None, true);
+        assert_eq!(plan_sdr_on_hdr, ScanoutPlan::VulkanFastDirectFlip);
+
+        let plan_sdr_untagged_on_hdr = caps.evaluate_scanout_plan_with_yuv(true, None, 203, None, true);
+        assert_eq!(plan_sdr_untagged_on_hdr, ScanoutPlan::VulkanFastDirectFlip);
     }
 
     #[test]
@@ -1980,10 +2129,8 @@ mod tests {
     #[test]
     fn test_print_hardware_color_support() {
         use crate::backend::allocator::format::FormatSet;
-        use crate::backend::drm::color::{CrtcColorCapabilities, DrmScanoutCapabilities, ScanoutPlan};
         use crate::backend::drm::device::DrmDeviceFd;
         use crate::utils::DeviceFd;
-        use crate::wayland::color::management::{ImageDescription, TransferFunction};
         use drm::Device as BasicDevice;
         use drm::control::Device as ControlDevice;
         use std::fs::OpenOptions;
@@ -2208,9 +2355,7 @@ mod tests {
                         primary_supports_10bit = has_10bit;
                         primary_supports_colorop = has_colorop;
                         if has_colorop && primary_color_pipelines.is_empty() {
-                            if let Ok(pipes) =
-                                crate::backend::drm::colorop::plane_color_pipelines(&drm_fd, *plane_handle)
-                            {
+                            if let Ok(pipes) = plane_color_pipelines(&drm_fd, *plane_handle) {
                                 primary_color_pipelines = pipes;
                             }
                         }

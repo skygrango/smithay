@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use super::Format;
+use super::{Format, Fourcc};
 use indexmap::IndexSet;
 
 /// Macro to generate table lookup functions for formats.
@@ -501,6 +501,40 @@ impl Iterator for FormatSetIntoIter {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+}
+
+/// Returns true if the specified format is a YUV/YCbCr format.
+pub fn is_ycbcr(fourcc: Fourcc) -> bool {
+    matches!(
+        fourcc,
+        Fourcc::Nv12
+            | Fourcc::Nv21
+            | Fourcc::Nv16
+            | Fourcc::Nv61
+            | Fourcc::Nv24
+            | Fourcc::Nv42
+            | Fourcc::Yuv410
+            | Fourcc::Yuv411
+            | Fourcc::Yuv420
+            | Fourcc::Yuv422
+            | Fourcc::Yuv444
+            | Fourcc::Yvu410
+            | Fourcc::Yvu411
+            | Fourcc::Yvu420
+            | Fourcc::Yvu422
+            | Fourcc::Yvu444
+            | Fourcc::Uyvy
+            | Fourcc::Vyuy
+            | Fourcc::Yuyv
+            | Fourcc::Yvyu
+            | Fourcc::P010
+            | Fourcc::P012
+            | Fourcc::P016
+            | Fourcc::P210
+            | Fourcc::Q410
+            | Fourcc::Q401
+            | Fourcc::Ayuv
+    )
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use include_bytes_aligned::include_bytes_aligned;
 
 use crate::backend::{
     renderer::vulkan::shaders::descriptor::DescriptorAllocator,
-    vulkan::{Device, device::WeakDevice},
+    vulkan::{Device, device::WeakDevice, ycbcr::YcbcrKey},
 };
 
 mod clear;
@@ -22,9 +22,9 @@ pub use self::{
     clear::ClearPushConstants,
     hdr_texture::{
         HDR_FLAG_HARDWARE_OFFLOAD, HDR_FLAG_INPUT_IS_HLG, HDR_FLAG_INPUT_IS_PQ,
-        HDR_FLAG_INPUT_PRIMARIES_MASK, HDR_FLAG_INPUT_PRIMARIES_SHIFT, HDR_FLAG_SKIP_COLOR_TRANSFORM,
-        HDR_FLAG_TARGET_IS_SDR, HdrTexPushConstants, SPEC_MODE_GENERIC, SPEC_MODE_LUT3D,
-        SPEC_MODE_PASSTHROUGH, SPEC_MODE_PQ, SPEC_MODE_SDR,
+        HDR_FLAG_INPUT_PRIMARIES_SHIFT, HDR_FLAG_SKIP_COLOR_TRANSFORM, HDR_FLAG_TARGET_IS_SDR,
+        HdrTexPushConstants, SPEC_MODE_GENERIC, SPEC_MODE_LUT3D, SPEC_MODE_PASSTHROUGH, SPEC_MODE_PQ,
+        SPEC_MODE_SDR,
     },
     outline::OutlinePushConstants,
     texture::TexPushConstants,
@@ -59,6 +59,33 @@ pub struct FormatPipelines {
     pub outline_blend_pipeline: Pipeline,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct YcbcrFormatPipelines {
+    pub tex_pipeline: Pipeline,
+    pub tex_blend_pipeline: Pipeline,
+    pub hdr_tex_pipeline: Pipeline,
+    pub hdr_tex_blend_pipeline: Pipeline,
+    pub hdr_passthrough_pipeline: Pipeline,
+    pub hdr_passthrough_blend_pipeline: Pipeline,
+    pub hdr_sdr_pipeline: Pipeline,
+    pub hdr_sdr_blend_pipeline: Pipeline,
+    pub hdr_pq_pipeline: Pipeline,
+    pub hdr_pq_blend_pipeline: Pipeline,
+}
+
+#[derive(Debug)]
+pub struct YcbcrEntry {
+    pub tex_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub tex_layout: PipelineLayout,
+    pub tex_desc_pool: DescriptorAllocator,
+
+    pub hdr_tex_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub hdr_tex_layout: PipelineLayout,
+    pub hdr_tex_desc_pool: DescriptorAllocator,
+
+    pub format_pipelines: HashMap<(vk::Format, bool), YcbcrFormatPipelines>,
+}
+
 #[derive(Debug)]
 pub struct Pipelines {
     device: WeakDevice,
@@ -80,6 +107,7 @@ pub struct Pipelines {
     outline_frag: vk::ShaderModule,
 
     format_pipelines: HashMap<(vk::Format, bool), FormatPipelines>,
+    ycbcr_entries: HashMap<YcbcrKey, YcbcrEntry>,
 }
 
 fn get_pipeline_cache_path(device: &Device) -> Option<std::path::PathBuf> {
@@ -288,6 +316,7 @@ impl Pipelines {
             outline_frag,
 
             format_pipelines: HashMap::new(),
+            ycbcr_entries: HashMap::new(),
         })
     }
 
@@ -410,54 +439,6 @@ impl Pipelines {
         } else {
             vk::Format::UNDEFINED
         };
-        let mut r0 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r1 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r2 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r3 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r4 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r5 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r6 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r7 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r8 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r9 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r10 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r11 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r12 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r13 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r14 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
-        let mut r15 = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_attachment_formats)
-            .depth_attachment_format(depth_format);
 
         let opaque_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(has_depth)
@@ -504,120 +485,58 @@ impl Pipelines {
             .multisample_state(&multisample_state)
             .dynamic_state(&dynamic_state);
 
-        let create_infos = [
-            // 0: clear opaque
-            base_ci
-                .push_next(&mut r0)
-                .stages(&clear_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.clear_layout),
-            // 1: clear blend
-            base_ci
-                .push_next(&mut r1)
-                .stages(&clear_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.clear_layout),
-            // 2: tex opaque
-            base_ci
-                .push_next(&mut r2)
-                .stages(&tex_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.tex_layout),
-            // 3: tex blend
-            base_ci
-                .push_next(&mut r3)
-                .stages(&tex_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.tex_layout),
-            // 4: hdr_tex opaque (generic fallback)
-            base_ci
-                .push_next(&mut r4)
-                .stages(&hdr_tex_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 5: hdr_tex blend (generic fallback)
-            base_ci
-                .push_next(&mut r5)
-                .stages(&hdr_tex_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 6: hdr_passthrough opaque
-            base_ci
-                .push_next(&mut r6)
-                .stages(&hdr_passthrough_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 7: hdr_passthrough blend
-            base_ci
-                .push_next(&mut r7)
-                .stages(&hdr_passthrough_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 8: hdr_sdr opaque
-            base_ci
-                .push_next(&mut r8)
-                .stages(&hdr_sdr_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 9: hdr_sdr blend
-            base_ci
-                .push_next(&mut r9)
-                .stages(&hdr_sdr_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 10: hdr_pq opaque
-            base_ci
-                .push_next(&mut r10)
-                .stages(&hdr_pq_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 11: hdr_pq blend
-            base_ci
-                .push_next(&mut r11)
-                .stages(&hdr_pq_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 12: hdr_lut3d opaque
-            base_ci
-                .push_next(&mut r12)
-                .stages(&hdr_lut3d_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 13: hdr_lut3d blend
-            base_ci
-                .push_next(&mut r13)
-                .stages(&hdr_lut3d_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.hdr_tex_layout),
-            // 14: outline opaque
-            base_ci
-                .push_next(&mut r14)
-                .stages(&outline_stages)
-                .color_blend_state(&opaque_blend_state)
-                .depth_stencil_state(&opaque_depth_stencil)
-                .layout(self.outline_layout),
-            // 15: outline blend
-            base_ci
-                .push_next(&mut r15)
-                .stages(&outline_stages)
-                .color_blend_state(&alpha_blend_state)
-                .depth_stencil_state(&blend_depth_stencil)
-                .layout(self.outline_layout),
+        let specs = [
+            // 0, 1: clear
+            (&clear_stages[..], false, self.clear_layout),
+            (&clear_stages[..], true, self.clear_layout),
+            // 2, 3: tex
+            (&tex_stages[..], false, self.tex_layout),
+            (&tex_stages[..], true, self.tex_layout),
+            // 4, 5: hdr_tex
+            (&hdr_tex_stages[..], false, self.hdr_tex_layout),
+            (&hdr_tex_stages[..], true, self.hdr_tex_layout),
+            // 6, 7: hdr_passthrough
+            (&hdr_passthrough_stages[..], false, self.hdr_tex_layout),
+            (&hdr_passthrough_stages[..], true, self.hdr_tex_layout),
+            // 8, 9: hdr_sdr
+            (&hdr_sdr_stages[..], false, self.hdr_tex_layout),
+            (&hdr_sdr_stages[..], true, self.hdr_tex_layout),
+            // 10, 11: hdr_pq
+            (&hdr_pq_stages[..], false, self.hdr_tex_layout),
+            (&hdr_pq_stages[..], true, self.hdr_tex_layout),
+            // 12, 13: hdr_lut3d
+            (&hdr_lut3d_stages[..], false, self.hdr_tex_layout),
+            (&hdr_lut3d_stages[..], true, self.hdr_tex_layout),
+            // 14, 15: outline
+            (&outline_stages[..], false, self.outline_layout),
+            (&outline_stages[..], true, self.outline_layout),
         ];
+
+        let mut rendering_infos = (0..specs.len())
+            .map(|_| {
+                vk::PipelineRenderingCreateInfo::default()
+                    .color_attachment_formats(&color_attachment_formats)
+                    .depth_attachment_format(depth_format)
+            })
+            .collect::<Vec<_>>();
+
+        let create_infos = specs
+            .iter()
+            .zip(rendering_infos.iter_mut())
+            .map(|((stages, is_blend, layout), r_info)| {
+                let (blend_state, depth_state) = if *is_blend {
+                    (&alpha_blend_state, &blend_depth_stencil)
+                } else {
+                    (&opaque_blend_state, &opaque_depth_stencil)
+                };
+                base_ci
+                    .push_next(r_info)
+                    .stages(stages)
+                    .color_blend_state(blend_state)
+                    .depth_stencil_state(depth_state)
+                    .layout(*layout)
+            })
+            .collect::<Vec<_>>();
 
         let pipelines = unsafe {
             device
@@ -715,6 +634,368 @@ impl Pipelines {
             BuiltinShader::HdrTexture => self.hdr_tex_desc_pool.alloc_descriptor_set().map_err(Into::into),
         }
     }
+
+    pub fn get_or_create_ycbcr_entry(
+        &mut self,
+        key: YcbcrKey,
+        sampler: vk::Sampler,
+    ) -> Result<&mut YcbcrEntry, Error> {
+        if !self.ycbcr_entries.contains_key(&key) {
+            let device = self
+                .device
+                .upgrade()
+                .ok_or(Error::Pipeline(vk::Result::ERROR_DEVICE_LOST))?;
+
+            let layout_flags = if device.vk_khr_push_descriptor().is_some() {
+                vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
+            } else {
+                vk::DescriptorSetLayoutCreateFlags::empty()
+            };
+
+            // Texture pipeline layout (1 descriptor set: sampler2D with immutable sampler)
+            let immutable_samplers = [sampler];
+            let tex_binding = [vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .stage_flags(ShaderStageFlags::FRAGMENT)
+                .descriptor_count(1)
+                .immutable_samplers(&immutable_samplers)];
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(layout_flags)
+                .bindings(&tex_binding);
+            let tex_descriptor_set_layout = unsafe {
+                device
+                    .vk()
+                    .create_descriptor_set_layout(&create_info, None)
+                    .map_err(Error::DescriptorSetLayout)?
+            };
+
+            let constants = [vk::PushConstantRange::default()
+                .stage_flags(ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(std::mem::size_of::<TexPushConstants>() as u32)];
+            let create_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&tex_descriptor_set_layout))
+                .push_constant_ranges(&constants);
+            let tex_layout = unsafe {
+                device
+                    .vk()
+                    .create_pipeline_layout(&create_info, None)
+                    .map_err(Error::PipelineLayout)?
+            };
+            let tex_desc_pool = DescriptorAllocator::new(&device, tex_descriptor_set_layout, &*TEX_SIZES);
+
+            // HDR Texture pipeline layout (binding 0: immutable sampler, binding 1: standard sampler3D)
+            let hdr_bindings = [
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .stage_flags(ShaderStageFlags::FRAGMENT)
+                    .descriptor_count(1)
+                    .immutable_samplers(&immutable_samplers),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .stage_flags(ShaderStageFlags::FRAGMENT)
+                    .descriptor_count(1),
+            ];
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(layout_flags)
+                .bindings(&hdr_bindings);
+            let hdr_tex_descriptor_set_layout = unsafe {
+                device
+                    .vk()
+                    .create_descriptor_set_layout(&create_info, None)
+                    .map_err(Error::DescriptorSetLayout)?
+            };
+
+            let constants = [vk::PushConstantRange::default()
+                .stage_flags(ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(std::mem::size_of::<HdrTexPushConstants>() as u32)];
+            let create_info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&hdr_tex_descriptor_set_layout))
+                .push_constant_ranges(&constants);
+            let hdr_tex_layout = unsafe {
+                device
+                    .vk()
+                    .create_pipeline_layout(&create_info, None)
+                    .map_err(Error::PipelineLayout)?
+            };
+            let hdr_tex_desc_pool =
+                DescriptorAllocator::new(&device, hdr_tex_descriptor_set_layout, &*HDR_TEX_SIZES);
+
+            self.ycbcr_entries.insert(
+                key,
+                YcbcrEntry {
+                    tex_descriptor_set_layout,
+                    tex_layout,
+                    tex_desc_pool,
+                    hdr_tex_descriptor_set_layout,
+                    hdr_tex_layout,
+                    hdr_tex_desc_pool,
+                    format_pipelines: HashMap::new(),
+                },
+            );
+        }
+
+        Ok(self.ycbcr_entries.get_mut(&key).unwrap())
+    }
+
+    pub fn get_or_create_ycbcr_format_pipelines(
+        &mut self,
+        key: YcbcrKey,
+        sampler: vk::Sampler,
+        format: vk::Format,
+        has_depth: bool,
+    ) -> Result<YcbcrFormatPipelines, Error> {
+        let (tex_layout, hdr_tex_layout) = {
+            let entry = self.get_or_create_ycbcr_entry(key, sampler)?;
+            if let Some(&p) = entry.format_pipelines.get(&(format, has_depth)) {
+                return Ok(p);
+            }
+            (entry.tex_layout, entry.hdr_tex_layout)
+        };
+
+        let device = self
+            .device
+            .upgrade()
+            .ok_or(Error::Pipeline(vk::Result::ERROR_DEVICE_LOST))?;
+
+        let vertex_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::VERTEX)
+            .name(c"main")
+            .module(self.quad_vert);
+
+        let tex_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.tex_frag);
+
+        let spec_entry = [vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(std::mem::size_of::<u32>())];
+
+        let spec_generic_data = SPEC_MODE_GENERIC.to_ne_bytes();
+        let spec_generic = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_generic_data);
+        let hdr_tex_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_generic);
+
+        let spec_passthrough_data = SPEC_MODE_PASSTHROUGH.to_ne_bytes();
+        let spec_passthrough = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_passthrough_data);
+        let hdr_passthrough_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_passthrough);
+
+        let spec_sdr_data = SPEC_MODE_SDR.to_ne_bytes();
+        let spec_sdr = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_sdr_data);
+        let hdr_sdr_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_sdr);
+
+        let spec_pq_data = SPEC_MODE_PQ.to_ne_bytes();
+        let spec_pq = vk::SpecializationInfo::default()
+            .map_entries(&spec_entry)
+            .data(&spec_pq_data);
+        let hdr_pq_stage = PipelineShaderStageCreateInfo::default()
+            .stage(ShaderStageFlags::FRAGMENT)
+            .name(c"main")
+            .module(self.hdr_tex_frag)
+            .specialization_info(&spec_pq);
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_bias_enable(false)
+            .line_width(1.0);
+
+        let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .sample_shading_enable(false);
+
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let color_attachment_formats = [format];
+        let depth_format = if has_depth {
+            vk::Format::D16_UNORM
+        } else {
+            vk::Format::UNDEFINED
+        };
+
+        let tex_stages = [vertex_stage, tex_stage];
+        let hdr_tex_stages = [vertex_stage, hdr_tex_stage];
+        let hdr_passthrough_stages = [vertex_stage, hdr_passthrough_stage];
+        let hdr_sdr_stages = [vertex_stage, hdr_sdr_stage];
+        let hdr_pq_stages = [vertex_stage, hdr_pq_stage];
+
+        let opaque_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let opaque_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&opaque_blend_attachment);
+
+        let alpha_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let alpha_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&alpha_blend_attachment);
+
+        let opaque_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(has_depth)
+            .depth_write_enable(has_depth)
+            .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+
+        let blend_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(has_depth)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+
+        let base_ci = vk::GraphicsPipelineCreateInfo::default()
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization_state)
+            .multisample_state(&multisample_state)
+            .dynamic_state(&dynamic_state);
+
+        let specs = [
+            // 0, 1: tex
+            (&tex_stages[..], false, tex_layout),
+            (&tex_stages[..], true, tex_layout),
+            // 2, 3: hdr_tex
+            (&hdr_tex_stages[..], false, hdr_tex_layout),
+            (&hdr_tex_stages[..], true, hdr_tex_layout),
+            // 4, 5: hdr_passthrough
+            (&hdr_passthrough_stages[..], false, hdr_tex_layout),
+            (&hdr_passthrough_stages[..], true, hdr_tex_layout),
+            // 6, 7: hdr_sdr
+            (&hdr_sdr_stages[..], false, hdr_tex_layout),
+            (&hdr_sdr_stages[..], true, hdr_tex_layout),
+            // 8, 9: hdr_pq
+            (&hdr_pq_stages[..], false, hdr_tex_layout),
+            (&hdr_pq_stages[..], true, hdr_tex_layout),
+        ];
+
+        let mut rendering_infos = (0..specs.len())
+            .map(|_| {
+                vk::PipelineRenderingCreateInfo::default()
+                    .color_attachment_formats(&color_attachment_formats)
+                    .depth_attachment_format(depth_format)
+            })
+            .collect::<Vec<_>>();
+
+        let create_infos = specs
+            .iter()
+            .zip(rendering_infos.iter_mut())
+            .map(|((stages, is_blend, layout), r_info)| {
+                let (blend_state, depth_state) = if *is_blend {
+                    (&alpha_blend_state, &blend_depth_stencil)
+                } else {
+                    (&opaque_blend_state, &opaque_depth_stencil)
+                };
+                base_ci
+                    .push_next(r_info)
+                    .stages(stages)
+                    .color_blend_state(blend_state)
+                    .depth_stencil_state(depth_state)
+                    .layout(*layout)
+            })
+            .collect::<Vec<_>>();
+
+        let pipelines = unsafe {
+            device
+                .vk()
+                .create_graphics_pipelines(self.cache, &create_infos, None)
+                .map_err(|(pipelines, res)| {
+                    for pipeline in pipelines {
+                        device.vk().destroy_pipeline(pipeline, None);
+                    }
+                    res
+                })
+                .map_err(Error::Pipeline)?
+        };
+
+        let format_pipelines = YcbcrFormatPipelines {
+            tex_pipeline: pipelines[0],
+            tex_blend_pipeline: pipelines[1],
+            hdr_tex_pipeline: pipelines[2],
+            hdr_tex_blend_pipeline: pipelines[3],
+            hdr_passthrough_pipeline: pipelines[4],
+            hdr_passthrough_blend_pipeline: pipelines[5],
+            hdr_sdr_pipeline: pipelines[6],
+            hdr_sdr_blend_pipeline: pipelines[7],
+            hdr_pq_pipeline: pipelines[8],
+            hdr_pq_blend_pipeline: pipelines[9],
+        };
+
+        let entry = self.ycbcr_entries.get_mut(&key).unwrap();
+        entry
+            .format_pipelines
+            .insert((format, has_depth), format_pipelines);
+        self.save_cache();
+        Ok(format_pipelines)
+    }
+
+    pub fn ycbcr_pipeline_layout(&self, key: YcbcrKey, is_hdr: bool) -> Option<PipelineLayout> {
+        let entry = self.ycbcr_entries.get(&key)?;
+        Some(if is_hdr {
+            entry.hdr_tex_layout
+        } else {
+            entry.tex_layout
+        })
+    }
+
+    pub fn alloc_ycbcr_descriptor_set(
+        &mut self,
+        key: YcbcrKey,
+        sampler: vk::Sampler,
+        is_hdr: bool,
+    ) -> Result<DescriptorSet, Error> {
+        let entry = self.get_or_create_ycbcr_entry(key, sampler)?;
+        if is_hdr {
+            entry.hdr_tex_desc_pool.alloc_descriptor_set().map_err(Into::into)
+        } else {
+            entry.tex_desc_pool.alloc_descriptor_set().map_err(Into::into)
+        }
+    }
 }
 
 impl Drop for Pipelines {
@@ -722,6 +1003,24 @@ impl Drop for Pipelines {
         self.save_cache();
         if let Some(device) = self.device.upgrade() {
             unsafe {
+                for (_, mut entry) in self.ycbcr_entries.drain() {
+                    for (_, p) in entry.format_pipelines.drain() {
+                        device.vk().destroy_pipeline(p.tex_pipeline, None);
+                        device.vk().destroy_pipeline(p.tex_blend_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_tex_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_tex_blend_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_passthrough_pipeline, None);
+                        device
+                            .vk()
+                            .destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_sdr_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_pq_pipeline, None);
+                        device.vk().destroy_pipeline(p.hdr_pq_blend_pipeline, None);
+                    }
+                    device.vk().destroy_pipeline_layout(entry.tex_layout, None);
+                    device.vk().destroy_pipeline_layout(entry.hdr_tex_layout, None);
+                }
                 for (_, p) in self.format_pipelines.drain() {
                     device.vk().destroy_pipeline(p.clear_pipeline, None);
                     device.vk().destroy_pipeline(p.clear_blend_pipeline, None);

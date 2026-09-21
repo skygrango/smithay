@@ -3,12 +3,12 @@
 use crate::{
     backend::{
         allocator::{
-            Format, Fourcc,
+            Buffer, Format, Fourcc,
             dmabuf::{Dmabuf, WeakDmabuf},
-            format::FormatSet,
+            format::{FormatSet, get_bpp, get_opaque},
         },
         drm::{
-            DrmDeviceFd,
+            DrmDeviceFd, NodeType,
             sync::{DrmSyncPoint, DrmTimeline, WeakDrmTimeline},
         },
         renderer::{
@@ -17,17 +17,34 @@ use crate::{
             vulkan::shaders::{ClearPushConstants, HdrTexPushConstants, TexPushConstants},
         },
         vulkan::{
-            PhysicalDevice, UnsupportedProperty,
+            Instance, PhysicalDevice, UnsupportedProperty,
             device::{Device, DeviceError, QueueType, WeakDevice},
-            format::{get_drm_format, get_vk_format, known_formats},
+            format::{get_drm_format, get_vk_format, is_ycbcr_fourcc, known_formats},
             image::{Error as ImageError, ImageInner, ImageUsageFlags, VulkanImage},
             memory::MemoryUsagePreference,
             version::Version,
+            ycbcr::YcbcrKey,
         },
     },
     reexports::drm::node::DrmNode,
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Size, Transform},
 };
+
+#[cfg(feature = "wayland_frontend")]
+use crate::{
+    backend::renderer::{ImportDmaWl, ImportMemWl},
+    wayland::{
+        color::{
+            management::{ImageDescription, Primaries, TransferFunction},
+            representation::get_color_representation_from_states,
+        },
+        compositor::SurfaceData,
+        dmabuf::get_dmabuf,
+        shm::{fourcc_to_shm_format, shm_format_to_fourcc, with_buffer_contents},
+    },
+};
+#[cfg(feature = "wayland_frontend")]
+use wayland_server::protocol::wl_buffer::WlBuffer;
 
 use ash::vk::{
     self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyInfo, DescriptorImageInfo,
@@ -337,12 +354,8 @@ impl VulkanRenderer {
         // Check matching drm descriptor, if provided
         let node = if let Some(fd) = drm.as_ref() {
             let node = DrmNode::from_file(fd).map_err(|_| Error::MismatchedDrmDevice)?;
-            let dev_render_node = node
-                .node_with_type(crate::backend::drm::NodeType::Render)
-                .and_then(Result::ok);
-            let dev_primary_node = node
-                .node_with_type(crate::backend::drm::NodeType::Primary)
-                .and_then(Result::ok);
+            let dev_render_node = node.node_with_type(NodeType::Render).and_then(Result::ok);
+            let dev_primary_node = node.node_with_type(NodeType::Primary).and_then(Result::ok);
             let matches = phd
                 .render_node()
                 .ok()
@@ -392,6 +405,10 @@ impl VulkanRenderer {
 
         if capabilities.contains(&Capability::MemoryPriority) {
             required_features.enable_memory_priority();
+        }
+
+        if supported_features.sampler_ycbcr_conversion() {
+            required_features.enable_sampler_ycbcr_conversion();
         }
 
         // Get extensions
@@ -983,7 +1000,7 @@ impl VulkanRenderer {
             .drm
             .map(|f| f.code)
             .or_else(|| get_drm_format(image.format()))
-            .and_then(crate::backend::allocator::format::get_bpp)
+            .and_then(get_bpp)
             .unwrap_or(32)
             / 8;
 
@@ -1103,7 +1120,7 @@ impl ImportMem for VulkanRenderer {
         size: Size<i32, BufferCoords>,
         _flipped: bool, // TODO
     ) -> Result<Self::TextureId, Self::Error> {
-        let bpp = crate::backend::allocator::format::get_bpp(format).unwrap_or(32) / 8;
+        let bpp = get_bpp(format).unwrap_or(32) / 8;
         let stride = size.w as usize * bpp;
         if data.len() < stride * size.h as usize {
             return Err(Error::BufferAccessError);
@@ -1149,7 +1166,7 @@ impl ImportMem for VulkanRenderer {
             .drm
             .map(|f| f.code)
             .or_else(|| get_drm_format(texture.format()))
-            .and_then(crate::backend::allocator::format::get_bpp)
+            .and_then(get_bpp)
             .unwrap_or(32)
             / 8;
 
@@ -1196,17 +1213,23 @@ impl ImportDma for VulkanRenderer {
         dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoords>]>,
     ) -> Result<Self::TextureId, Self::Error> {
+        let fourcc = Buffer::format(dmabuf).code;
+        let ycbcr_key = if is_ycbcr_fourcc(fourcc) {
+            YcbcrKey::default_for_fourcc(fourcc)
+        } else {
+            None
+        };
         let required_usage = ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC;
         if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
-            if image.vk_usage().contains(required_usage) {
+            if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
                 trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
                 image.set_needs_acquire(true);
                 return Ok(image.clone());
             }
         }
 
-        let image =
-            VulkanImage::new_from_dmabuf(&self.device, dmabuf, required_usage).map_err(Error::ImageError)?;
+        let image = VulkanImage::new_from_dmabuf_with_ycbcr(&self.device, dmabuf, required_usage, ycbcr_key)
+            .map_err(Error::ImageError)?;
 
         self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
         Ok(image)
@@ -1222,16 +1245,14 @@ impl ImportDma for VulkanRenderer {
 }
 
 #[cfg(feature = "wayland_frontend")]
-impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
+impl ImportMemWl for VulkanRenderer {
     #[profiling::function]
     fn import_shm_buffer(
         &mut self,
-        buffer: &wayland_server::protocol::wl_buffer::WlBuffer,
-        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        buffer: &WlBuffer,
+        surface: Option<&SurfaceData>,
         damage: &[Rectangle<i32, BufferCoords>],
     ) -> Result<Self::TextureId, Self::Error> {
-        use crate::wayland::shm::{shm_format_to_fourcc, with_buffer_contents};
-
         type CacheMap = HashMap<ContextId<VulkanImage>, VulkanImage>;
 
         let mut surface_lock = surface.as_ref().map(|surface_data| {
@@ -1265,7 +1286,7 @@ impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
             let cached_texture = surface_lock
                 .as_ref()
                 .and_then(|cache| cache.get(&id).cloned())
-                .filter(|texture| texture.size() == size && texture.format() == expected_vk_format);
+                .filter(|texture| Texture::size(texture) == size && texture.format() == expected_vk_format);
 
             let base_ptr = unsafe { ptr.offset(offset as isize) };
 
@@ -1318,15 +1339,48 @@ impl crate::backend::renderer::ImportMemWl for VulkanRenderer {
     }
 
     fn shm_formats(&self) -> Box<dyn Iterator<Item = wayland_server::protocol::wl_shm::Format>> {
-        Box::new(
-            self.mem_formats()
-                .filter_map(crate::wayland::shm::fourcc_to_shm_format),
-        )
+        Box::new(self.mem_formats().filter_map(fourcc_to_shm_format))
     }
 }
 
 #[cfg(feature = "wayland_frontend")]
-impl crate::backend::renderer::ImportDmaWl for VulkanRenderer {}
+impl ImportDmaWl for VulkanRenderer {
+    #[profiling::function]
+    fn import_dma_buffer(
+        &mut self,
+        buffer: &WlBuffer,
+        surface: Option<&SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoords>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let dmabuf = get_dmabuf(buffer).expect("import_dma_buffer without checking buffer type?");
+
+        let fourcc = Buffer::format(dmabuf).code;
+        let ycbcr_key = if is_ycbcr_fourcc(fourcc) {
+            let color_rep = surface.map(get_color_representation_from_states);
+            color_rep
+                .as_ref()
+                .and_then(|rep| YcbcrKey::from_color_representation(fourcc, rep))
+                .or_else(|| YcbcrKey::default_for_fourcc(fourcc))
+        } else {
+            None
+        };
+
+        let required_usage = ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC;
+        if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
+            if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
+                trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
+                image.set_needs_acquire(true);
+                return Ok(image.clone());
+            }
+        }
+
+        let image = VulkanImage::new_from_dmabuf_with_ycbcr(&self.device, dmabuf, required_usage, ycbcr_key)
+            .map_err(Error::ImageError)?;
+
+        self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
+        Ok(image)
+    }
+}
 
 pub enum VulkanMapping {
     Mapped(NonNull<u8>, usize, VulkanImage, WeakDevice),
@@ -2215,7 +2269,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     images: Vec<Arc<ImageInner>>,
     has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
-    active_color_description: Option<crate::wayland::color::management::ImageDescription>,
+    active_color_description: Option<ImageDescription>,
     active_clip: Option<(Rectangle<i32, Physical>, [f32; 4])>,
     is_blit: bool,
     rendering: bool,
@@ -2935,10 +2989,7 @@ impl Frame for VulkanFrame<'_, '_> {
     type TextureId = VulkanImage;
 
     #[cfg(feature = "wayland_frontend")]
-    fn set_surface_color_description(
-        &mut self,
-        desc: Option<&crate::wayland::color::management::ImageDescription>,
-    ) {
+    fn set_surface_color_description(&mut self, desc: Option<&ImageDescription>) {
         self.active_color_description = desc.cloned();
     }
 
@@ -3237,9 +3288,17 @@ impl Frame for VulkanFrame<'_, '_> {
 
         let buf = self.ensure_rendering()?;
 
+        let ycbcr_info = texture
+            .ycbcr()
+            .and_then(|key| texture.ycbcr_conversion().map(|conv| (key, conv.sampler)));
+
         let push_descriptor = self.renderer.device.vk_khr_push_descriptor();
         let descriptor = if push_descriptor.is_none() {
-            Some(if is_hdr {
+            Some(if let Some((key, sampler)) = ycbcr_info {
+                self.renderer
+                    .pipelines
+                    .alloc_ycbcr_descriptor_set(key, sampler, is_hdr)?
+            } else if is_hdr {
                 self.renderer
                     .pipelines
                     .alloc_descriptor_set(shaders::BuiltinShader::HdrTexture)?
@@ -3256,9 +3315,13 @@ impl Frame for VulkanFrame<'_, '_> {
             .vk_view()
             .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
         let is_downscaling = (dst.size.w as f64) < src.size.w || (dst.size.h as f64) < src.size.h;
-        let sampler = self.renderer.active_sampler(is_downscaling);
+        let sampler = if let Some((_, ycbcr_sampler)) = ycbcr_info {
+            ycbcr_sampler
+        } else {
+            self.renderer.active_sampler(is_downscaling)
+        };
 
-        if self.renderer.supports_descriptor_indexing {
+        if self.renderer.supports_descriptor_indexing && ycbcr_info.is_none() {
             if let Some(ref bindless) = self.renderer.bindless_pool {
                 let _ = bindless.update_texture(0, *view, sampler);
             }
@@ -3351,6 +3414,16 @@ impl Frame for VulkanFrame<'_, '_> {
             .renderer
             .pipelines
             .get_or_create_format_pipelines(fb_format, self.depth_enabled)?;
+        let ycbcr_format_pipelines = if let Some((key, sampler)) = ycbcr_info {
+            Some(self.renderer.pipelines.get_or_create_ycbcr_format_pipelines(
+                key,
+                sampler,
+                fb_format,
+                self.depth_enabled,
+            )?)
+        } else {
+            None
+        };
 
         let depth_val = if self.depth_enabled {
             self.current_depth
@@ -3380,16 +3453,14 @@ impl Frame for VulkanFrame<'_, '_> {
                 (*blit_cfg, true)
             } else {
                 (
-                    self.renderer
-                        .hdr_config
-                        .unwrap_or(crate::backend::renderer::gles::HdrOutputConfig {
-                            reference_white: 203.0,
-                            max_luminance: 1000.0,
-                            sdr_gamma: 2.2,
-                            gamut_stretch: 0.0,
-                            hardware_offload: false,
-                            is_sdr: false,
-                        }),
+                    self.renderer.hdr_config.unwrap_or(HdrOutputConfig {
+                        reference_white: 203.0,
+                        max_luminance: 1000.0,
+                        sdr_gamma: 2.2,
+                        gamut_stretch: 0.0,
+                        hardware_offload: false,
+                        is_sdr: false,
+                    }),
                     false,
                 )
             };
@@ -3425,7 +3496,6 @@ impl Frame for VulkanFrame<'_, '_> {
 
             #[cfg(feature = "wayland_frontend")]
             if !is_hdr_to_sdr && let Some(desc) = self.active_color_description.as_ref() {
-                use crate::wayland::color::management::{Primaries, TransferFunction};
                 if desc.is_pq_bt2020() {
                     input_is_pq = 1;
                     input_primaries = 2;
@@ -3524,7 +3594,29 @@ impl Frame for VulkanFrame<'_, '_> {
                 corner_radius,
             };
 
-            let chosen_pipeline = if should_blend {
+            let chosen_pipeline = if let Some(ycbcr_p) = ycbcr_format_pipelines {
+                if should_blend {
+                    if skip_color_transform != 0 {
+                        ycbcr_p.hdr_passthrough_blend_pipeline
+                    } else if input_is_pq != 0 && target_is_sdr == 0 {
+                        ycbcr_p.hdr_pq_blend_pipeline
+                    } else if input_is_hlg == 0 && input_primaries == 0 && target_is_sdr == 0 {
+                        ycbcr_p.hdr_sdr_blend_pipeline
+                    } else {
+                        ycbcr_p.hdr_tex_blend_pipeline
+                    }
+                } else {
+                    if skip_color_transform != 0 {
+                        ycbcr_p.hdr_passthrough_pipeline
+                    } else if input_is_pq != 0 && target_is_sdr == 0 {
+                        ycbcr_p.hdr_pq_pipeline
+                    } else if input_is_hlg == 0 && input_primaries == 0 && target_is_sdr == 0 {
+                        ycbcr_p.hdr_sdr_pipeline
+                    } else {
+                        ycbcr_p.hdr_tex_pipeline
+                    }
+                }
+            } else if should_blend {
                 if skip_color_transform != 0 {
                     format_pipelines.hdr_passthrough_blend_pipeline
                 } else if input_is_pq != 0 && target_is_sdr == 0 {
@@ -3546,22 +3638,33 @@ impl Frame for VulkanFrame<'_, '_> {
                 }
             };
 
-            (
-                *self.renderer.pipelines.hdr_tex_pipeline_layout(),
-                chosen_pipeline,
-                Some(push_constants),
-            )
+            let layout = if let Some((key, _)) = ycbcr_info {
+                self.renderer.pipelines.ycbcr_pipeline_layout(key, true).unwrap()
+            } else {
+                *self.renderer.pipelines.hdr_tex_pipeline_layout()
+            };
+
+            (layout, chosen_pipeline, Some(push_constants))
         } else {
-            let chosen_pipeline = if should_blend {
+            let chosen_pipeline = if let Some(ycbcr_p) = ycbcr_format_pipelines {
+                if should_blend {
+                    ycbcr_p.tex_blend_pipeline
+                } else {
+                    ycbcr_p.tex_pipeline
+                }
+            } else if should_blend {
                 format_pipelines.tex_blend_pipeline
             } else {
                 format_pipelines.tex_pipeline
             };
-            (
-                *self.renderer.pipelines.tex_pipeline_layout(),
-                chosen_pipeline,
-                None,
-            )
+
+            let layout = if let Some((key, _)) = ycbcr_info {
+                self.renderer.pipelines.ycbcr_pipeline_layout(key, false).unwrap()
+            } else {
+                *self.renderer.pipelines.tex_pipeline_layout()
+            };
+
+            (layout, chosen_pipeline, None)
         };
 
         unsafe {
@@ -4160,7 +4263,7 @@ impl Bind<VulkanImage> for VulkanRenderer {
                             code: *fourcc,
                             modifier: Modifier::from(prop.drm_format_modifier),
                         });
-                        if let Some(opaque) = crate::backend::allocator::format::get_opaque(*fourcc) {
+                        if let Some(opaque) = get_opaque(*fourcc) {
                             set.insert(Format {
                                 code: opaque,
                                 modifier: Modifier::from(prop.drm_format_modifier),
@@ -4224,10 +4327,9 @@ impl super::Offscreen<VulkanImage> for VulkanRenderer {
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        use crate::backend::allocator::Buffer as AllocBuffer;
         trace!(
-            width = AllocBuffer::width(target),
-            height = AllocBuffer::height(target),
+            width = Buffer::width(target),
+            height = Buffer::height(target),
             modifier = ?target.format().modifier,
             "VulkanRenderer::bind dmabuf"
         );
@@ -4273,7 +4375,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
                             code: *fourcc,
                             modifier: Modifier::from(prop.drm_format_modifier),
                         });
-                        if let Some(opaque) = crate::backend::allocator::format::get_opaque(*fourcc) {
+                        if let Some(opaque) = get_opaque(*fourcc) {
                             set.insert(Format {
                                 code: opaque,
                                 modifier: Modifier::from(prop.drm_format_modifier),
@@ -4295,7 +4397,7 @@ mod test {
     #[test]
     fn test_vulkan_renderer_version_check() {
         // Instance 1.2: should fail with UnsupportedVersion
-        if let Ok(instance_1_2) = crate::backend::vulkan::Instance::new(Version::VERSION_1_2, None) {
+        if let Ok(instance_1_2) = Instance::new(Version::VERSION_1_2, None) {
             if let Ok(phds) = PhysicalDevice::enumerate(&instance_1_2) {
                 for phd in phds {
                     assert!(
@@ -4307,7 +4409,7 @@ mod test {
         }
 
         // Instance 1.3: should succeed for Vulkan 1.3 capable physical devices
-        if let Ok(instance_1_3) = crate::backend::vulkan::Instance::new(Version::VERSION_1_3, None) {
+        if let Ok(instance_1_3) = Instance::new(Version::VERSION_1_3, None) {
             if let Ok(phds) = PhysicalDevice::enumerate(&instance_1_3) {
                 for phd in phds {
                     if phd.api_version() >= VulkanRenderer::MIN_DEVICE_VERSION {
@@ -4440,8 +4542,6 @@ mod test {
 
     #[test]
     fn test_blit_hdr_to_sdr_condition() {
-        use crate::backend::renderer::color::HdrOutputConfig;
-
         let check_needs_hdr_to_sdr =
             |from_fmt: vk::Format, to_fmt: vk::Format, hdr_cfg: Option<HdrOutputConfig>| -> bool {
                 let is_to_hdr = is_hdr_vk_format(to_fmt);
@@ -4475,7 +4575,7 @@ mod test {
 
     #[test]
     fn test_render_frame_with_indirect_draw_and_bindless() {
-        let Ok(instance) = crate::backend::vulkan::Instance::new(Version::VERSION_1_3, None) else {
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
             return;
         };
         let Ok(phds) = PhysicalDevice::enumerate(&instance) else {
@@ -4516,7 +4616,6 @@ mod test {
             .expect("Failed to create src VulkanImage");
 
             // 3. Bind renderer to the target framebuffer and render
-            use crate::backend::renderer::{Frame, Renderer};
             let dst_rect = Rectangle::new((0, 0).into(), (128, 128).into());
             let damage = [Rectangle::new((0, 0).into(), (64, 64).into())];
 

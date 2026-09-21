@@ -98,6 +98,15 @@ impl Features {
         features.features_memory_priority.memory_priority = 1;
     }
 
+    pub fn sampler_ycbcr_conversion(&self) -> bool {
+        self.features_11.sampler_ycbcr_conversion == 1
+    }
+
+    pub fn enable_sampler_ycbcr_conversion(self: &mut Pin<Box<Self>>) {
+        let features = unsafe { self.as_mut().get_unchecked_mut() };
+        features.features_11.sampler_ycbcr_conversion = 1;
+    }
+
     pub fn required_features() -> Pin<Box<Self>> {
         let mut features = Self::new(&Version::VERSION_1_3);
 

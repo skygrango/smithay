@@ -1,19 +1,19 @@
 mod protocol;
 use wayland_server::{Dispatch, DisplayHandle, GlobalDispatch, Weak, protocol::wl_surface::WlSurface};
 
-use crate::wayland::compositor::{self, Cacheable};
+use crate::wayland::compositor::{self, Cacheable, SurfaceData};
 
 pub use self::protocol::*;
-use self::wp_color_representation_v1::AlphaMode;
+pub use self::wp_color_representation_surface_v1::{AlphaMode, ChromaLocation, Coefficients, Range};
 mod dispatch;
 
 use std::sync::Mutex;
 
 #[derive(Debug)]
 pub struct ColorRepresentationState {
-    coefficients: Vec<u32>,
-    chroma_locations: Vec<u32>,
-    known_instances: Vec<wp_color_representation_manager_v1::WpColorRepresentationManagerV1>,
+    pub(crate) alpha_modes: Vec<AlphaMode>,
+    pub(crate) coefficients_and_ranges: Vec<(Coefficients, Range)>,
+    pub(crate) known_instances: Vec<wp_color_representation_manager_v1::WpColorRepresentationManagerV1>,
 }
 
 pub trait ColorRepresentationHandler {
@@ -22,8 +22,9 @@ pub trait ColorRepresentationHandler {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ColorRepresentationSurfaceCachedState {
-    coefficient: Option<u32>,
-    chroma_location: Option<u32>,
+    coefficients: Option<Coefficients>,
+    range: Option<Range>,
+    chroma_location: Option<ChromaLocation>,
     alpha_mode: Option<AlphaMode>,
 }
 
@@ -35,7 +36,8 @@ impl Cacheable for Option<ColorRepresentationSurfaceCachedState> {
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
         match (self, into) {
             (Some(this), Some(into)) => {
-                into.coefficient = this.coefficient.or_else(|| into.coefficient.take());
+                into.coefficients = this.coefficients.or_else(|| into.coefficients.take());
+                into.range = this.range.or_else(|| into.range.take());
                 into.chroma_location = this.chroma_location.or_else(|| into.chroma_location.take());
                 into.alpha_mode = this.alpha_mode.or_else(|| into.alpha_mode.take());
             }
@@ -49,33 +51,38 @@ impl Cacheable for Option<ColorRepresentationSurfaceCachedState> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColorRepresentation {
     pub alpha_mode: AlphaMode,
-    pub coefficient: Option<u32>,
-    pub chroma_location: Option<u32>,
+    pub coefficients: Option<Coefficients>,
+    pub range: Option<Range>,
+    pub chroma_location: Option<ChromaLocation>,
 }
 
 pub fn get_color_representation(surface: &WlSurface) -> ColorRepresentation {
-    compositor::with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<Option<ColorRepresentationSurfaceCachedState>>()
-            .current()
-            .as_ref()
-            .map(|state| ColorRepresentation {
-                coefficient: state.coefficient,
-                chroma_location: state.chroma_location,
-                alpha_mode: state.alpha_mode.unwrap_or(AlphaMode::PremultipliedElectrical),
-            })
-            .unwrap_or_else(|| ColorRepresentation {
-                alpha_mode: AlphaMode::PremultipliedElectrical,
-                coefficient: None,
-                chroma_location: None,
-            })
-    })
+    compositor::with_states(surface, get_color_representation_from_states)
+}
+
+pub fn get_color_representation_from_states(states: &SurfaceData) -> ColorRepresentation {
+    states
+        .cached_state
+        .get::<Option<ColorRepresentationSurfaceCachedState>>()
+        .current()
+        .as_ref()
+        .map(|state| ColorRepresentation {
+            coefficients: state.coefficients,
+            range: state.range,
+            chroma_location: state.chroma_location,
+            alpha_mode: state.alpha_mode.unwrap_or(AlphaMode::PremultipliedElectrical),
+        })
+        .unwrap_or_else(|| ColorRepresentation {
+            alpha_mode: AlphaMode::PremultipliedElectrical,
+            coefficients: None,
+            range: None,
+            chroma_location: None,
+        })
 }
 
 #[derive(Debug)]
 struct ColorRepresentationSurfaceData {
-    instance: Mutex<Option<wp_color_representation_v1::WpColorRepresentationV1>>,
+    instance: Mutex<Option<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1>>,
 }
 
 impl ColorRepresentationSurfaceData {
@@ -93,21 +100,44 @@ impl ColorRepresentationSurfaceData {
 impl ColorRepresentationState {
     pub fn new<D>(
         dh: &DisplayHandle,
-        coefficients: impl Iterator<Item = u32>,
-        chroma_locations: impl Iterator<Item = u32>,
+        alpha_modes: impl IntoIterator<Item = AlphaMode>,
+        coefficients_and_ranges: impl IntoIterator<Item = (Coefficients, Range)>,
     ) -> ColorRepresentationState
     where
         D: GlobalDispatch<wp_color_representation_manager_v1::WpColorRepresentationManagerV1, ()>
             + Dispatch<wp_color_representation_manager_v1::WpColorRepresentationManagerV1, ()>
-            + Dispatch<wp_color_representation_v1::WpColorRepresentationV1, Weak<WlSurface>>
+            + Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1, Weak<WlSurface>>
             + ColorRepresentationHandler
             + 'static,
     {
         dh.create_global::<D, wp_color_representation_manager_v1::WpColorRepresentationManagerV1, ()>(1, ());
         ColorRepresentationState {
-            coefficients: coefficients.collect(),
-            chroma_locations: chroma_locations.collect(),
+            alpha_modes: alpha_modes.into_iter().collect(),
+            coefficients_and_ranges: coefficients_and_ranges.into_iter().collect(),
             known_instances: Vec::new(),
         }
+    }
+
+    pub fn default_state<D>(dh: &DisplayHandle) -> ColorRepresentationState
+    where
+        D: GlobalDispatch<wp_color_representation_manager_v1::WpColorRepresentationManagerV1, ()>
+            + Dispatch<wp_color_representation_manager_v1::WpColorRepresentationManagerV1, ()>
+            + Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1, Weak<WlSurface>>
+            + ColorRepresentationHandler
+            + 'static,
+    {
+        Self::new::<D>(
+            dh,
+            [AlphaMode::PremultipliedElectrical],
+            [
+                (Coefficients::Identity, Range::Full),
+                (Coefficients::Bt709, Range::Limited),
+                (Coefficients::Bt709, Range::Full),
+                (Coefficients::Bt601, Range::Limited),
+                (Coefficients::Bt601, Range::Full),
+                (Coefficients::Bt2020, Range::Limited),
+                (Coefficients::Bt2020, Range::Full),
+            ],
+        )
     }
 }

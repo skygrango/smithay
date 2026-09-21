@@ -227,6 +227,8 @@ where
                 fb: *handle.as_ref(),
                 fence: None,
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
 
@@ -394,6 +396,8 @@ where
                 fb: *handle.as_ref(),
                 fence: fence.as_ref().map(|fence| fence.as_fd()),
                 color_pipeline: None,
+                color_encoding: None,
+                color_range: None,
             }),
         };
 

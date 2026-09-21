@@ -10,11 +10,17 @@ use ash::vk::{self, ImageTiling, MemoryPropertyFlags};
 use drm::node::DrmNode;
 
 use crate::backend::{
-    allocator::{Buffer, Format, Fourcc, Modifier, dmabuf::Dmabuf, format::has_alpha},
+    allocator::{
+        Buffer, Format, Fourcc, Modifier,
+        dmabuf::{AsDmabuf, Dmabuf},
+        format::has_alpha,
+        vulkan::ExportError,
+    },
     vulkan::{
         Device,
-        format::component_mapping_for_format,
+        format::{component_mapping_for_format, is_ycbcr_format},
         memory::{MemoryTypeRank, MemoryUsagePreference},
+        ycbcr::{YcbcrConversion, YcbcrKey},
     },
 };
 
@@ -73,6 +79,8 @@ pub enum Error {
     VulkanBind(#[source] vk::Result),
     #[error("Creating a vulkan image view")]
     VulkanImageView(#[source] vk::Result),
+    #[error("Creating a vulkan sampler ycbcr conversion failed")]
+    VulkanSamplerYcbcr(#[source] vk::Result),
     #[error("Failed to clone the dmabuf fd")]
     DmabufFdError(#[source] io::Error),
 }
@@ -96,6 +104,7 @@ impl VulkanImage {
             linear,
             Option::<Option<Modifier>>::None,
             None,
+            None,
         )
     }
 
@@ -117,6 +126,7 @@ impl VulkanImage {
             usage,
             linear,
             Option::<Option<Modifier>>::None,
+            None,
             None,
         )
     }
@@ -140,6 +150,7 @@ impl VulkanImage {
             false,
             Some(modifiers),
             None,
+            None,
         )
     }
 
@@ -147,6 +158,15 @@ impl VulkanImage {
         device: &Device,
         dmabuf: &Dmabuf,
         usage: vk::ImageUsageFlags,
+    ) -> Result<Self, Error> {
+        Self::new_from_dmabuf_with_ycbcr(device, dmabuf, usage, None)
+    }
+
+    pub fn new_from_dmabuf_with_ycbcr(
+        device: &Device,
+        dmabuf: &Dmabuf,
+        usage: vk::ImageUsageFlags,
+        ycbcr: Option<YcbcrKey>,
     ) -> Result<Self, Error> {
         let width = dmabuf.width();
         let height = dmabuf.height();
@@ -176,6 +196,7 @@ impl VulkanImage {
             false,
             Option::<Option<Modifier>>::None,
             Some(dmabuf),
+            ycbcr,
         )
     }
 
@@ -189,6 +210,7 @@ impl VulkanImage {
         linear: bool,
         modifiers: Option<impl IntoIterator<Item = Modifier>>,
         dmabuf: Option<&Dmabuf>,
+        ycbcr: Option<YcbcrKey>,
     ) -> Result<Self, Error> {
         let modifiers = modifiers.map(|modifiers| modifiers.into_iter().map(u64::from).collect::<Vec<_>>());
         let fourcc = dmabuf.map(|d| d.format().code).or(fourcc);
@@ -284,6 +306,8 @@ impl VulkanImage {
             needs_acquire: std::sync::atomic::AtomicBool::new(true),
             dmabuf_exportable: modifiers.is_some() || dmabuf.is_some(),
             dmabuf_plane_count: dmabuf.map(|dmabuf| dmabuf.num_planes() as u32).unwrap_or(0),
+            ycbcr: None,
+            ycbcr_conversion: None,
         };
 
         let drm_format = fourcc
@@ -610,6 +634,29 @@ impl VulkanImage {
             || vk_format == vk::Format::D32_SFLOAT
             || vk_format == vk::Format::D24_UNORM_S8_UINT;
 
+        let mut ycbcr = ycbcr;
+        if ycbcr.is_none() && is_ycbcr_format(vk_format) {
+            if let Some(fourcc) = fourcc {
+                ycbcr = YcbcrKey::default_for_fourcc(fourcc);
+            }
+            if ycbcr.is_none() {
+                let model = if vk_format == vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 {
+                    vk::SamplerYcbcrModelConversion::YCBCR_2020
+                } else {
+                    vk::SamplerYcbcrModelConversion::YCBCR_709
+                };
+                ycbcr = Some(YcbcrKey {
+                    format: vk_format,
+                    model,
+                    range: vk::SamplerYcbcrRange::ITU_NARROW,
+                    x_chroma_offset: vk::ChromaLocation::COSITED_EVEN,
+                    y_chroma_offset: vk::ChromaLocation::MIDPOINT,
+                });
+            }
+        }
+
+        let mut ycbcr_conversion_arc = None;
+
         if vk_usage.contains(vk::ImageUsageFlags::SAMPLED)
             || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
             || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
@@ -621,7 +668,7 @@ impl VulkanImage {
                 vk::ImageAspectFlags::COLOR
             };
 
-            let info = vk::ImageViewCreateInfo::default()
+            let mut info = vk::ImageViewCreateInfo::default()
                 .image(inner.image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(vk_format)
@@ -629,6 +676,7 @@ impl VulkanImage {
                     if is_depth
                         || vk_usage.contains(vk::ImageUsageFlags::STORAGE)
                         || vk_usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        || ycbcr.is_some()
                     {
                         vk::ComponentMapping {
                             r: vk::ComponentSwizzle::IDENTITY,
@@ -646,6 +694,18 @@ impl VulkanImage {
                         .level_count(1)
                         .layer_count(1),
                 );
+
+            let mut ycbcr_conversion_info;
+            if let Some(key) = ycbcr {
+                let conversion = device
+                    .get_or_create_ycbcr_conversion(key)
+                    .map_err(Error::VulkanSamplerYcbcr)?;
+                ycbcr_conversion_info =
+                    vk::SamplerYcbcrConversionInfo::default().conversion(conversion.conversion);
+                info = info.push_next(&mut ycbcr_conversion_info);
+                ycbcr_conversion_arc = Some(conversion);
+            }
+
             inner.view = Some(unsafe {
                 device
                     .vk()
@@ -653,6 +713,9 @@ impl VulkanImage {
                     .map_err(Error::VulkanImageView)?
             });
         }
+
+        inner.ycbcr = ycbcr;
+        inner.ycbcr_conversion = ycbcr_conversion_arc;
 
         Ok(VulkanImage {
             inner: Arc::new(inner),
@@ -700,6 +763,16 @@ impl VulkanImage {
 
     pub fn vk_view(&self) -> Option<&vk::ImageView> {
         self.inner.view.as_ref()
+    }
+
+    /// Returns the YCbCr conversion key if this image uses YCbCr sampling.
+    pub fn ycbcr(&self) -> Option<YcbcrKey> {
+        self.inner.ycbcr
+    }
+
+    /// Returns the YCbCr conversion handle and sampler if this image uses YCbCr sampling.
+    pub fn ycbcr_conversion(&self) -> Option<Arc<YcbcrConversion>> {
+        self.inner.ycbcr_conversion.clone()
     }
 
     pub fn vk_usage(&self) -> ImageUsageFlags {
@@ -758,8 +831,8 @@ impl VulkanImage {
     }
 
     /// Export the image as a DMA-BUF if exportable.
-    pub fn export(&self) -> Result<Dmabuf, crate::backend::allocator::vulkan::ExportError> {
-        crate::backend::allocator::dmabuf::AsDmabuf::export(self)
+    pub fn export(&self) -> Result<Dmabuf, ExportError> {
+        AsDmabuf::export(self)
     }
 
     /// Returns a persistent pointer to the mapped memory of this image.
@@ -790,6 +863,8 @@ pub(crate) struct ImageInner {
 
     pub(crate) dmabuf_exportable: bool,
     pub(crate) dmabuf_plane_count: u32,
+    pub(crate) ycbcr: Option<YcbcrKey>,
+    pub(crate) ycbcr_conversion: Option<Arc<YcbcrConversion>>,
 }
 
 impl ImageInner {

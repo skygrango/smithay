@@ -82,6 +82,7 @@ pub mod instance;
 pub mod memory;
 pub mod phd;
 pub mod version;
+pub mod ycbcr;
 
 pub use self::{
     device::Device,
@@ -90,6 +91,7 @@ pub use self::{
     memory::{MemoryBudgetInfo, MemoryPreferences, MemoryTypeRank, MemoryUsagePreference},
     phd::PhysicalDevice,
     version::Version,
+    ycbcr::{YcbcrConversion, YcbcrKey},
 };
 pub use ash;
 

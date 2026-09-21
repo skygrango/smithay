@@ -3,8 +3,7 @@ use ash::vk::{
     DescriptorPoolCreateFlags, DescriptorPoolCreateInfo, DescriptorPoolSize, DescriptorSet,
     DescriptorSetAllocateInfo, DescriptorSetLayout, DescriptorSetLayoutBinding,
     DescriptorSetLayoutBindingFlagsCreateInfo, DescriptorSetLayoutCreateFlags, DescriptorType, DeviceMemory,
-    DrawIndirectCommand, MemoryAllocateInfo, MemoryMapFlags, MemoryPropertyFlags,
-    PhysicalDeviceMemoryProperties, ShaderStageFlags, SharingMode,
+    DrawIndirectCommand, MemoryAllocateInfo, MemoryMapFlags, ShaderStageFlags, SharingMode,
 };
 
 use crate::backend::{

@@ -89,10 +89,12 @@ mod surface;
 use std::sync::Once;
 
 use crate::utils::{DevPath, Physical, Size};
+#[cfg(feature = "wayland_frontend")]
+pub use color::ScanoutCandidate;
 pub use color::{
     Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, CtaCoordinate, DrmColorCtm,
     DrmColorLut, DrmScanoutCapabilities, Eotf, HdrOutputMetadata, PlaneColorConversion, ScanoutPlan,
-    SrgbToPqEncoder, bt709_to_bt2020,
+    ScanoutTarget, SrgbToPqEncoder, bt709_to_bt2020,
 };
 pub use colorop::{
     ColorOp, ColorOpKind, ColorPipeline, Curve1DType, Lut1DInterpolation, Lut3DInterpolation,
@@ -147,6 +149,67 @@ pub struct Planes {
     pub overlay: Vec<PlaneInfo>,
 }
 
+/// Color encoding standard for YCbCr plane data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrmColorEncoding {
+    /// ITU-R BT.601 YCbCr
+    Bt601,
+    /// ITU-R BT.709 YCbCr
+    Bt709,
+    /// ITU-R BT.2020 YCbCr
+    Bt2020,
+}
+
+/// Color range standard for YCbCr plane data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DrmColorRange {
+    /// YCbCr limited range (e.g. 16-235)
+    Limited,
+    /// YCbCr full range (e.g. 0-255)
+    Full,
+}
+
+/// Supported color encodings and their raw values on a DRM plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlaneColorEncoding {
+    /// Raw property enum value for BT.601
+    pub bt601: Option<u64>,
+    /// Raw property enum value for BT.709
+    pub bt709: Option<u64>,
+    /// Raw property enum value for BT.2020
+    pub bt2020: Option<u64>,
+}
+
+impl PlaneColorEncoding {
+    /// Returns the raw enum value for the given color encoding if supported by the plane.
+    pub fn raw_value(&self, encoding: DrmColorEncoding) -> Option<u64> {
+        match encoding {
+            DrmColorEncoding::Bt601 => self.bt601,
+            DrmColorEncoding::Bt709 => self.bt709,
+            DrmColorEncoding::Bt2020 => self.bt2020,
+        }
+    }
+}
+
+/// Supported color ranges and their raw values on a DRM plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlaneColorRange {
+    /// Raw property enum value for limited range
+    pub limited: Option<u64>,
+    /// Raw property enum value for full range
+    pub full: Option<u64>,
+}
+
+impl PlaneColorRange {
+    /// Returns the raw enum value for the given color range if supported by the plane.
+    pub fn raw_value(&self, range: DrmColorRange) -> Option<u64> {
+        match range {
+            DrmColorRange::Limited => self.limited,
+            DrmColorRange::Full => self.full,
+        }
+    }
+}
+
 /// Info about a single plane
 #[derive(Debug, Clone)]
 pub struct PlaneInfo {
@@ -160,6 +223,10 @@ pub struct PlaneInfo {
     pub formats: FormatSet,
     /// Recommended plane size in order of preference
     pub size_hints: Option<Vec<Size<u16, Physical>>>,
+    /// Supported color encodings if COLOR_ENCODING property is present
+    pub color_encoding: Option<PlaneColorEncoding>,
+    /// Supported color ranges if COLOR_RANGE property is present
+    pub color_range: Option<PlaneColorRange>,
 }
 
 fn planes(
@@ -201,12 +268,15 @@ fn planes(
             let type_ = plane_type(dev, plane)?;
             let formats = plane_formats(dev, plane)?;
             let size_hints = plane_size_hints(dev, plane)?;
+            let (color_encoding, color_range) = plane_color_properties(dev, plane).unwrap_or((None, None));
             let plane_info = PlaneInfo {
                 handle: plane,
                 type_,
                 zpos,
                 formats,
                 size_hints,
+                color_encoding,
+                color_range,
             };
             match type_ {
                 PlaneType::Primary => {
@@ -527,4 +597,60 @@ fn plane_size_hints(
         }
     }
     Ok(None)
+}
+
+fn plane_color_properties(
+    dev: &(impl ControlDevice + DevPath),
+    plane: plane::Handle,
+) -> Result<(Option<PlaneColorEncoding>, Option<PlaneColorRange>), DrmError> {
+    let props = dev.get_properties(plane).map_err(|source| {
+        DrmError::Access(AccessError {
+            errmsg: "Failed to get properties of plane",
+            dev: dev.dev_path(),
+            source,
+        })
+    })?;
+    let (ids, vals) = props.as_props_and_values();
+    let mut encoding = None;
+    let mut range = None;
+
+    for (&id, _) in ids.iter().zip(vals.iter()) {
+        let Ok(info) = dev.get_property(id) else {
+            continue;
+        };
+        let name = info.name().to_string_lossy();
+        if name == "COLOR_ENCODING" {
+            if let drm::control::property::ValueType::Enum(items) = info.value_type() {
+                let mut pe = PlaneColorEncoding::default();
+                let (_, enum_values) = items.values();
+                for item in enum_values {
+                    let item_name = item.name().to_bytes();
+                    if item_name == b"ITU-R BT.601 YCbCr" {
+                        pe.bt601 = Some(item.value());
+                    } else if item_name == b"ITU-R BT.709 YCbCr" {
+                        pe.bt709 = Some(item.value());
+                    } else if item_name == b"ITU-R BT.2020 YCbCr" {
+                        pe.bt2020 = Some(item.value());
+                    }
+                }
+                encoding = Some(pe);
+            }
+        } else if name == "COLOR_RANGE" {
+            if let drm::control::property::ValueType::Enum(items) = info.value_type() {
+                let mut pr = PlaneColorRange::default();
+                let (_, enum_values) = items.values();
+                for item in enum_values {
+                    let item_name = item.name().to_bytes();
+                    if item_name == b"YCbCr limited range" {
+                        pr.limited = Some(item.value());
+                    } else if item_name == b"YCbCr full range" {
+                        pr.full = Some(item.value());
+                    }
+                }
+                range = Some(pr);
+            }
+        }
+    }
+
+    Ok((encoding, range))
 }

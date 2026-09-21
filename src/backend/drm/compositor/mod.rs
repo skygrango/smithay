@@ -156,7 +156,7 @@ use crate::{
         allocator::{
             Allocator, Buffer, Slot, Swapchain,
             dmabuf::{AsDmabuf, Dmabuf},
-            format::{get_opaque, has_alpha},
+            format::{get_opaque, has_alpha, is_ycbcr},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
@@ -168,7 +168,7 @@ use crate::{
                 RenderElementStates, RenderingReason, UnderlyingStorage,
             },
             sync::SyncPoint,
-            utils::{CommitCounter, DamageBag},
+            utils::{Buffer as RendererBuffer, CommitCounter, DamageBag},
         },
     },
     output::OutputModeSource,
@@ -177,7 +177,7 @@ use crate::{
 };
 
 use super::{
-    DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+    DrmColorEncoding, DrmColorRange, DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     color::{Colorspace, ConnectorColorState, CrtcColorCapabilities, CrtcColorState, DrmScanoutCapabilities},
     colorop::{ColorPipeline, OwnedBlob, PostBlendEncode, ResolvedColorPipeline, ScanoutColorTransform},
     error::AccessError,
@@ -212,7 +212,7 @@ impl RenderElementState {
 #[allow(dead_code)] // This structs purpose is to keep buffer objects alive, most variants won't be read
 #[derive(Debug)]
 enum ScanoutBuffer<B: Buffer> {
-    Wayland(crate::backend::renderer::utils::Buffer),
+    Wayland(RendererBuffer),
     Swapchain(Arc<Slot<B>>),
     Cursor(Arc<GbmBuffer>),
 }
@@ -463,6 +463,8 @@ struct PlaneProperties {
     pub transform: Transform,
     pub alpha: f32,
     pub format: DrmFormat,
+    pub color_encoding: Option<u64>,
+    pub color_range: Option<u64>,
 }
 
 impl PlaneProperties {
@@ -473,6 +475,8 @@ impl PlaneProperties {
             && self.transform == other.transform
             && self.alpha == other.alpha
             && self.format == other.format
+            && self.color_encoding == other.color_encoding
+            && self.color_range == other.color_range
     }
 }
 
@@ -482,6 +486,8 @@ struct ElementPlaneConfig<'a, B: Buffer, F: Framebuffer> {
     properties: PlaneProperties,
     buffer: DrmScanoutBuffer<B, F>,
     failed_planes: &'a mut PlanesSnapshot,
+    color_encoding: Option<DrmColorEncoding>,
+    color_range: Option<DrmColorRange>,
 }
 
 #[derive(Debug)]
@@ -748,7 +754,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
-    ) -> Result<(), crate::backend::drm::error::Error> {
+    ) -> Result<(), DrmError> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         let is_swapchain = self
             .plane_state(surface.plane())
@@ -769,7 +775,7 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
-    ) -> Result<(), crate::backend::drm::error::Error> {
+    ) -> Result<(), DrmError> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         let is_swapchain = self
             .plane_state(surface.plane())
@@ -845,6 +851,8 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
                         .as_ref()
                         .and_then(|(_, fence)| fence.as_ref().map(|fence| fence.as_fd())),
                     color_pipeline: config.color_pipeline.as_deref(),
+                    color_encoding: config.properties.color_encoding,
+                    color_range: config.properties.color_range,
                 }),
             })
     }
@@ -1657,6 +1665,8 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: buffer.format(),
+                    color_encoding: None,
+                    color_range: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(buffer)),
@@ -1932,6 +1942,8 @@ where
                     transform: Transform::Normal,
                     alpha: 1.0,
                     format: primary_plane_buffer.format(),
+                    color_encoding: None,
+                    color_range: None,
                 },
                 buffer: DrmScanoutBuffer {
                     buffer: ScanoutBuffer::Swapchain(Arc::new(primary_plane_buffer)),
@@ -2804,7 +2816,7 @@ where
     fn handle_flip(
         &mut self,
         prepared_frame: &PreparedFrame<A, F>,
-        flip: Result<(), crate::backend::drm::error::Error>,
+        flip: Result<(), DrmError>,
     ) -> FrameResult<(), A, F> {
         match flip {
             Ok(_) => {
@@ -2812,9 +2824,7 @@ where
                     self.reset_pending = false;
                 }
             }
-            Err(crate::backend::drm::error::Error::Access(ref access))
-                if access.source.kind() == ErrorKind::InvalidInput =>
-            {
+            Err(DrmError::Access(ref access)) if access.source.kind() == ErrorKind::InvalidInput => {
                 // In case the commit/flip failed while we tried to directly scan-out
                 // something on the primary plane we can try to mark this as failed for
                 // the next call to render_frame
@@ -4075,6 +4085,8 @@ where
                 alpha: 1.0,
                 transform: Transform::Normal,
                 format: framebuffer.format(),
+                color_encoding: None,
+                color_range: None,
             },
             buffer: DrmScanoutBuffer {
                 buffer: ScanoutBuffer::Cursor(Arc::new(cursor_buffer)),
@@ -4264,12 +4276,18 @@ where
             output_transform.invert(),
         );
         let alpha = element.alpha();
+        let (color_encoding, color_range) = match &underlying_storage {
+            UnderlyingStorage::Wayland(b) => (b.color_encoding(), b.color_range()),
+            _ => (None, None),
+        };
         let properties = PlaneProperties {
             src,
             dst,
             alpha,
             transform,
             format: fb.format(),
+            color_encoding: None,
+            color_range: None,
         };
         let buffer: DrmScanoutBuffer<
             <A as Allocator>::Buffer,
@@ -4397,6 +4415,8 @@ where
             geometry: element_geometry,
             buffer,
             failed_planes,
+            color_encoding,
+            color_range,
         })
     }
 
@@ -4718,8 +4738,73 @@ where
             None
         };
 
+        let mut properties = element_config.properties;
+        let is_yuv = is_ycbcr(properties.format.code) || element_config.color_encoding.is_some();
+
+        if is_yuv && color_pipeline.is_some() {
+            trace!(
+                "skipping direct scan-out on {:?} for element {:?}, plane color pipeline does not support YCbCr",
+                plane.handle, element_id
+            );
+            return Err(Some(RenderingReason::ColorTransformUnsupported));
+        }
+
+        if let Some(encoding) = element_config.color_encoding.or_else(|| {
+            if is_yuv {
+                Some(DrmColorEncoding::Bt709)
+            } else {
+                None
+            }
+        }) {
+            if let Some(plane_encoding) = plane.color_encoding.as_ref() {
+                match plane_encoding.raw_value(encoding) {
+                    Some(raw) => properties.color_encoding = Some(raw),
+                    None => {
+                        trace!(
+                            "skipping direct scan-out on {:?} for element {:?}, plane does not support color encoding {:?}",
+                            plane.handle, element_id, encoding
+                        );
+                        return Err(Some(RenderingReason::FormatUnsupported));
+                    }
+                }
+            } else if encoding != DrmColorEncoding::Bt601 {
+                trace!(
+                    "skipping direct scan-out on {:?} for element {:?}, plane lacks COLOR_ENCODING property for {:?}",
+                    plane.handle, element_id, encoding
+                );
+                return Err(Some(RenderingReason::FormatUnsupported));
+            }
+        }
+
+        if let Some(range) = element_config.color_range.or_else(|| {
+            if is_yuv {
+                Some(DrmColorRange::Limited)
+            } else {
+                None
+            }
+        }) {
+            if let Some(plane_range) = plane.color_range.as_ref() {
+                match plane_range.raw_value(range) {
+                    Some(raw) => properties.color_range = Some(raw),
+                    None => {
+                        trace!(
+                            "skipping direct scan-out on {:?} for element {:?}, plane does not support color range {:?}",
+                            plane.handle, element_id, range
+                        );
+                        return Err(Some(RenderingReason::FormatUnsupported));
+                    }
+                }
+            } else if range != DrmColorRange::Limited {
+                trace!(
+                    "skipping direct scan-out on {:?} for element {:?}, plane lacks COLOR_RANGE property for {:?}",
+                    plane.handle, element_id, range
+                );
+                return Err(Some(RenderingReason::FormatUnsupported));
+            }
+        }
+
         let config = PlaneConfig {
-            properties: element_config.properties,
+            properties,
             buffer: element_config.buffer.clone(),
             damage_clips,
             plane_claim,

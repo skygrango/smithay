@@ -3,7 +3,7 @@
 // and avoid exposing internal details.
 //
 // You can use all the types from my_protocol as if they went from `wayland_client::protocol`.
-pub use generated::{wp_color_representation_manager_v1, wp_color_representation_v1};
+pub use generated::{wp_color_representation_manager_v1, wp_color_representation_surface_v1};
 
 #[allow(non_upper_case_globals, non_snake_case, non_camel_case_types)]
 mod generated {
