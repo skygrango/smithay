@@ -606,6 +606,17 @@ pub trait RenderElement<R: Renderer>: Element {
         let _ = (frame, src, dst, cache);
         unimplemented!("error: is_framebuffer_effect without capture_framebuffer implementation!");
     }
+
+    /// Prepare any textures required by this element before rendering begins.
+    ///
+    /// This allows renderers to perform batched texture layout transitions,
+    /// synchronization, and queue family ownership transfers *before* dynamic rendering
+    /// begins, preventing pipeline stalls or renderpass interruptions.
+    #[inline]
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        let _ = frame;
+        Ok(())
+    }
 }
 
 /// Types that can be converted into [`RenderElement`]s
@@ -704,6 +715,10 @@ where
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
         (*self).capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        (*self).prepare_texture(frame)
     }
 }
 
@@ -816,6 +831,10 @@ impl<R: Renderer, E: Element + RenderElement<R>> RenderElement<R> for Namespaced
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
         self.inner.capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn prepare_texture(&self, frame: &mut <R>::Frame<'_, '_>) -> Result<(), <R>::Error> {
+        self.inner.prepare_texture(frame)
     }
 }
 
@@ -966,6 +985,9 @@ macro_rules! render_elements_internal {
     };
     (@call $renderer:ty as $other:ty; draw; $x:ident, $renderer_ref:ident, $frame:ident, $($tail:ident),*) => {
         $crate::backend::renderer::element::RenderElement::<$other>::draw($x, $renderer_ref.as_mut(), $frame.as_mut(), $($tail),*).map_err(Into::into)
+    };
+    (@call $renderer:ty as $other:ty; prepare_texture; $x:ident, $frame:ident) => {
+        $crate::backend::renderer::element::RenderElement::<$other>::prepare_texture($x, $frame.as_mut()).map_err(Into::into)
     };
     (@call $renderer:ty as $other:ty; $name:ident; $($x:ident),*) => {
         $crate::backend::renderer::element::RenderElement::<$other>::$name($($x),*)
@@ -1187,6 +1209,31 @@ macro_rules! render_elements_internal {
                 Self::_GenericCatcher(_) => unreachable!(),
             }
         }
+
+        fn prepare_texture(
+            &self,
+            frame: &mut <$renderer as $crate::backend::renderer::RendererSuper>::Frame<'_, '_>,
+        ) -> Result<(), <$renderer as $crate::backend::renderer::RendererSuper>::Error>
+        where
+        $(
+            $(
+                $renderer: std::convert::AsMut<$other_renderer>,
+                <$renderer as $crate::backend::renderer::RendererSuper>::Frame: std::convert::AsMut<<$other_renderer as $crate::backend::renderer::RendererSuper>::Frame>,
+                <$other_renderer as $crate::backend::renderer::RendererSuper>::Error: Into<<$renderer as $crate::backend::renderer::RendererSuper>::Error>,
+            )*
+        )*
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; prepare_texture; x, frame)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
     };
     (@draw $renderer:ty; $($(#[$meta:meta])* $body:ident=$field:ty $(as <$other_renderer:ty>)?),* $(,)?) => {
         fn draw(
@@ -1241,6 +1288,23 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; capture_framebuffer; x, frame, src, dst, cache)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn prepare_texture(
+            &self,
+            frame: &mut <$renderer as $crate::backend::renderer::RendererSuper>::Frame<'_, '_>,
+        ) -> Result<(), <$renderer as $crate::backend::renderer::RendererSuper>::Error>
+        {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call $renderer $(as $other_renderer)?; prepare_texture; x, frame)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1834,6 +1898,10 @@ where
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
         self.0.capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        self.0.prepare_texture(frame)
     }
 }
 

@@ -659,4 +659,8 @@ where
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
         Some(UnderlyingStorage::Memory(&self.buffer))
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        frame.prepare_textures(std::iter::once(&self.texture))
+    }
 }

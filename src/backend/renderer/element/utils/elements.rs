@@ -120,6 +120,10 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RescaleRenderElement
     ) -> Result<(), <R>::Error> {
         self.element.capture_framebuffer(frame, src, dst, cache)
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        self.element.prepare_texture(frame)
+    }
 }
 
 /// A element that allows to crop another element
@@ -319,6 +323,10 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for CropRenderElement<E>
     ) -> Result<(), <R>::Error> {
         self.element.capture_framebuffer(frame, src, dst, cache)
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        self.element.prepare_texture(frame)
+    }
 }
 
 /// Defines how the location parameter should apply in [`RelocateRenderElement::from_element`]
@@ -435,6 +443,10 @@ impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for RelocateRenderElemen
         cache: &UserDataMap,
     ) -> Result<(), <R>::Error> {
         self.element.capture_framebuffer(frame, src, dst, cache)
+    }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        self.element.prepare_texture(frame)
     }
 }
 

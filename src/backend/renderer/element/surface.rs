@@ -501,4 +501,11 @@ where
         frame.set_surface_color_description(None);
         res
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        if let WaylandSurfaceTexture::Texture(ref texture) = self.texture {
+            frame.prepare_textures(std::iter::once(texture))?;
+        }
+        Ok(())
+    }
 }

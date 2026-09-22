@@ -873,6 +873,10 @@ impl OutputDamageTracker {
             let mut element_opaque_regions = std::mem::take(&mut self.element_opaque_regions);
             let mut frame = renderer.render(framebuffer, output_size, output_transform)?;
 
+            for element in render_elements.iter() {
+                element.prepare_texture(&mut frame)?;
+            }
+
             element_damage.clear();
             element_damage.extend_from_slice(&self.damage);
             element_damage =

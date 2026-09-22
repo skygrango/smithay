@@ -713,4 +713,11 @@ where
             self.alpha,
         )
     }
+
+    fn prepare_texture(&self, frame: &mut R::Frame<'_, '_>) -> Result<(), R::Error> {
+        if frame.context_id() != self.context_id {
+            return Ok(());
+        }
+        frame.prepare_textures(std::iter::once(&self.texture))
+    }
 }

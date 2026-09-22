@@ -368,6 +368,17 @@ pub trait Frame {
         alpha: f32,
     ) -> Result<(), Self::Error>;
 
+    /// Batches layout transitions and queue family acquires for a collection of textures into a single
+    /// pipeline barrier, avoiding breaking dynamic rendering passes mid-frame.
+    fn prepare_textures<'a, I>(&mut self, textures: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = &'a Self::TextureId>,
+        Self::TextureId: 'a,
+    {
+        let _ = textures;
+        Ok(())
+    }
+
     /// Output transformation that is applied to this frame
     fn transformation(&self) -> Transform;
 

@@ -2400,7 +2400,7 @@ impl VulkanFrame<'_, '_> {
         let ext_queue = self.renderer.external_queue_family();
 
         let mut barriers = Vec::new();
-        let mut transitioned = Vec::new();
+        let mut transitioned: Vec<&'a VulkanImage> = Vec::new();
 
         for texture in textures {
             if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
@@ -2419,6 +2419,10 @@ impl VulkanFrame<'_, '_> {
                 tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
             if needs_tex_barrier {
+                if transitioned.iter().any(|t| Arc::ptr_eq(&t.inner, &texture.inner)) {
+                    continue;
+                }
+
                 let (tex_src_stage, tex_src_access) =
                     if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
                         (PipelineStageFlags2::NONE, AccessFlags2::NONE)
@@ -2999,6 +3003,14 @@ impl Frame for VulkanFrame<'_, '_> {
 
     fn context_id(&self) -> ContextId<Self::TextureId> {
         self.renderer.device.context()
+    }
+
+    fn prepare_textures<'a, I>(&mut self, textures: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = &'a Self::TextureId>,
+        Self::TextureId: 'a,
+    {
+        VulkanFrame::prepare_textures(self, textures)
     }
 
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {

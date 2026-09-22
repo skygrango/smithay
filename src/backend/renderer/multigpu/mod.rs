@@ -2076,6 +2076,38 @@ where
         self.frame.as_ref().unwrap().context_id().map()
     }
 
+    #[instrument(level = "trace", parent = &self.span, skip(self, textures))]
+    #[profiling::function]
+    fn prepare_textures<'a, I>(&mut self, textures: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = &'a Self::TextureId>,
+        Self::TextureId: 'a,
+    {
+        let render_id = self.frame.as_mut().unwrap().context_id();
+        let mut inner_textures = Vec::new();
+        for texture in textures {
+            let sync = texture.needs_synchronization::<R>(&render_id);
+            if let Some(sync) = sync {
+                if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
+                    trace!(?err, "Failed to import sync point, blocking");
+                    let _ = sync.wait();
+                }
+            }
+            texture
+                .reimport::<R>(unsafe { (*self.render).renderer_mut() })
+                .map_err(Error::Render)?;
+
+            if let Some(texture) = texture.get::<R>(&render_id) {
+                inner_textures.push(texture);
+            }
+        }
+        self.frame
+            .as_mut()
+            .unwrap()
+            .prepare_textures(&inner_textures)
+            .map_err(Error::Render)
+    }
+
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
     fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Error<R, T>> {
