@@ -3532,6 +3532,57 @@ where
                 .map_err(Error::Render)
         }
     }
+
+    #[instrument(level = "trace", parent = &self.span, skip(self, from, to))]
+    #[profiling::function]
+    fn blit_sdr_to_hdr(
+        &mut self,
+        from: &MultiFramebuffer<'_, T>,
+        to: &mut MultiFramebuffer<'_, T>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        config: &HdrOutputConfig,
+    ) -> Result<SyncPoint, <Self as RendererSuper>::Error> {
+        if let Some(target) = self.target.as_mut() {
+            let MultiFramebufferInternal::Target(from_fb) = &from.0 else {
+                unreachable!()
+            };
+            let MultiFramebufferInternal::Target(to_fb) = &mut to.0 else {
+                unreachable!()
+            };
+            target
+                .device
+                .renderer_mut()
+                .blit_sdr_to_hdr(from_fb, to_fb, src, dst, filter, config)
+                .map_err(Error::Target)
+        } else {
+            let MultiFramebufferInternal::Render(from_fb) = &from.0 else {
+                unreachable!()
+            };
+            let MultiFramebufferInternal::Render(to_fb) = &mut to.0 else {
+                unreachable!()
+            };
+            // SAFETY: We know this is fine, because target can only be `None` (and thus this framebuffer be of variant `Render`), if R == T.
+            let from_fb = unsafe {
+                std::mem::transmute::<
+                    &<<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'_>,
+                    &<<R::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'_>,
+                >(from_fb)
+            };
+            // SAFETY: We know this is fine, because target can only be `None` (and thus this framebuffer be of variant `Render`), if R == T.
+            let to_fb = unsafe {
+                std::mem::transmute::<
+                    &mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'_>,
+                    &mut <<R::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'_>,
+                >(to_fb)
+            };
+            self.render
+                .renderer_mut()
+                .blit_sdr_to_hdr(from_fb, to_fb, src, dst, filter, config)
+                .map_err(Error::Render)
+        }
+    }
 }
 
 impl<'a, 'render, 'target, 'frame, 'buffer, R: GraphicsApi, T: GraphicsApi>

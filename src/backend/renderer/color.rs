@@ -144,6 +144,21 @@ impl HdrOutputConfig {
             is_sdr: true,
         }
     }
+
+    /// Create an SDR to HDR conversion configuration with standard BT.2408 colorimetry.
+    ///
+    /// Uses standard piecewise sRGB EOTF (`sdr_gamma = 0.0`), accurate Rec.709 -> BT.2020 matrix (`gamut_stretch = 0.0`),
+    /// and standard diffuse white (203.0 cd/m²).
+    pub fn sdr_to_hdr() -> Self {
+        Self {
+            reference_white: 203.0,
+            sdr_gamma: 0.0, // standard piecewise sRGB
+            gamut_stretch: 0.0,
+            max_luminance: 1000.0,
+            hardware_offload: false,
+            is_sdr: false,
+        }
+    }
 }
 
 /// Modified Reinhard tone-mapping curve on luminance in cd/m² (mirroring KWin's ICtCp tonemapping).
@@ -305,6 +320,16 @@ mod tests {
         assert_eq!(config.max_luminance, 350.0);
         assert!(config.is_sdr);
         assert_eq!(config.sdr_gamma, 0.0);
+    }
+
+    #[test]
+    fn test_sdr_to_hdr_config() {
+        let config = HdrOutputConfig::sdr_to_hdr();
+        assert_eq!(config.reference_white, 203.0);
+        assert_eq!(config.sdr_gamma, 0.0);
+        assert_eq!(config.gamut_stretch, 0.0);
+        assert!(!config.is_sdr);
+        assert!(!config.hardware_offload);
     }
 
     #[test]

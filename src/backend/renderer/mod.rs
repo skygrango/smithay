@@ -883,6 +883,20 @@ where
     ) -> Result<SyncPoint, Self::Error> {
         self.blit(from, to, src, dst, filter)
     }
+
+    /// Copies and converts the contents of `src` from an SDR framebuffer to `dst` in an HDR framebuffer,
+    /// applying SDR to PQ HDR conversion, gamut expansion, and transfer function encoding based on `config`.
+    fn blit_sdr_to_hdr(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+        _config: &HdrOutputConfig,
+    ) -> Result<SyncPoint, Self::Error> {
+        self.blit(from, to, src, dst, filter)
+    }
 }
 
 /// Trait for frames supporting blitting contents from/to the current framebuffer to/from another.

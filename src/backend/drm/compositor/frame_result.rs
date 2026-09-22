@@ -319,7 +319,7 @@ where
                 let size = dmabuf.size();
                 let geometry = Rectangle::from_size(size.to_logical(1, Transform::Normal).to_physical(1));
                 opaque_regions.push(geometry);
-                Some((sync.clone(), dmabuf, geometry))
+                Some((sync.clone(), dmabuf, geometry, geometry))
             }
             PrimaryPlaneElement::Element(e) => {
                 let dmabuf: Option<Dmabuf> =
@@ -329,10 +329,24 @@ where
                         _ => None,
                     });
                 if let Some(dmabuf) = dmabuf {
-                    let size = dmabuf.size();
-                    let geometry = Rectangle::from_size(size.to_logical(1, Transform::Normal).to_physical(1));
-                    opaque_regions.push(geometry);
-                    Some((SyncPoint::default(), dmabuf, geometry))
+                    let geometry = e.geometry(scale);
+                    let opaque = e.opaque_regions(scale);
+                    if !opaque.is_empty() {
+                        opaque_regions.extend(opaque);
+                    } else if e.alpha() >= 1.0 {
+                        opaque_regions.push(geometry);
+                    }
+                    let src = e.src();
+                    let mut src_rect = Rectangle::new(
+                        Point::from((src.loc.x as i32, src.loc.y as i32)),
+                        Size::from((src.size.w as i32, src.size.h as i32)),
+                    );
+                    if src_rect.size.is_empty() {
+                        src_rect = Rectangle::from_size(
+                            dmabuf.size().to_logical(1, Transform::Normal).to_physical(1),
+                        );
+                    }
+                    Some((SyncPoint::default(), dmabuf, geometry, src_rect))
                 } else {
                     elements_to_render.push(*e);
                     opaque_regions.extend(e.opaque_regions(scale));
@@ -360,33 +374,76 @@ where
         }
 
         // first do the potential blit
-        if let Some((primary_dmabuf_sync, mut dmabuf, geometry)) = primary_dmabuf {
+        if let Some((primary_dmabuf_sync, mut dmabuf, geometry, src_rect)) = primary_dmabuf {
             let blit_damage = damage
                 .iter()
                 .filter_map(|d| d.intersection(geometry))
                 .collect::<Vec<_>>();
 
-            tracing::trace!("blitting frame with damage: {:#?}", blit_damage);
-
-            renderer
-                .wait(&primary_dmabuf_sync)
-                .map_err(BlitFrameResultError::Rendering)?;
-            let fb = renderer
-                .bind(&mut dmabuf)
-                .map_err(BlitFrameResultError::Rendering)?;
-            for rect in blit_damage {
-                // TODO: On Vulkan, may need to combine sync points instead of just using latest?
-                sync = Some(
-                    renderer
-                        .blit(
-                            &fb,
-                            framebuffer,
-                            rect,
-                            rect,
-                            crate::backend::renderer::TextureFilter::Linear,
-                        )
-                        .map_err(BlitFrameResultError::Rendering)?,
+            if !blit_damage.is_empty() {
+                tracing::trace!(
+                    "blitting frame with damage: {:#?}, geometry: {:?}, src_rect: {:?}",
+                    blit_damage,
+                    geometry,
+                    src_rect
                 );
+
+                renderer
+                    .wait(&primary_dmabuf_sync)
+                    .map_err(BlitFrameResultError::Rendering)?;
+                let fb = renderer
+                    .bind(&mut dmabuf)
+                    .map_err(BlitFrameResultError::Rendering)?;
+
+                if geometry.size == src_rect.size
+                    && geometry.loc == Point::default()
+                    && src_rect.loc == Point::default()
+                {
+                    for rect in blit_damage {
+                        // TODO: On Vulkan, may need to combine sync points instead of just using latest?
+                        sync = Some(
+                            renderer
+                                .blit(
+                                    &fb,
+                                    framebuffer,
+                                    rect,
+                                    rect,
+                                    crate::backend::renderer::TextureFilter::Linear,
+                                )
+                                .map_err(BlitFrameResultError::Rendering)?,
+                        );
+                    }
+                } else if geometry.size != src_rect.size {
+                    // Direct scanout scaling (e.g. 1080p game fullscreen on 1440p/4K display)
+                    // Scale the source buffer to cover the destination geometry on the framebuffer.
+                    sync = Some(
+                        renderer
+                            .blit(
+                                &fb,
+                                framebuffer,
+                                src_rect,
+                                geometry,
+                                crate::backend::renderer::TextureFilter::Linear,
+                            )
+                            .map_err(BlitFrameResultError::Rendering)?,
+                    );
+                } else {
+                    let offset = geometry.loc - src_rect.loc;
+                    for rect in blit_damage {
+                        let sub_src = Rectangle::new(rect.loc - offset, rect.size);
+                        sync = Some(
+                            renderer
+                                .blit(
+                                    &fb,
+                                    framebuffer,
+                                    sub_src,
+                                    rect,
+                                    crate::backend::renderer::TextureFilter::Linear,
+                                )
+                                .map_err(BlitFrameResultError::Rendering)?,
+                        );
+                    }
+                }
             }
         }
 
