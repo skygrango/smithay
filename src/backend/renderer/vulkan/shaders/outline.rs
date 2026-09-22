@@ -20,4 +20,5 @@ pub struct OutlinePushConstants {
     pub thickness: f32,
     pub color: [f32; 4],
     pub corner_radius: [f32; 4],
+    pub outline_rect: Rectangle<f32, Physical>,
 }

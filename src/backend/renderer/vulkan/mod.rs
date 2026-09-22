@@ -3098,6 +3098,7 @@ impl Frame for VulkanFrame<'_, '_> {
         thickness: f32,
         radius: [f32; 4],
         color: Color32F,
+        outline_rect: Option<Rectangle<i32, Physical>>,
     ) -> Result<(), Self::Error> {
         trace!(
             ?dst,
@@ -3105,6 +3106,7 @@ impl Frame for VulkanFrame<'_, '_> {
             thickness,
             ?radius,
             ?color,
+            ?outline_rect,
             fb_size = ?self.size,
             "VulkanFrame::draw_rounded_outline executing"
         );
@@ -3114,6 +3116,9 @@ impl Frame for VulkanFrame<'_, '_> {
         let untransformed_dst = dst;
         let transformed_dst = self.transform.transform_rect_in(dst, &self.size);
         let transformed_radii = transform_corner_radius(radius, self.transform);
+
+        let uncropped_outline = outline_rect.unwrap_or(dst);
+        let transformed_outline = self.transform.transform_rect_in(uncropped_outline, &self.size);
 
         let color = if let Some(config) = self.renderer.hdr_config {
             sdr_color_to_hdr(
@@ -3150,6 +3155,13 @@ impl Frame for VulkanFrame<'_, '_> {
             Point::new(transformed_dst.loc.x as f32, transformed_dst.loc.y as f32),
             Size::new(transformed_dst.size.w as f32, transformed_dst.size.h as f32),
         );
+        let outline_rect = Rectangle::new(
+            Point::new(transformed_outline.loc.x as f32, transformed_outline.loc.y as f32),
+            Size::new(
+                transformed_outline.size.w as f32,
+                transformed_outline.size.h as f32,
+            ),
+        );
         let screen_size = [self.size.w as f32, self.size.h as f32];
         let depth_val = if self.depth_enabled {
             self.current_depth
@@ -3164,6 +3176,7 @@ impl Frame for VulkanFrame<'_, '_> {
             thickness,
             color: color.components(),
             corner_radius: transformed_radii,
+            outline_rect,
         };
 
         unsafe {
@@ -4509,7 +4522,7 @@ mod test {
         assert!(size_of::<HdrTexPushConstants>() <= 128);
 
         assert_eq!(align_of::<OutlinePushConstants>(), 16);
-        assert_eq!(size_of::<OutlinePushConstants>(), 64);
+        assert_eq!(size_of::<OutlinePushConstants>(), 80);
         assert!(size_of::<OutlinePushConstants>() <= 128);
     }
 

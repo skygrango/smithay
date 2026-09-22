@@ -50,7 +50,8 @@ float get_clip_alpha() {
     vec2 coords = pixel - params.clipRect.xy;
     vec2 size = params.clipRect.zw;
 
-    if (coords.x < 0.0 || coords.x > size.x || coords.y < 0.0 || coords.y > size.y) {
+    const float EPSILON = 0.01;
+    if (coords.x < -EPSILON || coords.x > size.x + EPSILON || coords.y < -EPSILON || coords.y > size.y + EPSILON) {
         return 0.0;
     }
 
@@ -58,26 +59,27 @@ float get_clip_alpha() {
         return 1.0;
     }
 
+    vec2 clamped_coords = clamp(coords, vec2(0.0), size);
     vec2 center;
     float radius;
 
-    if (coords.x < params.cornerRadius.x && coords.y < params.cornerRadius.x) {
+    if (clamped_coords.x < params.cornerRadius.x && clamped_coords.y < params.cornerRadius.x) {
         radius = params.cornerRadius.x;
         center = vec2(radius, radius);
-    } else if (size.x - params.cornerRadius.y < coords.x && coords.y < params.cornerRadius.y) {
+    } else if (size.x - params.cornerRadius.y < clamped_coords.x && clamped_coords.y < params.cornerRadius.y) {
         radius = params.cornerRadius.y;
         center = vec2(size.x - radius, radius);
-    } else if (size.x - params.cornerRadius.z < coords.x && size.y - params.cornerRadius.z < coords.y) {
+    } else if (size.x - params.cornerRadius.z < clamped_coords.x && size.y - params.cornerRadius.z < clamped_coords.y) {
         radius = params.cornerRadius.z;
         center = vec2(size.x - radius, size.y - radius);
-    } else if (coords.x < params.cornerRadius.w && size.y - params.cornerRadius.w < coords.y) {
+    } else if (clamped_coords.x < params.cornerRadius.w && size.y - params.cornerRadius.w < clamped_coords.y) {
         radius = params.cornerRadius.w;
         center = vec2(radius, size.y - radius);
     } else {
         return 1.0;
     }
 
-    float dist = distance(coords, center);
+    float dist = distance(clamped_coords, center);
     return 1.0 - smoothstep(radius - 0.5, radius + 0.5, dist);
 }
 

@@ -304,8 +304,9 @@ pub trait Frame {
         thickness: f32,
         radius: [f32; 4],
         color: Color32F,
+        outline_rect: Option<Rectangle<i32, Physical>>,
     ) -> Result<(), Self::Error> {
-        let _ = (dst, damage, thickness, radius, color);
+        let _ = (dst, damage, thickness, radius, color, outline_rect);
         Ok(())
     }
 

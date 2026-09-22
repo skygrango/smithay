@@ -10,6 +10,7 @@ layout(push_constant, std140) uniform PushConstants {
     float thickness;
     vec4 color;
     vec4 cornerRadius;
+    vec4 outlineRect;
 } params;
 
 float rounding_alpha(vec2 coords, vec2 size, vec4 radius) {
@@ -41,10 +42,18 @@ float rounding_alpha(vec2 coords, vec2 size, vec4 radius) {
 }
 
 void main() {
-    vec2 size = params.dstRect.zw;
-    vec2 coords = v_pos * size;
+    vec2 pixel = params.dstRect.xy + v_pos * params.dstRect.zw;
+    vec2 coords = pixel - params.outlineRect.xy;
+    vec2 size = params.outlineRect.zw;
 
-    float outer_alpha = rounding_alpha(coords, size, params.cornerRadius);
+    const float EPSILON = 0.5;
+    if (coords.x < -EPSILON || coords.x > size.x + EPSILON ||
+        coords.y < -EPSILON || coords.y > size.y + EPSILON) {
+        discard;
+    }
+
+    vec2 clamped_coords = clamp(coords, vec2(0.0), size);
+    float outer_alpha = rounding_alpha(clamped_coords, size, params.cornerRadius);
     float inner_alpha = 1.0;
 
     if (params.thickness > 0.0) {
@@ -55,7 +64,8 @@ void main() {
             && inner_coords.y >= 0.0 && inner_coords.y <= inner_size.y)
         {
             vec4 inner_radius = max(params.cornerRadius - vec4(params.thickness), vec4(0.0));
-            inner_alpha = 1.0 - rounding_alpha(inner_coords, inner_size, inner_radius);
+            vec2 clamped_inner_coords = clamp(inner_coords, vec2(0.0), inner_size);
+            inner_alpha = 1.0 - rounding_alpha(clamped_inner_coords, inner_size, inner_radius);
         }
     }
 

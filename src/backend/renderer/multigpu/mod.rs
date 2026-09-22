@@ -2115,6 +2115,7 @@ where
         thickness: f32,
         radius: [f32; 4],
         color: Color32F,
+        outline_rect: Option<Rectangle<i32, Physical>>,
     ) -> Result<(), Self::Error> {
         self.damage.extend(damage.iter().copied().map(|mut rect| {
             rect.loc += dst.loc;
@@ -2123,7 +2124,7 @@ where
         self.frame
             .as_mut()
             .unwrap()
-            .draw_rounded_outline(dst, damage, thickness, radius, color)
+            .draw_rounded_outline(dst, damage, thickness, radius, color, outline_rect)
             .map_err(Error::Render)
     }
 
