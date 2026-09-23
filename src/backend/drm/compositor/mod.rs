@@ -1093,6 +1093,8 @@ bitflags::bitflags! {
         const ALLOW_CURSOR_PLANE_SCANOUT = 8;
         /// Return `EmptyFrame`, if only the cursor plane would have been updated
         const SKIP_CURSOR_ONLY_UPDATES = 16;
+        /// Align fullscreen swapchain pacing by skipping rendering when the fullscreen element has no damage
+        const FULLSCREEN_PACING = 32;
         /// Allow to realize the frame by assigning elements on any plane
         const ALLOW_SCANOUT = Self::ALLOW_PRIMARY_PLANE_SCANOUT.bits() | Self::ALLOW_OVERLAY_PLANE_SCANOUT.bits() | Self::ALLOW_CURSOR_PLANE_SCANOUT.bits();
         /// Safe default set of flags
@@ -2377,188 +2379,303 @@ where
             .unwrap_or(false);
 
         if render {
-            trace!(
-                "rendering {} elements on the primary {:?}",
-                primary_plane_elements.len(),
-                self.surface.plane(),
-            );
-            let (mut dmabuf, age) = {
-                let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
-                let config = primary_plane_state.config.as_ref().unwrap();
-                let slot = match &config.buffer.buffer {
-                    ScanoutBuffer::Swapchain(slot) => slot,
-                    _ => unreachable!(),
+            let is_fullscreen_pacing = frame_flags.contains(FrameFlags::FULLSCREEN_PACING);
+            let fullscreen_fast_flip_element = if primary_plane_elements.len() == 1 {
+                let elem = primary_plane_elements[0];
+                let has_underlays = overlay_plane_elements.iter().any(|(p, _)| {
+                    let plane_z_pos = self
+                        .planes
+                        .overlay
+                        .iter()
+                        .find_map(|info| {
+                            if info.handle == *p {
+                                Some(info.zpos.unwrap_or_default())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default()
+                });
+
+                let is_candidate = if is_fullscreen_pacing {
+                    !has_underlays
+                } else {
+                    let element_geometry = elem.geometry(output_scale);
+                    let spans_output = element_geometry.contains_rect(output_geometry);
+                    let crtc_background_matches_clear_color =
+                        (clear_color.r() == 0f32 && clear_color.g() == 0f32 && clear_color.b() == 0f32)
+                            || clear_color.a() == 0f32;
+                    !has_underlays && (spans_output || crtc_background_matches_clear_color)
                 };
 
-                // It is safe to call export multiple times as the Slot will cache the dmabuf for us
-                let dmabuf = slot.export().map_err(FrameError::AsDmabufError)?;
-                let age = slot.age().into();
-                (dmabuf, age)
+                if is_candidate { Some(elem) } else { None }
+            } else {
+                None
             };
 
-            // store the current renderer debug flags and replace them
-            // with our own
-            let renderer_debug_flags = renderer.debug_flags();
-            renderer.set_debug_flags(self.debug_flags);
+            let previous_primary_state = previous_state.plane_state(self.surface.plane());
+            let current_primary_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
+            let current_config = current_primary_state.config.as_ref().unwrap();
 
-            // First we collect all our fake elements for overlay and underlays
-            // This is used to transport the opaque regions for elements that
-            // have been assigned to planes and to realize hole punching for
-            // underlays. We use an Id per plane/element combination to not
-            // interfere with the element damage state in the output damage tracker.
-            // Using the original element id would store the commit in the
-            // OutputDamageTracker without actual rendering anything -> bad
-            // Using a id per plane could result in an issue when a different
-            // element with the same geometry gets assigned and has the same
-            // commit -> unlikely but possible
-            // So we use an Id per plane for as long as we have the same element
-            // on that plane.
-            let overlay_plane_elements = overlay_plane_elements.iter().filter_map(|(p, element)| {
-                let id = self
-                    .overlay_plane_element_ids
-                    .plane_id_for_element_id(p, element.id());
+            let previous_swapchain_compatible = previous_primary_state
+                .and_then(|state| state.config.as_ref())
+                .map(|c| {
+                    matches!(c.buffer.buffer, ScanoutBuffer::Swapchain(_)) && c.is_compatible(current_config)
+                })
+                .unwrap_or(false);
 
-                let plane_z_pos = self
-                    .planes
-                    .overlay
-                    .iter()
-                    .find_map(|info| {
-                        if info.handle == *p {
-                            Some(info.zpos.unwrap_or_default())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let is_underlay = plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
-                if is_underlay {
-                    Some(HolepunchRenderElement::from_render_element(id, element, output_scale).into())
-                } else {
-                    OverlayPlaneElement::from_render_element(id, *element, output_scale)
-                        .map(DrmRenderElements::from)
-                }
-            });
-            // Then render all remaining elements assigned to the primary plane
-            let elements = overlay_plane_elements
-                .chain(
-                    primary_plane_elements
-                        .into_iter()
-                        .map(|e| DrmRenderElements::Other(e)),
-                )
-                .collect::<Vec<_>>();
-
-            let mut framebuffer = renderer
-                .bind(&mut dmabuf)
-                .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
-            let render_res =
-                self.damage_tracker
-                    .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
-
-            trace!(
-                age,
-                elements_len = elements.len(),
-                render_ok = render_res.is_ok(),
-                render_damage = ?render_res.as_ref().ok().and_then(|r| r.damage.as_ref()),
-                "DrmCompositor damage_tracker render_output result"
-            );
-
-            // restore the renderer debug flags
-            renderer.set_debug_flags(renderer_debug_flags);
-
-            match render_res {
-                Ok(render_output_result) => {
-                    if render_output_result.damage.is_none() {
-                        // if we receive no damage we can assume no rendering took place
-                        // and we should trigger a cleanup of the renderer texture cache
-                        // to prevent holding textures longer then necessary
-                        let _ = renderer.cleanup_texture_cache();
-                    }
-
-                    for (id, state) in render_output_result.states.states.into_iter() {
-                        // Skip the state for our fake elements
-                        if self.overlay_plane_element_ids.contains_plane_id(&id) {
-                            continue;
-                        }
-
-                        if let Some(existing_state) = render_element_states.states.get_mut(&id) {
-                            if matches!(
-                                existing_state.presentation_state,
-                                RenderElementPresentationState::Skipped
-                            ) {
-                                *existing_state = state;
+            let skip_fullscreen_render = if let Some(fullscreen_element) = fullscreen_fast_flip_element {
+                if allow_partial_update && previous_swapchain_compatible {
+                    let previous_commit = previous_primary_state.and_then(|state| {
+                        state.element_state.as_ref().and_then(|state| {
+                            if state.id == *fullscreen_element.id() {
+                                Some(state.commit)
                             } else {
-                                existing_state.visible_area += state.visible_area;
+                                None
+                            }
+                        })
+                    });
+
+                    let has_same_commit = previous_commit == Some(fullscreen_element.current_commit());
+                    let element_damage = fullscreen_element.damage_since(output_scale, previous_commit);
+                    has_same_commit && element_damage.is_empty()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if skip_fullscreen_render {
+                let fullscreen_element = fullscreen_fast_flip_element.unwrap();
+                trace!(
+                    is_fullscreen_pacing,
+                    "fullscreen fast direct flip: no damage on element {:?}, skipping swapchain render and primary plane update",
+                    fullscreen_element.id()
+                );
+
+                let primary_plane_state = next_frame_state.plane_state_mut(self.surface.plane()).unwrap();
+                let config = primary_plane_state.config.as_mut().unwrap();
+
+                primary_plane_state.skip = true;
+                *config = previous_state
+                    .plane_state(self.surface.plane())
+                    .and_then(|state| state.config.as_ref().cloned())
+                    .unwrap_or_else(|| config.clone());
+
+                primary_plane_state.element_state = previous_state
+                    .plane_state(self.surface.plane())
+                    .and_then(|state| state.element_state.clone());
+
+                if let Some(existing_state) = render_element_states.states.get_mut(fullscreen_element.id()) {
+                    *existing_state = RenderElementState::skipped();
+                } else {
+                    render_element_states
+                        .states
+                        .insert(fullscreen_element.id().clone(), RenderElementState::skipped());
+                }
+
+                let _ = renderer.cleanup_texture_cache();
+            } else {
+                trace!(
+                    "rendering {} elements on the primary {:?}",
+                    primary_plane_elements.len(),
+                    self.surface.plane(),
+                );
+                let (mut dmabuf, age) = {
+                    let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
+                    let config = primary_plane_state.config.as_ref().unwrap();
+                    let slot = match &config.buffer.buffer {
+                        ScanoutBuffer::Swapchain(slot) => slot,
+                        _ => unreachable!(),
+                    };
+
+                    // It is safe to call export multiple times as the Slot will cache the dmabuf for us
+                    let dmabuf = slot.export().map_err(FrameError::AsDmabufError)?;
+                    let age = slot.age().into();
+                    (dmabuf, age)
+                };
+
+                // store the current renderer debug flags and replace them
+                // with our own
+                let renderer_debug_flags = renderer.debug_flags();
+                renderer.set_debug_flags(self.debug_flags);
+
+                // First we collect all our fake elements for overlay and underlays
+                // This is used to transport the opaque regions for elements that
+                // have been assigned to planes and to realize hole punching for
+                // underlays. We use an Id per plane/element combination to not
+                // interfere with the element damage state in the output damage tracker.
+                // Using the original element id would store the commit in the
+                // OutputDamageTracker without actual rendering anything -> bad
+                // Using a id per plane could result in an issue when a different
+                // element with the same geometry gets assigned and has the same
+                // commit -> unlikely but possible
+                // So we use an Id per plane for as long as we have the same element
+                // on that plane.
+                let overlay_plane_elements = overlay_plane_elements.iter().filter_map(|(p, element)| {
+                    let id = self
+                        .overlay_plane_element_ids
+                        .plane_id_for_element_id(p, element.id());
+
+                    let plane_z_pos = self
+                        .planes
+                        .overlay
+                        .iter()
+                        .find_map(|info| {
+                            if info.handle == *p {
+                                Some(info.zpos.unwrap_or_default())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    let is_underlay = plane_z_pos < self.surface.plane_info().zpos.unwrap_or_default();
+                    if is_underlay {
+                        Some(HolepunchRenderElement::from_render_element(id, element, output_scale).into())
+                    } else {
+                        OverlayPlaneElement::from_render_element(id, *element, output_scale)
+                            .map(DrmRenderElements::from)
+                    }
+                });
+                // Then render all remaining elements assigned to the primary plane
+                let elements = overlay_plane_elements
+                    .chain(
+                        primary_plane_elements
+                            .into_iter()
+                            .map(|e| DrmRenderElements::Other(e)),
+                    )
+                    .collect::<Vec<_>>();
+
+                let mut framebuffer = renderer
+                    .bind(&mut dmabuf)
+                    .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
+                let render_res = self.damage_tracker.render_output(
+                    renderer,
+                    &mut framebuffer,
+                    age,
+                    &elements,
+                    clear_color,
+                );
+
+                trace!(
+                    age,
+                    elements_len = elements.len(),
+                    render_ok = render_res.is_ok(),
+                    render_damage = ?render_res.as_ref().ok().and_then(|r| r.damage.as_ref()),
+                    "DrmCompositor damage_tracker render_output result"
+                );
+
+                // restore the renderer debug flags
+                renderer.set_debug_flags(renderer_debug_flags);
+
+                match render_res {
+                    Ok(render_output_result) => {
+                        if render_output_result.damage.is_none() {
+                            // if we receive no damage we can assume no rendering took place
+                            // and we should trigger a cleanup of the renderer texture cache
+                            // to prevent holding textures longer then necessary
+                            let _ = renderer.cleanup_texture_cache();
+                        }
+
+                        for (id, state) in render_output_result.states.states.into_iter() {
+                            // Skip the state for our fake elements
+                            if self.overlay_plane_element_ids.contains_plane_id(&id) {
+                                continue;
+                            }
+
+                            if let Some(existing_state) = render_element_states.states.get_mut(&id) {
+                                if matches!(
+                                    existing_state.presentation_state,
+                                    RenderElementPresentationState::Skipped
+                                ) {
+                                    *existing_state = state;
+                                } else {
+                                    existing_state.visible_area += state.visible_area;
+                                }
+                            } else {
+                                render_element_states.states.insert(id.clone(), state);
+                            }
+                        }
+
+                        // Fixup damage on plane, if we used the plane for direct scan-out before
+                        // but now use it for rendering we do not replace the damage which is
+                        // the whole plane initially.
+                        let had_direct_scan_out = previous_state
+                            .plane_buffer(self.surface.plane())
+                            .map(|config| matches!(config.buffer, ScanoutBuffer::Wayland(_)))
+                            .unwrap_or(true);
+
+                        let primary_plane_state =
+                            next_frame_state.plane_state_mut(self.surface.plane()).unwrap();
+                        let config = primary_plane_state.config.as_mut().unwrap();
+
+                        if !had_direct_scan_out {
+                            if let Some(render_damage) = render_output_result.damage {
+                                trace!("rendering damage: {:?}", render_damage);
+
+                                self.primary_plane_damage_bag.add(render_damage.iter().map(|d| {
+                                    d.to_logical(1).to_buffer(
+                                        1,
+                                        Transform::Normal,
+                                        &output_geometry.size.to_logical(1),
+                                    )
+                                }));
+
+                                // Here we need to apply the output_transform to the damage since we
+                                // haven't rotated our framebuffer. dst is already in the same
+                                // coordinate space src is, so no transform needed.
+                                config.damage_clips = PlaneDamageClips::from_damage(
+                                    self.surface.device_fd(),
+                                    config.properties.src,
+                                    config.properties.dst,
+                                    Transform::Normal,
+                                    output_transform,
+                                    render_damage.iter().copied(),
+                                )
+                                .ok()
+                                .flatten();
+                                config.sync = Some((render_output_result.sync.clone(), None));
+                            } else {
+                                trace!("skipping primary plane, no damage");
+
+                                primary_plane_state.skip = true;
+                                *config = previous_state
+                                    .plane_state(self.surface.plane())
+                                    .and_then(|state| state.config.as_ref().cloned())
+                                    .unwrap_or_else(|| config.clone());
                             }
                         } else {
-                            render_element_states.states.insert(id.clone(), state);
-                        }
-                    }
-
-                    // Fixup damage on plane, if we used the plane for direct scan-out before
-                    // but now use it for rendering we do not replace the damage which is
-                    // the whole plane initially.
-                    let had_direct_scan_out = previous_state
-                        .plane_state(self.surface.plane())
-                        .map(|state| state.element_state.is_some())
-                        .unwrap_or(true);
-
-                    let primary_plane_state = next_frame_state.plane_state_mut(self.surface.plane()).unwrap();
-                    let config = primary_plane_state.config.as_mut().unwrap();
-
-                    if !had_direct_scan_out {
-                        if let Some(render_damage) = render_output_result.damage {
-                            trace!("rendering damage: {:?}", render_damage);
-
-                            self.primary_plane_damage_bag.add(render_damage.iter().map(|d| {
-                                d.to_logical(1).to_buffer(
+                            trace!(
+                                "clearing previous direct scan-out on primary plane, damaging complete output"
+                            );
+                            self.primary_plane_damage_bag
+                                .add([output_geometry.to_logical(1).to_buffer(
                                     1,
                                     Transform::Normal,
                                     &output_geometry.size.to_logical(1),
-                                )
-                            }));
+                                )]);
 
-                            // Here we need to apply the output_transform to the damage since we
-                            // haven't rotated our framebuffer. dst is already in the same
-                            // coordinate space src is, so no transform needed.
-                            config.damage_clips = PlaneDamageClips::from_damage(
-                                self.surface.device_fd(),
-                                config.properties.src,
-                                config.properties.dst,
-                                Transform::Normal,
-                                output_transform,
-                                render_damage.iter().copied(),
-                            )
-                            .ok()
-                            .flatten();
                             config.sync = Some((render_output_result.sync.clone(), None));
-                        } else {
-                            trace!("skipping primary plane, no damage");
-
-                            primary_plane_state.skip = true;
-                            *config = previous_state
-                                .plane_state(self.surface.plane())
-                                .and_then(|state| state.config.as_ref().cloned())
-                                .unwrap_or_else(|| config.clone());
                         }
-                    } else {
-                        trace!(
-                            "clearing previous direct scan-out on primary plane, damaging complete output"
-                        );
-                        self.primary_plane_damage_bag
-                            .add([output_geometry.to_logical(1).to_buffer(
-                                1,
-                                Transform::Normal,
-                                &output_geometry.size.to_logical(1),
-                            )]);
 
-                        config.sync = Some((render_output_result.sync.clone(), None));
+                        if let Some(fullscreen_element) = fullscreen_fast_flip_element {
+                            primary_plane_state.element_state = Some(PlaneElementState {
+                                id: fullscreen_element.id().clone(),
+                                commit: fullscreen_element.current_commit(),
+                                z_index: 0,
+                                cursor_size: None,
+                                cursor_post_blend: false,
+                            });
+                        }
                     }
-                }
-                Err(err) => {
-                    // Rendering failed at some point, reset the buffers
-                    // as we probably now have some half drawn buffer
-                    self.swapchain.reset_buffers();
-                    return Err(RenderFrameError::from(err));
+                    Err(err) => {
+                        // Rendering failed at some point, reset the buffers
+                        // as we probably now have some half drawn buffer
+                        self.swapchain.reset_buffers();
+                        return Err(RenderFrameError::from(err));
+                    }
                 }
             }
         } else {
