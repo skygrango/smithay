@@ -99,11 +99,15 @@ use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_toplevel_decoration_v1::{self, Mode},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    backend::{ClientId, GlobalId},
 };
 
 use super::{ToplevelSurface, XdgShellHandler};
-use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2, shell::xdg::XdgShellSurfaceUserData};
+use crate::wayland::{
+    Dispatch2, GlobalData, GlobalDispatch2, compositor,
+    shell::xdg::{XdgShellSurfaceUserData, XdgToplevelSurfaceData},
+};
 
 /// Delegate type for handling xdg decoration events.
 #[derive(Debug)]
@@ -146,11 +150,28 @@ impl XdgDecorationState {
             + 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
+        Self::new_with_filter_and_version::<D, _>(display, 2, filter)
+    }
+
+    /// Creates a new delegate type for handling xdg decoration events with a specified version and filter.
+    pub fn new_with_filter_and_version<D, F>(
+        display: &DisplayHandle,
+        version: u32,
+        filter: F,
+    ) -> XdgDecorationState
+    where
+        D: GlobalDispatch<
+                zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+                XdgDecorationManagerGlobalData,
+            > + Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, GlobalData>
+            + 'static,
+        F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
+    {
         let data = XdgDecorationManagerGlobalData {
             filter: Box::new(filter),
         };
         let global =
-            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(1, data);
+            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(version, data);
 
         XdgDecorationState { global }
     }
@@ -171,6 +192,9 @@ pub trait XdgDecorationHandler {
 
     /// Notification the client does not prefer a particular decoration mode on the toplevel.
     fn unset_mode(&mut self, toplevel: ToplevelSurface);
+
+    /// Notification that the decoration object for the toplevel has been destroyed.
+    fn decoration_destroyed(&mut self, _toplevel: ToplevelSurface) {}
 }
 
 pub(super) fn send_decoration_configure(
@@ -251,6 +275,16 @@ where
                 *decoration_guard = Some(toplevel_decoration);
                 drop(decoration_guard);
 
+                compositor::with_states(&toplevel.wl_surface, |states| {
+                    if let Some(mut attributes) = states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .map(|d| d.lock().unwrap())
+                    {
+                        attributes.initial_decoration_configure_sent = false;
+                    }
+                });
+
                 state.new_decoration(toplevel);
             }
 
@@ -297,5 +331,28 @@ where
 
             _ => unreachable!(),
         }
+    }
+
+    fn destroyed(
+        &self,
+        state: &mut D,
+        _client: ClientId,
+        _resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+    ) {
+        if let Some(data) = self.xdg_toplevel().data::<XdgShellSurfaceUserData>() {
+            data.decoration.lock().unwrap().take();
+        }
+
+        compositor::with_states(&self.wl_surface, |states| {
+            if let Some(mut attributes) = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .map(|d| d.lock().unwrap())
+            {
+                attributes.initial_decoration_configure_sent = false;
+            }
+        });
+
+        state.decoration_destroyed(self.clone());
     }
 }

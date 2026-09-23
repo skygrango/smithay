@@ -1589,6 +1589,18 @@ impl ToplevelSurface {
     ) {
         let _span = trace_span!("xdg-toplevel pre-commit", surface = %surface.id()).entered();
 
+        let toplevels = &state.xdg_shell_state().known_toplevels;
+        let has_decoration_object = toplevels
+            .iter()
+            .find(|handle| handle.wl_surface == *surface)
+            .and_then(|toplevel| {
+                toplevel
+                    .shell_surface
+                    .data::<self::handlers::XdgShellSurfaceUserData>()
+            })
+            .and_then(|data| data.decoration.lock().unwrap().as_ref().cloned())
+            .is_some();
+
         let error = compositor::with_states(surface, |states| {
             let mut role = states
                 .data_map
@@ -1628,6 +1640,21 @@ impl ToplevelSurface {
                 // The surface remains, or became, unmapped, meaning that it's in the initial
                 // configure stage.
                 pending.last_acked = None;
+            }
+
+            if !has_decoration_object {
+                if let Some(last_acked) = pending.last_acked.as_mut() {
+                    if last_acked.state.decoration_mode == Some(zxdg_toplevel_decoration_v1::Mode::ServerSide)
+                    {
+                        last_acked.state.decoration_mode =
+                            Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+                    }
+                }
+                if let Some(server_pending) = role.server_pending.as_mut() {
+                    if server_pending.decoration_mode == Some(zxdg_toplevel_decoration_v1::Mode::ServerSide) {
+                        server_pending.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+                    }
+                }
             }
 
             if got_unmapped {
