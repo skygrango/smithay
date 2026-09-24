@@ -387,6 +387,80 @@ impl ImageDescription {
         }
         self.luminances_or_default().1
     }
+
+    /// Remaps the HDR metadata (MaxCLL, MaxFALL, mastering luminance) to fit within
+    /// the target display's peak luminance using an ITU-R BT.2408-inspired knee-point
+    /// soft-compression rational curve.
+    ///
+    /// - Below the knee point (protecting reference white and midtones): 1:1 linear preservation
+    ///   so diffuse white, UI, and skin tones are completely undistorted.
+    /// - Above the knee point: smooth C1-continuous monotonic roll-off mapping the content's
+    ///   maximum light level asymptotically up to `target_peak`.
+    pub fn remap_metadata_to_peak(&self, target_peak: u32, target_ref_white: u32) -> Self {
+        if target_peak == 0 {
+            return self.clone();
+        }
+
+        let explicit_max = self
+            .max_cll
+            .or_else(|| self.mastering_luminance.map(|(_, m)| m))
+            .or_else(|| self.luminances.map(|(_, m, _)| m));
+
+        let Some(content_max) = explicit_max else {
+            return self.clone();
+        };
+
+        let content_ref_white = self.luminances_or_default().2;
+        let ref_scale = (target_ref_white as f64) / (content_ref_white as f64).max(1.0);
+        let scaled_max = (content_max as f64) * ref_scale;
+
+        // If the content is already within the display's headroom (+5% margin), no remapping needed.
+        if scaled_max <= (target_peak as f64) * 1.05 {
+            return self.clone();
+        }
+
+        let target_peak_f = target_peak as f64;
+        // Knee point: keep reference white and lower luminance 1:1 linear.
+        // Protect up to 60% of target peak or target reference white.
+        let knee = (target_ref_white as f64).min(target_peak_f * 0.6);
+
+        // Curvature parameter for C1-continuous monotonic rational roll-off:
+        // f(L) = knee + (L - knee) / (1.0 + c * (L - knee))
+        // such that f(scaled_max) = target_peak_f, f(knee) = knee, f'(knee) = 1.0.
+        let delta_max = (scaled_max - knee).max(1.0);
+        let delta_target = (target_peak_f - knee).max(1.0);
+        let c = (scaled_max - target_peak_f) / (delta_target * delta_max);
+
+        let map_lum = |lum: u32| -> u32 {
+            let scaled = (lum as f64) * ref_scale;
+            if scaled <= knee {
+                lum
+            } else {
+                let x = scaled - knee;
+                let mapped = knee + x / (1.0 + c * x);
+                let unscaled = mapped / ref_scale;
+                unscaled.round().clamp(1.0, target_peak_f) as u32
+            }
+        };
+
+        let mut remapped = self.clone();
+        if let Some(cll) = self.max_cll {
+            remapped.max_cll = Some(map_lum(cll));
+        }
+        if let Some(fall) = self.max_fall {
+            remapped.max_fall = Some(map_lum(fall));
+        }
+        if let Some((min_lum, max_lum)) = self.mastering_luminance {
+            let new_max = map_lum(max_lum);
+            remapped.mastering_luminance = Some((min_lum.min(new_max), new_max));
+        }
+        if let Some((min_lum, max_lum, _)) = self.luminances {
+            let new_max = map_lum(max_lum);
+            remapped.luminances = Some((min_lum.min(new_max), new_max, target_ref_white));
+        }
+
+        remapped
+    }
 }
 
 /// Double-buffered per-surface color management state.
@@ -1629,6 +1703,26 @@ mod tests {
             ..bt2100
         };
         assert_ne!(state.identity_for(bt2100), state.identity_for(twin));
+    }
+
+    #[test]
+    fn test_remap_metadata_to_peak() {
+        let mut desc = ImageDescription::WINDOWS_BT2100;
+        desc.windows_bt2100 = false;
+        desc.max_cll = Some(1500);
+        desc.max_fall = Some(400);
+        desc.mastering_luminance = Some((50, 1500));
+
+        let remapped = desc.remap_metadata_to_peak(1000, 203);
+        assert_eq!(remapped.max_cll.unwrap(), 1000);
+        assert!(remapped.max_fall.unwrap() < 400);
+        assert!(remapped.max_fall.unwrap() >= 203);
+        assert_eq!(remapped.mastering_luminance.unwrap().1, 1000);
+
+        // When content peak <= target_peak * 1.05, no remapping occurs
+        let desc_under = desc.remap_metadata_to_peak(1600, 203);
+        assert_eq!(desc_under.max_cll, Some(1500));
+        assert_eq!(desc_under.max_fall, Some(400));
     }
 
     #[test]

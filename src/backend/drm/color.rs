@@ -1933,6 +1933,14 @@ mod tests {
         );
         assert_eq!(plan_win, ScanoutPlan::DirectPassthrough);
 
+        // Metadata Remapping: PQ content with max_cll = 1500 remapped to 1000 nits.
+        // Once remapped using BT.2408 curve, it fits the 1000-nit sink and allows DirectPassthrough!
+        let remapped_pq = pq_desc.remap_metadata_to_peak(1000, 203);
+        assert_eq!(remapped_pq.max_cll, Some(1000));
+        let plan_remapped = caps.evaluate_scanout_plan_with_peak(true, Some(&remapped_pq), 203, Some(1000));
+        assert_eq!(plan_remapped, ScanoutPlan::DirectPassthrough);
+        assert!(plan_remapped.allows_primary_scanout());
+
         // 1b. Parametric PQ content with NO explicit peak declared (fallback defaults to 10,000 in TF).
         // It must NOT be false-positively treated as exceeding sink peak and must pass through directly!
         let mut pq_no_max = ImageDescription::WINDOWS_BT2100;
