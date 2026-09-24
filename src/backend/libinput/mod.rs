@@ -289,6 +289,83 @@ impl backend::PointerMotionEvent<LibinputInputBackend> for event::pointer::Point
     }
 }
 
+/// A coalesced pointer motion event representing one or more motion events from the same device in a single dispatch batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibinputPointerMotionEvent {
+    pub(crate) device: libinput::Device,
+    pub(crate) time: InputTime,
+    pub(crate) dx: f64,
+    pub(crate) dy: f64,
+    pub(crate) dx_unaccel: f64,
+    pub(crate) dy_unaccel: f64,
+}
+
+impl LibinputPointerMotionEvent {
+    pub(crate) fn from_event(event: &event::pointer::PointerMotionEvent) -> Self {
+        Self {
+            device: event::EventTrait::device(event),
+            time: InputTime::from_micros(event::pointer::PointerEventTrait::time_usec(event)),
+            dx: event.dx(),
+            dy: event.dy(),
+            dx_unaccel: event.dx_unaccelerated(),
+            dy_unaccel: event.dy_unaccelerated(),
+        }
+    }
+
+    pub(crate) fn accumulate_coords(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+        time: InputTime,
+    ) {
+        self.dx += dx;
+        self.dy += dy;
+        self.dx_unaccel += dx_unaccel;
+        self.dy_unaccel += dy_unaccel;
+        self.time = time;
+    }
+
+    pub(crate) fn accumulate(&mut self, event: &event::pointer::PointerMotionEvent) {
+        self.accumulate_coords(
+            event.dx(),
+            event.dy(),
+            event.dx_unaccelerated(),
+            event.dy_unaccelerated(),
+            InputTime::from_micros(event::pointer::PointerEventTrait::time_usec(event)),
+        );
+    }
+}
+
+impl backend::Event<LibinputInputBackend> for LibinputPointerMotionEvent {
+    fn time(&self) -> InputTime {
+        self.time
+    }
+
+    fn device(&self) -> libinput::Device {
+        self.device.clone()
+    }
+}
+
+impl backend::PointerMotionEvent<LibinputInputBackend> for LibinputPointerMotionEvent {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+
+    fn delta_x_unaccel(&self) -> f64 {
+        self.dx_unaccel
+    }
+
+    fn delta_y_unaccel(&self) -> f64 {
+        self.dy_unaccel
+    }
+}
+
 impl backend::Event<LibinputInputBackend> for event::pointer::PointerMotionAbsoluteEvent {
     fn time(&self) -> InputTime {
         InputTime::from_micros(event::pointer::PointerEventTrait::time_usec(self))
@@ -585,7 +662,7 @@ impl InputBackend for LibinputInputBackend {
     type KeyboardKeyEvent = event::keyboard::KeyboardKeyEvent;
     type PointerAxisEvent = PointerScrollAxis;
     type PointerButtonEvent = event::pointer::PointerButtonEvent;
-    type PointerMotionEvent = event::pointer::PointerMotionEvent;
+    type PointerMotionEvent = LibinputPointerMotionEvent;
     type PointerMotionAbsoluteEvent = event::pointer::PointerMotionAbsoluteEvent;
 
     type GestureSwipeBeginEvent = event::gesture::GestureSwipeBeginEvent;
@@ -719,7 +796,20 @@ impl EventSource for LibinputInputBackend {
             let _guard = self.span.enter();
             self.context.dispatch()?;
 
+            let mut pending_motion: Option<LibinputPointerMotionEvent> = None;
+            macro_rules! flush_pending {
+                ($pending:expr, $cb:expr) => {
+                    if let Some(motion) = $pending.take() {
+                        $cb(InputEvent::PointerMotion { event: motion }, &mut ());
+                    }
+                };
+            }
+
             for event in &mut self.context {
+                if !matches!(event, libinput::Event::Pointer(event::PointerEvent::Motion(_))) {
+                    flush_pending!(pending_motion, callback);
+                }
+
                 match event {
                     libinput::Event::Device(device_event) => match device_event {
                         event::DeviceEvent::Added(device_added_event) => {
@@ -770,7 +860,18 @@ impl EventSource for LibinputInputBackend {
                     },
                     libinput::Event::Pointer(pointer_event) => match pointer_event {
                         event::PointerEvent::Motion(motion_event) => {
-                            callback(InputEvent::PointerMotion { event: motion_event }, &mut ());
+                            let dev = event::EventTrait::device(&motion_event);
+                            if let Some(ref mut pending) = pending_motion {
+                                if pending.device == dev {
+                                    pending.accumulate(&motion_event);
+                                } else {
+                                    flush_pending!(pending_motion, callback);
+                                    pending_motion =
+                                        Some(LibinputPointerMotionEvent::from_event(&motion_event));
+                                }
+                            } else {
+                                pending_motion = Some(LibinputPointerMotionEvent::from_event(&motion_event));
+                            }
                         }
                         event::PointerEvent::MotionAbsolute(motion_abs_event) => {
                             callback(
@@ -868,6 +969,8 @@ impl EventSource for LibinputInputBackend {
                     _ => {} //FIXME: What to do with the rest.
                 }
             }
+
+            flush_pending!(pending_motion, callback);
         }
 
         Ok(PostAction::Continue)
@@ -887,5 +990,268 @@ impl EventSource for LibinputInputBackend {
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
         self.token = None;
         poll.unregister(self.as_fd())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    enum TestEvent {
+        Motion {
+            dev_id: u32,
+            dx: f64,
+            dy: f64,
+            dx_unaccel: f64,
+            dy_unaccel: f64,
+            time: u64,
+        },
+        Button {
+            dev_id: u32,
+            button: u32,
+        },
+    }
+
+    struct MockCoalescer {
+        pending: Option<(u32, f64, f64, f64, f64, u64)>,
+        dispatched: Vec<TestEvent>,
+    }
+
+    impl MockCoalescer {
+        fn new() -> Self {
+            Self {
+                pending: None,
+                dispatched: Vec::new(),
+            }
+        }
+
+        fn flush(&mut self) {
+            if let Some((dev_id, dx, dy, dx_unaccel, dy_unaccel, time)) = self.pending.take() {
+                self.dispatched.push(TestEvent::Motion {
+                    dev_id,
+                    dx,
+                    dy,
+                    dx_unaccel,
+                    dy_unaccel,
+                    time,
+                });
+            }
+        }
+
+        fn process_event(&mut self, event: TestEvent) {
+            match event {
+                TestEvent::Motion {
+                    dev_id,
+                    dx,
+                    dy,
+                    dx_unaccel,
+                    dy_unaccel,
+                    time,
+                } => {
+                    if let Some((
+                        p_dev,
+                        ref mut p_dx,
+                        ref mut p_dy,
+                        ref mut p_dx_unaccel,
+                        ref mut p_dy_unaccel,
+                        ref mut p_time,
+                    )) = self.pending
+                    {
+                        if p_dev == dev_id {
+                            *p_dx += dx;
+                            *p_dy += dy;
+                            *p_dx_unaccel += dx_unaccel;
+                            *p_dy_unaccel += dy_unaccel;
+                            *p_time = time;
+                            return;
+                        }
+                    }
+                    self.flush();
+                    self.pending = Some((dev_id, dx, dy, dx_unaccel, dy_unaccel, time));
+                }
+                other => {
+                    self.flush();
+                    self.dispatched.push(other);
+                }
+            }
+        }
+
+        fn finish(&mut self) {
+            self.flush();
+        }
+    }
+
+    #[test]
+    fn test_coalescing_same_device_motion() {
+        let mut coalescer = MockCoalescer::new();
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 1.0,
+            dy: 2.0,
+            dx_unaccel: 1.5,
+            dy_unaccel: 2.5,
+            time: 100,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 3.0,
+            dy: 4.0,
+            dx_unaccel: 3.5,
+            dy_unaccel: 4.5,
+            time: 101,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 5.0,
+            dy: 6.0,
+            dx_unaccel: 5.5,
+            dy_unaccel: 6.5,
+            time: 102,
+        });
+        coalescer.finish();
+
+        assert_eq!(coalescer.dispatched.len(), 1);
+        assert_eq!(
+            coalescer.dispatched[0],
+            TestEvent::Motion {
+                dev_id: 1,
+                dx: 9.0,
+                dy: 12.0,
+                dx_unaccel: 10.5,
+                dy_unaccel: 13.5,
+                time: 102,
+            }
+        );
+    }
+
+    #[test]
+    fn test_coalescing_interrupted_by_non_motion() {
+        let mut coalescer = MockCoalescer::new();
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 1.0,
+            dy: 2.0,
+            dx_unaccel: 1.0,
+            dy_unaccel: 2.0,
+            time: 100,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 3.0,
+            dy: 4.0,
+            dx_unaccel: 3.0,
+            dy_unaccel: 4.0,
+            time: 101,
+        });
+        coalescer.process_event(TestEvent::Button {
+            dev_id: 1,
+            button: 0x110,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 5.0,
+            dy: 6.0,
+            dx_unaccel: 5.0,
+            dy_unaccel: 6.0,
+            time: 102,
+        });
+        coalescer.finish();
+
+        assert_eq!(coalescer.dispatched.len(), 3);
+        assert_eq!(
+            coalescer.dispatched[0],
+            TestEvent::Motion {
+                dev_id: 1,
+                dx: 4.0,
+                dy: 6.0,
+                dx_unaccel: 4.0,
+                dy_unaccel: 6.0,
+                time: 101,
+            }
+        );
+        assert_eq!(
+            coalescer.dispatched[1],
+            TestEvent::Button {
+                dev_id: 1,
+                button: 0x110
+            }
+        );
+        assert_eq!(
+            coalescer.dispatched[2],
+            TestEvent::Motion {
+                dev_id: 1,
+                dx: 5.0,
+                dy: 6.0,
+                dx_unaccel: 5.0,
+                dy_unaccel: 6.0,
+                time: 102,
+            }
+        );
+    }
+
+    #[test]
+    fn test_coalescing_interrupted_by_different_device() {
+        let mut coalescer = MockCoalescer::new();
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 1.0,
+            dy: 2.0,
+            dx_unaccel: 1.0,
+            dy_unaccel: 2.0,
+            time: 100,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 2,
+            dx: 10.0,
+            dy: 20.0,
+            dx_unaccel: 10.0,
+            dy_unaccel: 20.0,
+            time: 101,
+        });
+        coalescer.process_event(TestEvent::Motion {
+            dev_id: 1,
+            dx: 3.0,
+            dy: 4.0,
+            dx_unaccel: 3.0,
+            dy_unaccel: 4.0,
+            time: 102,
+        });
+        coalescer.finish();
+
+        assert_eq!(coalescer.dispatched.len(), 3);
+        assert_eq!(
+            coalescer.dispatched[0],
+            TestEvent::Motion {
+                dev_id: 1,
+                dx: 1.0,
+                dy: 2.0,
+                dx_unaccel: 1.0,
+                dy_unaccel: 2.0,
+                time: 100,
+            }
+        );
+        assert_eq!(
+            coalescer.dispatched[1],
+            TestEvent::Motion {
+                dev_id: 2,
+                dx: 10.0,
+                dy: 20.0,
+                dx_unaccel: 10.0,
+                dy_unaccel: 20.0,
+                time: 101,
+            }
+        );
+        assert_eq!(
+            coalescer.dispatched[2],
+            TestEvent::Motion {
+                dev_id: 1,
+                dx: 3.0,
+                dy: 4.0,
+                dx_unaccel: 3.0,
+                dy_unaccel: 4.0,
+                time: 102,
+            }
+        );
     }
 }
