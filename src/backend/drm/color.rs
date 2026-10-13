@@ -1272,22 +1272,21 @@ impl DrmScanoutCapabilities {
                     } else {
                         203
                     };
-                    if !desc.windows_scrgb && tonemap_needed(desc, eff_ref_white as u32) {
-                        ScanoutPlan::VulkanFastDirectFlip
+                    // The renderer treats extended linear content as peaking at the sink's
+                    // luminance and ignores its MaxCLL (see the Vulkan `ExtLinear` path), so
+                    // no tone mapping decision is made from the declared peak here either.
+                    let conv = PlaneColorConversion::ScRgbToPq {
+                        reference_white: eff_ref_white,
+                    };
+                    if self.can_plane_colorop_execute(conv) && self.supports_fp16 {
+                        // Tier 2A: Plane COLOR_PIPELINE (colorop)
+                        ScanoutPlan::PlaneColorop(conv)
+                    } else if self.supports_scrgb_hardware_scanout() {
+                        // Tier 2B: CRTC Color Management
+                        ScanoutPlan::CrtcHardware(conv)
                     } else {
-                        let conv = PlaneColorConversion::ScRgbToPq {
-                            reference_white: eff_ref_white,
-                        };
-                        if self.can_plane_colorop_execute(conv) && self.supports_fp16 {
-                            // Tier 2A: Plane COLOR_PIPELINE (colorop)
-                            ScanoutPlan::PlaneColorop(conv)
-                        } else if self.supports_scrgb_hardware_scanout() {
-                            // Tier 2B: CRTC Color Management
-                            ScanoutPlan::CrtcHardware(conv)
-                        } else {
-                            // Tier 3: Vulkan Shader Fast Flip
-                            ScanoutPlan::VulkanFastDirectFlip
-                        }
+                        // Tier 3: Vulkan Shader Fast Flip
+                        ScanoutPlan::VulkanFastDirectFlip
                     }
                 }
                 Some(desc) if desc.transfer == TransferFunction::Hlg => {
@@ -1956,11 +1955,12 @@ mod tests {
         scrgb_desc.windows_scrgb = false;
         scrgb_desc.max_cll = Some(2000);
 
-        // Sink peak 1000 nits: requires tone mapping -> VulkanFastDirectFlip
+        // scRGB is never gated on its declared peak (the renderer ignores it too), so a sink
+        // peak below MaxCLL still scans out through hardware.
         let plan_scrgb_over = caps.evaluate_scanout_plan_with_peak(true, Some(&scrgb_desc), 203, Some(1000));
-        assert_eq!(plan_scrgb_over, ScanoutPlan::VulkanFastDirectFlip);
+        assert!(matches!(plan_scrgb_over, ScanoutPlan::CrtcHardware(_)));
 
-        // Sink peak 2500 nits: no tone mapping needed -> CrtcHardware (or PlaneColorop)
+        // Sink peak 2500 nits: CrtcHardware (or PlaneColorop)
         let plan_scrgb_under = caps.evaluate_scanout_plan_with_peak(true, Some(&scrgb_desc), 203, Some(2500));
         assert!(matches!(plan_scrgb_under, ScanoutPlan::CrtcHardware(_)));
 
