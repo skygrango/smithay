@@ -1086,6 +1086,7 @@ impl Renderer for VulkanRenderer {
             pending_waits,
             hdr_to_sdr: None,
             sdr_to_hdr: None,
+            release_source: None,
         })
     }
 
@@ -1236,6 +1237,7 @@ impl ImportDma for VulkanRenderer {
         if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
             if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
                 trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
+                image.set_current_layout(ImageLayout::GENERAL);
                 image.set_needs_acquire(true);
                 return Ok(image.clone());
             }
@@ -1382,6 +1384,7 @@ impl ImportDmaWl for VulkanRenderer {
         if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
             if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
                 trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
+                image.set_current_layout(ImageLayout::GENERAL);
                 image.set_needs_acquire(true);
                 return Ok(image.clone());
             }
@@ -1610,23 +1613,7 @@ impl VulkanRenderer {
         };
 
         let old_layout = image.current_layout();
-        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            (
-                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        } else {
-            (
-                PipelineStageFlags2::ALL_TRANSFER
-                    | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                    | PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::TRANSFER_WRITE
-                    | AccessFlags2::COLOR_ATTACHMENT_WRITE
-                    | AccessFlags2::SHADER_STORAGE_WRITE,
-            )
-        };
+        let (tex_src_stage, tex_src_access) = src_stage_and_access_for_layout(tex_needs_acquire, old_layout);
 
         let img_barrier = ImageMemoryBarrier2::default()
             .image(*image.vk())
@@ -1686,19 +1673,39 @@ impl VulkanRenderer {
             );
         }
 
-        let restore_layout = if old_layout == ImageLayout::UNDEFINED {
-            ImageLayout::GENERAL
-        } else {
-            old_layout
-        };
+        let (restore_layout, restore_src_q, restore_dst_q, restore_dst_stage, restore_dst_access) =
+            if tex_needs_acquire {
+                (
+                    ImageLayout::GENERAL,
+                    qfam,
+                    ext_queue,
+                    PipelineStageFlags2::NONE,
+                    AccessFlags2::NONE,
+                )
+            } else {
+                let layout = if old_layout == ImageLayout::UNDEFINED {
+                    ImageLayout::GENERAL
+                } else {
+                    old_layout
+                };
+                (
+                    layout,
+                    QUEUE_FAMILY_IGNORED,
+                    QUEUE_FAMILY_IGNORED,
+                    PipelineStageFlags2::ALL_COMMANDS,
+                    AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE,
+                )
+            };
         let restore_barrier = ImageMemoryBarrier2::default()
             .image(*image.vk())
             .old_layout(ImageLayout::TRANSFER_SRC_OPTIMAL)
             .new_layout(restore_layout)
+            .src_queue_family_index(restore_src_q)
+            .dst_queue_family_index(restore_dst_q)
             .src_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
             .src_access_mask(AccessFlags2::TRANSFER_READ)
-            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(restore_dst_stage)
+            .dst_access_mask(restore_dst_access)
             .subresource_range(
                 ImageSubresourceRange::default()
                     .aspect_mask(ImageAspectFlags::COLOR)
@@ -1717,6 +1724,9 @@ impl VulkanRenderer {
                 .map_err(Error::CommandBufferError)?;
         }
         image.set_current_layout(restore_layout);
+        if tex_needs_acquire {
+            image.set_needs_acquire(true);
+        }
 
         let cmd_buffer_info = [CommandBufferSubmitInfo::default().command_buffer(buf)];
         let next_seq_no = self.seq_no + 1;
@@ -1888,18 +1898,7 @@ impl VulkanRenderer {
         };
 
         let old_layout = image.current_layout();
-        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else {
-            (
-                PipelineStageFlags2::ALL_TRANSFER
-                    | PipelineStageFlags2::COMPUTE_SHADER
-                    | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::TRANSFER_WRITE
-                    | AccessFlags2::SHADER_STORAGE_WRITE
-                    | AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        };
+        let (tex_src_stage, tex_src_access) = src_stage_and_access_for_layout(tex_needs_acquire, old_layout);
 
         let img_barrier = ImageMemoryBarrier2::default()
             .image(*image.vk())
@@ -1959,19 +1958,39 @@ impl VulkanRenderer {
             );
         }
 
-        let restore_layout = if old_layout == ImageLayout::UNDEFINED {
-            ImageLayout::GENERAL
-        } else {
-            old_layout
-        };
+        let (restore_layout, restore_src_q, restore_dst_q, restore_dst_stage, restore_dst_access) =
+            if tex_needs_acquire {
+                (
+                    ImageLayout::GENERAL,
+                    qfam,
+                    ext_queue,
+                    PipelineStageFlags2::NONE,
+                    AccessFlags2::NONE,
+                )
+            } else {
+                let layout = if old_layout == ImageLayout::UNDEFINED {
+                    ImageLayout::GENERAL
+                } else {
+                    old_layout
+                };
+                (
+                    layout,
+                    QUEUE_FAMILY_IGNORED,
+                    QUEUE_FAMILY_IGNORED,
+                    PipelineStageFlags2::ALL_COMMANDS,
+                    AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE,
+                )
+            };
         let restore_barrier = ImageMemoryBarrier2::default()
             .image(*image.vk())
             .old_layout(ImageLayout::TRANSFER_SRC_OPTIMAL)
             .new_layout(restore_layout)
+            .src_queue_family_index(restore_src_q)
+            .dst_queue_family_index(restore_dst_q)
             .src_stage_mask(PipelineStageFlags2::ALL_TRANSFER)
             .src_access_mask(AccessFlags2::TRANSFER_READ)
-            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(AccessFlags2::MEMORY_READ | AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(restore_dst_stage)
+            .dst_access_mask(restore_dst_access)
             .subresource_range(
                 ImageSubresourceRange::default()
                     .aspect_mask(ImageAspectFlags::COLOR)
@@ -1990,6 +2009,9 @@ impl VulkanRenderer {
                 .map_err(Error::CommandBufferError)?;
         }
         image.set_current_layout(restore_layout);
+        if tex_needs_acquire {
+            image.set_needs_acquire(true);
+        }
 
         let cmd_buffer_info = [CommandBufferSubmitInfo::default().command_buffer(buf)];
         let next_seq_no = self.seq_no + 1;
@@ -2270,6 +2292,45 @@ pub fn is_hdr_vk_format(format: vk::Format) -> bool {
     )
 }
 
+fn src_stage_and_access_for_layout(
+    needs_acquire: bool,
+    old_layout: ImageLayout,
+) -> (PipelineStageFlags2, AccessFlags2) {
+    if needs_acquire || old_layout == ImageLayout::UNDEFINED {
+        (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+    } else if old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        (
+            PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            AccessFlags2::COLOR_ATTACHMENT_READ | AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )
+    } else if old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        (
+            PipelineStageFlags2::FRAGMENT_SHADER,
+            AccessFlags2::SHADER_SAMPLED_READ,
+        )
+    } else if old_layout == ImageLayout::TRANSFER_SRC_OPTIMAL {
+        (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_READ)
+    } else if old_layout == ImageLayout::TRANSFER_DST_OPTIMAL {
+        (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_WRITE)
+    } else {
+        (
+            PipelineStageFlags2::COMPUTE_SHADER
+                | PipelineStageFlags2::ALL_TRANSFER
+                | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                | PipelineStageFlags2::FRAGMENT_SHADER
+                | PipelineStageFlags2::HOST,
+            AccessFlags2::SHADER_STORAGE_READ
+                | AccessFlags2::SHADER_STORAGE_WRITE
+                | AccessFlags2::TRANSFER_READ
+                | AccessFlags2::TRANSFER_WRITE
+                | AccessFlags2::COLOR_ATTACHMENT_READ
+                | AccessFlags2::COLOR_ATTACHMENT_WRITE
+                | AccessFlags2::SHADER_SAMPLED_READ
+                | AccessFlags2::HOST_WRITE,
+        )
+    }
+}
+
 pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
     fb: &'frame mut VulkanFramebuffer,
@@ -2292,6 +2353,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     pub(crate) pending_waits: Vec<DrmSyncPoint>,
     pub(crate) hdr_to_sdr: Option<HdrOutputConfig>,
     pub(crate) sdr_to_hdr: Option<HdrOutputConfig>,
+    pub(crate) release_source: Option<VulkanImage>,
 }
 
 impl VulkanFrame<'_, '_> {
@@ -2438,25 +2500,7 @@ impl VulkanFrame<'_, '_> {
                 }
 
                 let (tex_src_stage, tex_src_access) =
-                    if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
-                        (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-                    } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                        (
-                            PipelineStageFlags2::FRAGMENT_SHADER,
-                            AccessFlags2::SHADER_SAMPLED_READ,
-                        )
-                    } else {
-                        (
-                            PipelineStageFlags2::COMPUTE_SHADER
-                                | PipelineStageFlags2::ALL_TRANSFER
-                                | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                                | PipelineStageFlags2::HOST,
-                            AccessFlags2::SHADER_STORAGE_WRITE
-                                | AccessFlags2::TRANSFER_WRITE
-                                | AccessFlags2::COLOR_ATTACHMENT_WRITE
-                                | AccessFlags2::HOST_WRITE,
-                        )
-                    };
+                    src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
 
                 let barrier = ImageMemoryBarrier2::default()
                     .image(*texture.vk())
@@ -2520,7 +2564,7 @@ impl VulkanFrame<'_, '_> {
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
 
-        let fb_needs_acquire = self.fb.0.needs_acquire();
+        let fb_needs_acquire = self.fb.0.needs_acquire() && self.fb.0.dmabuf_exportable();
         let (fb_src_queue, fb_dst_queue) = if fb_needs_acquire {
             (ext_queue, qfam)
         } else {
@@ -2528,19 +2572,7 @@ impl VulkanFrame<'_, '_> {
         };
 
         let fb_old_layout = self.fb.0.current_layout();
-        let (fb_src_stage, fb_src_access) = if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if fb_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            (
-                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        } else {
-            (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COMPUTE_SHADER,
-                AccessFlags2::TRANSFER_WRITE | AccessFlags2::SHADER_STORAGE_WRITE,
-            )
-        };
+        let (fb_src_stage, fb_src_access) = src_stage_and_access_for_layout(fb_needs_acquire, fb_old_layout);
 
         let fb_barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
@@ -2652,6 +2684,8 @@ impl VulkanFrame<'_, '_> {
                 .image(*depth_img.vk())
                 .old_layout(depth_old_layout)
                 .new_layout(ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(QUEUE_FAMILY_IGNORED)
                 .src_stage_mask(PipelineStageFlags2::NONE)
                 .src_access_mask(AccessFlags2::NONE)
                 .dst_stage_mask(
@@ -2792,7 +2826,7 @@ impl VulkanFrame<'_, '_> {
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
 
-        let fb_needs_acquire = self.fb.0.needs_acquire();
+        let fb_needs_acquire = self.fb.0.needs_acquire() && self.fb.0.dmabuf_exportable();
         let (fb_src_queue, fb_dst_queue) = if fb_needs_acquire {
             (ext_queue, qfam)
         } else {
@@ -2800,19 +2834,7 @@ impl VulkanFrame<'_, '_> {
         };
 
         let fb_old_layout = self.fb.0.current_layout();
-        let (fb_src_stage, fb_src_access) = if fb_needs_acquire || fb_old_layout == ImageLayout::UNDEFINED {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if fb_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            (
-                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        } else {
-            (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::TRANSFER_WRITE | AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        };
+        let (fb_src_stage, fb_src_access) = src_stage_and_access_for_layout(fb_needs_acquire, fb_old_layout);
 
         let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
         let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
@@ -2822,27 +2844,8 @@ impl VulkanFrame<'_, '_> {
         };
 
         let tex_old_layout = texture.current_layout();
-        let (tex_src_stage, tex_src_access) = if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED
-        {
-            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-        } else if tex_old_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            (
-                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-            (
-                PipelineStageFlags2::FRAGMENT_SHADER,
-                AccessFlags2::SHADER_SAMPLED_READ,
-            )
-        } else {
-            (
-                PipelineStageFlags2::ALL_TRANSFER | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::TRANSFER_READ
-                    | AccessFlags2::TRANSFER_WRITE
-                    | AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        };
+        let (tex_src_stage, tex_src_access) =
+            src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
 
         let fb_barrier = ImageMemoryBarrier2::default()
             .image(*self.fb.0.vk())
@@ -3277,25 +3280,7 @@ impl Frame for VulkanFrame<'_, '_> {
             let buf = self.get_or_create_cmd_buffer()?;
 
             let (tex_src_stage, tex_src_access) =
-                if tex_needs_acquire || tex_old_layout == ImageLayout::UNDEFINED {
-                    (PipelineStageFlags2::NONE, AccessFlags2::NONE)
-                } else if tex_old_layout == ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                    (
-                        PipelineStageFlags2::FRAGMENT_SHADER,
-                        AccessFlags2::SHADER_SAMPLED_READ,
-                    )
-                } else {
-                    (
-                        PipelineStageFlags2::COMPUTE_SHADER
-                            | PipelineStageFlags2::ALL_TRANSFER
-                            | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
-                            | PipelineStageFlags2::HOST,
-                        AccessFlags2::SHADER_STORAGE_WRITE
-                            | AccessFlags2::TRANSFER_WRITE
-                            | AccessFlags2::COLOR_ATTACHMENT_WRITE
-                            | AccessFlags2::HOST_WRITE,
-                    )
-                };
+                src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
 
             let tex_barrier = ImageMemoryBarrier2::default()
                 .image(*texture.vk())
@@ -3832,52 +3817,88 @@ impl Frame for VulkanFrame<'_, '_> {
         let qfam = self.renderer.device.queue_family_idx();
         let ext_queue = self.renderer.external_queue_family();
 
-        let current_layout = self.fb.0.current_layout();
-        let (src_stage, src_access) = if current_layout == ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
-            (
-                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )
-        } else {
-            (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_WRITE)
-        };
+        let mut release_barriers = Vec::with_capacity(2);
 
-        // For scanout release to ext_queue (VK_QUEUE_FAMILY_FOREIGN_EXT or VK_QUEUE_FAMILY_EXTERNAL),
-        // keep current_layout (e.g. COLOR_ATTACHMENT_OPTIMAL) instead of GENERAL.
-        // This avoids forcing an unnecessary DCC decompress pass in the driver and allows
-        // direct compressed scanout by DCN/KMS.
-        let new_layout = current_layout;
+        if self.fb.0.dmabuf_exportable() {
+            let current_layout = self.fb.0.current_layout();
+            let (src_stage, src_access) = src_stage_and_access_for_layout(false, current_layout);
 
-        let barrier = ImageMemoryBarrier2::default()
-            .image(*self.fb.0.vk())
-            .old_layout(current_layout)
-            .new_layout(new_layout)
-            .src_queue_family_index(qfam)
-            .dst_queue_family_index(ext_queue)
-            .src_stage_mask(src_stage)
-            .src_access_mask(src_access)
-            .dst_stage_mask(PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(AccessFlags2::NONE)
-            .subresource_range(
-                ImageSubresourceRange::default()
-                    .aspect_mask(ImageAspectFlags::COLOR)
-                    .layer_count(1)
-                    .level_count(1),
+            // Per Vulkan 1.3 spec (VK_EXT_image_drm_format_modifier & VK_EXT_queue_family_foreign),
+            // any image exported to an external/foreign consumer (DRM/KMS scanout, Wayland client, etc.)
+            // must be transitioned to VK_IMAGE_LAYOUT_GENERAL on queue family ownership release,
+            // with dstStageMask = NONE and dstAccessMask = NONE.
+            // Both Mesa RADV (radv_layout_dcc_compressed / radv_image_need_retile) and Intel ANV
+            // preserve and prepare DCC/CCS compression metadata for scanout when releasing to
+            // VK_QUEUE_FAMILY_FOREIGN_EXT with newLayout = VK_IMAGE_LAYOUT_GENERAL.
+            let new_layout = ImageLayout::GENERAL;
+
+            release_barriers.push(
+                ImageMemoryBarrier2::default()
+                    .image(*self.fb.0.vk())
+                    .old_layout(current_layout)
+                    .new_layout(new_layout)
+                    .src_queue_family_index(qfam)
+                    .dst_queue_family_index(ext_queue)
+                    .src_stage_mask(src_stage)
+                    .src_access_mask(src_access)
+                    .dst_stage_mask(PipelineStageFlags2::NONE)
+                    .dst_access_mask(AccessFlags2::NONE)
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .layer_count(1)
+                            .level_count(1),
+                    ),
             );
+            self.fb.0.set_current_layout(new_layout);
+            self.fb.0.set_needs_acquire(true);
+        }
+
+        if let Some(ref src_img) = self.release_source {
+            if !Arc::ptr_eq(&src_img.inner, &self.fb.0.inner)
+                && src_img.dmabuf_exportable()
+                && !src_img.needs_acquire()
+            {
+                let src_layout = src_img.current_layout();
+                let (src_stage, src_access) = src_stage_and_access_for_layout(false, src_layout);
+                let new_layout = ImageLayout::GENERAL;
+
+                release_barriers.push(
+                    ImageMemoryBarrier2::default()
+                        .image(*src_img.vk())
+                        .old_layout(src_layout)
+                        .new_layout(new_layout)
+                        .src_queue_family_index(qfam)
+                        .dst_queue_family_index(ext_queue)
+                        .src_stage_mask(src_stage)
+                        .src_access_mask(src_access)
+                        .dst_stage_mask(PipelineStageFlags2::NONE)
+                        .dst_access_mask(AccessFlags2::NONE)
+                        .subresource_range(
+                            ImageSubresourceRange::default()
+                                .aspect_mask(ImageAspectFlags::COLOR)
+                                .layer_count(1)
+                                .level_count(1),
+                        ),
+                );
+                src_img.set_current_layout(new_layout);
+                src_img.set_needs_acquire(true);
+            }
+        }
 
         unsafe {
-            self.renderer
-                .device
-                .vk()
-                .cmd_pipeline_barrier2(buf, &DependencyInfo::default().image_memory_barriers(&[barrier]));
+            if !release_barriers.is_empty() {
+                self.renderer.device.vk().cmd_pipeline_barrier2(
+                    buf,
+                    &DependencyInfo::default().image_memory_barriers(&release_barriers),
+                );
+            }
             self.renderer
                 .device
                 .vk()
                 .end_command_buffer(buf)
                 .map_err(Error::CommandBufferError)?;
         }
-
-        self.fb.0.set_needs_acquire(true);
 
         let prev_seq_no = self.renderer.seq_no;
         let next_seq_no = prev_seq_no + 1;
@@ -4056,6 +4077,7 @@ impl Blit for VulkanRenderer {
         self.downscale_filter = filter;
         self.upscale_filter = filter;
         let pending_waits = std::mem::take(&mut self.pending_waits);
+        let release_source = (from.0.needs_acquire() && from.0.dmabuf_exportable()).then(|| from.0.clone());
         let mut frame = VulkanFrame {
             renderer: self,
             fb: to,
@@ -4070,6 +4092,7 @@ impl Blit for VulkanRenderer {
             active_color_description: None,
             active_clip: None,
             is_blit: true,
+            release_source,
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
@@ -4124,6 +4147,7 @@ impl Blit for VulkanRenderer {
         self.downscale_filter = filter;
         self.upscale_filter = filter;
         let pending_waits = std::mem::take(&mut self.pending_waits);
+        let release_source = (from.0.needs_acquire() && from.0.dmabuf_exportable()).then(|| from.0.clone());
         let mut frame = VulkanFrame {
             renderer: self,
             fb: to,
@@ -4138,6 +4162,7 @@ impl Blit for VulkanRenderer {
             active_color_description: None,
             active_clip: None,
             is_blit: true,
+            release_source,
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
@@ -4187,6 +4212,7 @@ impl Blit for VulkanRenderer {
         self.downscale_filter = filter;
         self.upscale_filter = filter;
         let pending_waits = std::mem::take(&mut self.pending_waits);
+        let release_source = (from.0.needs_acquire() && from.0.dmabuf_exportable()).then(|| from.0.clone());
         let mut frame = VulkanFrame {
             renderer: self,
             fb: to,
@@ -4201,6 +4227,7 @@ impl Blit for VulkanRenderer {
             active_color_description: None,
             active_clip: None,
             is_blit: true,
+            release_source,
             rendering: false,
             depth_enabled: false,
             current_depth: 0.0,
@@ -4802,6 +4829,182 @@ mod test {
                 0,
                 "indirect_buffer len should reset after cleanup"
             );
+        }
+    }
+
+    #[test]
+    fn test_src_stage_and_access_for_layout() {
+        // Acquire from foreign/external queue or transition from UNDEFINED -> NONE / NONE
+        assert_eq!(
+            src_stage_and_access_for_layout(true, ImageLayout::GENERAL),
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        );
+        assert_eq!(
+            src_stage_and_access_for_layout(false, ImageLayout::UNDEFINED),
+            (PipelineStageFlags2::NONE, AccessFlags2::NONE)
+        );
+        // Same-queue transitions preserve exact producer stages/accesses
+        assert_eq!(
+            src_stage_and_access_for_layout(false, ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            (
+                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                AccessFlags2::COLOR_ATTACHMENT_READ | AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )
+        );
+        assert_eq!(
+            src_stage_and_access_for_layout(false, ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            (
+                PipelineStageFlags2::FRAGMENT_SHADER,
+                AccessFlags2::SHADER_SAMPLED_READ,
+            )
+        );
+        assert_eq!(
+            src_stage_and_access_for_layout(false, ImageLayout::TRANSFER_SRC_OPTIMAL),
+            (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_READ)
+        );
+        assert_eq!(
+            src_stage_and_access_for_layout(false, ImageLayout::TRANSFER_DST_OPTIMAL),
+            (PipelineStageFlags2::ALL_TRANSFER, AccessFlags2::TRANSFER_WRITE)
+        );
+    }
+
+    #[test]
+    fn test_dmabuf_and_internal_image_layout_and_queue_ownership() {
+        use crate::backend::allocator::{
+            Allocator, Fourcc, Modifier, dmabuf::AsDmabuf, vulkan::VulkanAllocator,
+        };
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+        let Ok(phds) = PhysicalDevice::enumerate(&instance) else {
+            return;
+        };
+
+        for phd in phds {
+            let Ok(mut renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+
+            // 1. Internal non-exportable image must start in UNDEFINED with needs_acquire = false
+            let mut internal_target = VulkanImage::new(
+                &renderer.device,
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
+                false,
+            )
+            .expect("Failed to create internal target VulkanImage");
+
+            assert!(!internal_target.dmabuf_exportable());
+            assert!(!internal_target.needs_acquire());
+            assert_eq!(internal_target.current_layout(), ImageLayout::UNDEFINED);
+
+            let rect = Rectangle::new((0, 0).into(), (64, 64).into());
+            {
+                let mut fb = renderer.bind(&mut internal_target).unwrap();
+                let mut frame = renderer
+                    .render(&mut fb, (64, 64).into(), Transform::Normal)
+                    .unwrap();
+                frame
+                    .draw_solid(rect, &[rect], Color32F::new(1.0, 0.0, 0.0, 1.0))
+                    .unwrap();
+                let _sync = frame.finish().unwrap();
+            }
+
+            // Internal non-exportable image must NOT be released to foreign queue on finish
+            assert!(!internal_target.needs_acquire());
+            assert_eq!(
+                internal_target.current_layout(),
+                ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            );
+
+            // 2. Test DMA-BUF exportable / imported lifecycle when supported by the device
+            let mut allocator = VulkanAllocator::from_renderer(
+                &renderer,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::SAMPLED,
+            );
+            if let Ok(exportable_img) =
+                allocator.create_buffer(64, 64, Fourcc::Abgr8888, &[Modifier::Linear, Modifier::Invalid])
+            {
+                // Newly allocated exportable image starts in UNDEFINED with needs_acquire = false
+                assert!(exportable_img.dmabuf_exportable());
+                assert!(!exportable_img.needs_acquire());
+                assert_eq!(exportable_img.current_layout(), ImageLayout::UNDEFINED);
+
+                if let Ok(mut dmabuf) = exportable_img.export() {
+                    // Importing an external DMA-BUF must initialize current_layout = GENERAL and needs_acquire = true
+                    let imported_tex = renderer
+                        .import_dmabuf(&dmabuf, None)
+                        .expect("Failed to import dmabuf");
+                    assert!(imported_tex.dmabuf_exportable());
+                    assert!(imported_tex.needs_acquire());
+                    assert_eq!(imported_tex.current_layout(), ImageLayout::GENERAL);
+
+                    // Binding and rendering into the DMA-BUF must release it to ext_queue in GENERAL on finish
+                    {
+                        let mut dmabuf_fb = renderer.bind(&mut dmabuf).expect("Failed to bind dmabuf");
+                        let mut frame = renderer
+                            .render(&mut dmabuf_fb, (64, 64).into(), Transform::Normal)
+                            .unwrap();
+                        frame
+                            .draw_solid(rect, &[rect], Color32F::new(0.0, 1.0, 0.0, 1.0))
+                            .unwrap();
+                        let _sync = frame.finish().unwrap();
+                        assert_eq!(dmabuf_fb.0.current_layout(), ImageLayout::GENERAL);
+                        assert!(dmabuf_fb.0.needs_acquire());
+                    }
+
+                    // Blitting from the finished DMA-BUF framebuffer to an internal framebuffer must
+                    // re-release the source DMA-BUF back to ext_queue in GENERAL
+                    {
+                        let dmabuf_fb = renderer.bind(&mut dmabuf).expect("Failed to bind dmabuf");
+                        let mut dst_fb = renderer.bind(&mut internal_target).unwrap();
+                        let _sync = renderer
+                            .blit(&dmabuf_fb, &mut dst_fb, rect, rect, TextureFilter::Linear)
+                            .expect("Blit from dmabuf_fb to internal_target failed");
+                        assert_eq!(dmabuf_fb.0.current_layout(), ImageLayout::GENERAL);
+                        assert!(dmabuf_fb.0.needs_acquire());
+                        assert!(!internal_target.needs_acquire());
+                    }
+
+                    // Sampling the imported DMA-BUF acquires it into SHADER_READ_ONLY_OPTIMAL,
+                    // and a subsequent import_dmabuf (next client buffer commit) resets it to GENERAL + needs_acquire
+                    {
+                        let tex = renderer.import_dmabuf(&dmabuf, None).unwrap();
+                        assert_eq!(tex.current_layout(), ImageLayout::GENERAL);
+                        assert!(tex.needs_acquire());
+
+                        let mut dst_fb = renderer.bind(&mut internal_target).unwrap();
+                        let mut frame = renderer
+                            .render(&mut dst_fb, (64, 64).into(), Transform::Normal)
+                            .unwrap();
+                        let src_f64 = Rectangle::new(Point::new(0.0, 0.0), Size::new(64.0, 64.0));
+                        frame
+                            .render_texture_from_to(&tex, src_f64, rect, &[rect], &[], Transform::Normal, 1.0)
+                            .unwrap();
+                        let _sync = frame.finish().unwrap();
+                        assert_eq!(tex.current_layout(), ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        assert!(!tex.needs_acquire());
+
+                        let reimported = renderer.import_dmabuf(&dmabuf, None).unwrap();
+                        assert_eq!(reimported.current_layout(), ImageLayout::GENERAL);
+                        assert!(reimported.needs_acquire());
+                    }
+                }
+            }
+
+            unsafe {
+                let _ = renderer.device.vk().device_wait_idle();
+            }
+            renderer.cleanup().expect("cleanup failed");
         }
     }
 }

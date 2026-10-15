@@ -302,8 +302,12 @@ impl VulkanImage {
             persistent_mapping: std::sync::Mutex::new(None),
             device: device.clone(),
             view: None,
-            current_layout: std::sync::atomic::AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
-            needs_acquire: std::sync::atomic::AtomicBool::new(true),
+            current_layout: std::sync::atomic::AtomicI32::new(if dmabuf.is_some() {
+                vk::ImageLayout::GENERAL.as_raw()
+            } else {
+                vk::ImageLayout::UNDEFINED.as_raw()
+            }),
+            needs_acquire: std::sync::atomic::AtomicBool::new(dmabuf.is_some()),
             dmabuf_exportable: modifiers.is_some() || dmabuf.is_some(),
             dmabuf_plane_count: dmabuf.map(|dmabuf| dmabuf.num_planes() as u32).unwrap_or(0),
             ycbcr: None,
