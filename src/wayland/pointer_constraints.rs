@@ -6,11 +6,12 @@ use std::{
     collections::{HashMap, hash_map},
     ops,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
+use portable_atomic::AtomicF64;
 use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},
     zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
@@ -24,7 +25,7 @@ use wayland_server::{
 use super::compositor::{self, RegionAttributes};
 use crate::{
     input::{SeatHandler, pointer::PointerHandle},
-    utils::{Logical, Point},
+    utils::{Client as ClientCoords, Logical, Point},
     wayland::{Dispatch2, GlobalData, GlobalDispatch2, seat::PointerUserData},
 };
 
@@ -264,6 +265,7 @@ impl PointerConstraintsState {
 pub struct PointerConstraintUserData<D: SeatHandler> {
     surface: WlSurface,
     pointer: Option<PointerHandle<D>>,
+    client_scale: Arc<AtomicF64>,
 }
 
 struct PointerConstraintData<D: SeatHandler + 'static> {
@@ -410,12 +412,14 @@ where
                 lifetime,
             } => {
                 let region = region.as_ref().map(compositor::get_region_attributes);
-                let pointer = pointer.data::<PointerUserData<D>>().unwrap().handle.clone();
+                let data = pointer.data::<PointerUserData<D>>().unwrap();
+                let pointer = data.handle.clone();
                 let handle = data_init.init(
                     id,
                     PointerConstraintUserData {
                         surface: surface.clone(),
                         pointer: pointer.clone(),
+                        client_scale: data.client_scale.clone(),
                     },
                 );
                 if let Some(pointer) = pointer {
@@ -444,12 +448,14 @@ where
                 lifetime,
             } => {
                 let region = region.as_ref().map(compositor::get_region_attributes);
-                let pointer = pointer.data::<PointerUserData<D>>().unwrap().handle.clone();
+                let data = pointer.data::<PointerUserData<D>>().unwrap();
+                let pointer = data.handle.clone();
                 let handle = data_init.init(
                     id,
                     PointerConstraintUserData {
                         surface: surface.clone(),
                         pointer: pointer.clone(),
+                        client_scale: data.client_scale.clone(),
                     },
                 );
                 if let Some(pointer) = pointer {
@@ -559,9 +565,11 @@ where
 
         match request {
             zwp_locked_pointer_v1::Request::SetCursorPositionHint { surface_x, surface_y } => {
+                let client_scale = self.client_scale.load(Ordering::Acquire);
+                let hint = Point::<f64, ClientCoords>::from((surface_x, surface_y)).to_logical(client_scale);
                 with_pointer_constraint(&self.surface, pointer, |constraint| {
                     if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
-                        locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
+                        locked.pending_cursor_position_hint = Some(hint);
                     }
                 });
             }
