@@ -8,22 +8,18 @@ use ash::vk::{
 
 use crate::backend::{
     renderer::vulkan::Error,
-    vulkan::{
-        Device,
-        device::{DeviceError, WeakDevice},
-        memory::MemoryUsagePreference,
-    },
+    vulkan::{Device, device::DeviceError, memory::MemoryUsagePreference},
 };
 
 /// Buffer for storing `VkDrawIndirectCommand` structures for multi-draw indirect calls.
 #[derive(Debug)]
 pub struct DrawIndirectBuffer {
-    device: WeakDevice,
     buffer: Buffer,
     memory: DeviceMemory,
     capacity: usize,
     len: usize,
     mapped: *mut DrawIndirectCommand,
+    device: Device,
 }
 
 // SAFETY: DrawIndirectBuffer owns the mapped pointer exclusively, and writes are synchronized.
@@ -87,12 +83,12 @@ impl DrawIndirectBuffer {
         };
 
         Ok(DrawIndirectBuffer {
-            device: device.downgrade(),
             buffer,
             memory,
             capacity: cap,
             len: 0,
             mapped,
+            device: device.clone(),
         })
     }
 
@@ -102,12 +98,8 @@ impl DrawIndirectBuffer {
             return Ok(());
         }
 
-        let Some(device) = self.device.upgrade() else {
-            return Err(Error::DeadDevice);
-        };
-
         let new_cap = (self.capacity * 2).max(required);
-        let new_buf = Self::new(&device, new_cap)?;
+        let new_buf = Self::new(&self.device, new_cap)?;
 
         let old = std::mem::replace(self, new_buf);
         if old.len > 0 && !old.mapped.is_null() && !self.mapped.is_null() {
@@ -178,15 +170,13 @@ impl DrawIndirectBuffer {
 
 impl Drop for DrawIndirectBuffer {
     fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                if !self.mapped.is_null() {
-                    let _ = device.vk().unmap_memory(self.memory);
-                    self.mapped = std::ptr::null_mut();
-                }
-                device.vk().destroy_buffer(self.buffer, None);
-                device.vk().free_memory(self.memory, None);
+        unsafe {
+            if !self.mapped.is_null() {
+                let _ = self.device.vk().unmap_memory(self.memory);
+                self.mapped = std::ptr::null_mut();
             }
+            self.device.vk().destroy_buffer(self.buffer, None);
+            self.device.vk().free_memory(self.memory, None);
         }
     }
 }
@@ -194,11 +184,11 @@ impl Drop for DrawIndirectBuffer {
 /// Manages a bindless descriptor indexing pool and descriptor set for texture arrays.
 #[derive(Debug)]
 pub struct BindlessDescriptorPool {
-    device: WeakDevice,
     pool: DescriptorPool,
     layout: DescriptorSetLayout,
     descriptor_set: DescriptorSet,
     max_textures: u32,
+    device: Device,
 }
 
 impl BindlessDescriptorPool {
@@ -266,11 +256,11 @@ impl BindlessDescriptorPool {
         };
 
         Ok(BindlessDescriptorPool {
-            device: device.downgrade(),
             pool,
             layout,
             descriptor_set: set,
             max_textures,
+            device: device.clone(),
         })
     }
 
@@ -279,10 +269,6 @@ impl BindlessDescriptorPool {
         if slot >= self.max_textures {
             return Err(Error::DescriptorPoolError(vk::Result::ERROR_OUT_OF_POOL_MEMORY));
         }
-
-        let Some(device) = self.device.upgrade() else {
-            return Err(Error::DeadDevice);
-        };
 
         let image_info = [vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -298,7 +284,7 @@ impl BindlessDescriptorPool {
             .image_info(&image_info)];
 
         unsafe {
-            device.vk().update_descriptor_sets(&write, &[]);
+            self.device.vk().update_descriptor_sets(&write, &[]);
         }
 
         Ok(())
@@ -322,11 +308,9 @@ impl BindlessDescriptorPool {
 
 impl Drop for BindlessDescriptorPool {
     fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                device.vk().destroy_descriptor_pool(self.pool, None);
-                device.vk().destroy_descriptor_set_layout(self.layout, None);
-            }
+        unsafe {
+            self.device.vk().destroy_descriptor_pool(self.pool, None);
+            self.device.vk().destroy_descriptor_set_layout(self.layout, None);
         }
     }
 }

@@ -3,10 +3,7 @@ use std::{collections::VecDeque, sync::Arc};
 use super::Error;
 use crate::backend::{
     renderer::vulkan::shaders::DescriptorSet,
-    vulkan::{
-        device::{Device, WeakDevice},
-        image::ImageInner,
-    },
+    vulkan::{device::Device, image::ImageInner},
 };
 
 use ash::vk::{
@@ -16,19 +13,19 @@ use ash::vk::{
 
 #[derive(Debug)]
 pub struct CommandPool {
-    device: WeakDevice,
     vk: VkCommandPool,
     pending_buffers: VecDeque<(u64, CommandBuffer, Vec<DescriptorSet>, Vec<Arc<ImageInner>>)>,
     recycled_buffers: Vec<CommandBuffer>,
+    device: Device,
 }
 
 impl CommandPool {
     pub(super) fn from_vk(device: &Device, vk: VkCommandPool) -> Self {
         CommandPool {
-            device: device.downgrade(),
             vk,
             pending_buffers: VecDeque::new(),
             recycled_buffers: Vec::new(),
+            device: device.clone(),
         }
     }
 
@@ -37,9 +34,7 @@ impl CommandPool {
     }
 
     pub fn create_and_begin_buffer(&mut self) -> Result<CommandBuffer, Error> {
-        let Some(device) = self.device.upgrade() else {
-            return Err(Error::DeadDevice);
-        };
+        let device = &self.device;
 
         let buf = if let Some(buf) = self.recycled_buffers.pop() {
             buf
@@ -95,28 +90,32 @@ impl CommandPool {
     pub fn is_empty(&self) -> bool {
         self.pending_buffers.is_empty()
     }
+
+    pub fn last_pending_seq(&self) -> Option<u64> {
+        self.pending_buffers.back().map(|(seq, _, _, _)| *seq)
+    }
 }
 
 impl Drop for CommandPool {
     fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
+        if !self.pending_buffers.is_empty() {
             unsafe {
-                let _ = device.vk().device_wait_idle();
+                let _ = self.device.wait_idle();
             }
+        }
 
-            let mut bufs = self
-                .pending_buffers
-                .drain(..)
-                .map(|(_, buf, _, _)| buf)
-                .collect::<Vec<_>>();
-            bufs.extend(self.recycled_buffers.drain(..));
+        let mut bufs = self
+            .pending_buffers
+            .drain(..)
+            .map(|(_, buf, _, _)| buf)
+            .collect::<Vec<_>>();
+        bufs.extend(self.recycled_buffers.drain(..));
 
-            unsafe {
-                if !bufs.is_empty() {
-                    device.vk().free_command_buffers(self.vk, &bufs);
-                }
-                device.vk().destroy_command_pool(self.vk, None);
+        unsafe {
+            if !bufs.is_empty() {
+                self.device.vk().free_command_buffers(self.vk, &bufs);
             }
+            self.device.vk().destroy_command_pool(self.vk, None);
         }
     }
 }

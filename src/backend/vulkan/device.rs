@@ -23,6 +23,15 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct Device(Arc<InnerDevice>);
+
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Device {}
+
 #[derive(Debug, Clone)]
 pub struct WeakDevice(Weak<InnerDevice>);
 
@@ -226,6 +235,7 @@ impl Device {
                 .or_else(|| phd.primary_node().ok().flatten()),
 
             queue,
+            queue_lock: std::sync::Mutex::new(()),
             queue_idx: queue_index as u32,
 
             context: ContextId::new(),
@@ -320,8 +330,36 @@ impl Device {
         &self.0.mem_properties
     }
 
+    pub fn physical_device(&self) -> &PhysicalDevice {
+        &self.0.phd
+    }
+
     pub fn queue(&self) -> &Queue {
         &self.0.queue
+    }
+
+    pub(crate) fn with_queue_lock<R>(&self, f: impl FnOnce(&VkDevice, Queue) -> R) -> R {
+        let _guard = self.0.queue_lock.lock().unwrap();
+        f(&self.0.vk, self.0.queue)
+    }
+
+    pub unsafe fn queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let _guard = self.0.queue_lock.lock().unwrap();
+        unsafe { self.0.vk.queue_submit2(self.0.queue, submits, fence) }
+    }
+
+    pub unsafe fn queue_wait_idle(&self) -> Result<(), vk::Result> {
+        let _guard = self.0.queue_lock.lock().unwrap();
+        unsafe { self.0.vk.queue_wait_idle(self.0.queue) }
+    }
+
+    pub unsafe fn wait_idle(&self) -> Result<(), vk::Result> {
+        let _guard = self.0.queue_lock.lock().unwrap();
+        unsafe { self.0.vk.device_wait_idle() }
     }
 
     pub fn queue_family_idx(&self) -> u32 {
@@ -517,6 +555,7 @@ struct InnerDevice {
     node: Option<DrmNode>,
 
     queue: Queue,
+    queue_lock: std::sync::Mutex<()>,
     queue_idx: u32,
 
     context: ContextId<VulkanImage>,
@@ -546,6 +585,7 @@ impl fmt::Debug for InnerDevice {
 impl Drop for InnerDevice {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.vk.device_wait_idle();
             for entry in self.ycbcr_conversions.lock().unwrap().values() {
                 self.vk.destroy_sampler(entry.sampler, None);
                 self.vk.destroy_sampler_ycbcr_conversion(entry.conversion, None);

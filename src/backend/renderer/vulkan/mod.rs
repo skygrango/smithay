@@ -18,7 +18,7 @@ use crate::{
         },
         vulkan::{
             Instance, PhysicalDevice, UnsupportedProperty,
-            device::{Device, DeviceError, QueueType, WeakDevice},
+            device::{Device, DeviceError, QueueType},
             format::{get_drm_format, get_vk_format, is_ycbcr_fourcc, known_formats},
             image::{Error as ImageError, ImageInner, ImageUsageFlags, VulkanImage},
             memory::MemoryUsagePreference,
@@ -47,12 +47,11 @@ use crate::{
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
 use ash::vk::{
-    self, AccessFlags2, BorderColor, CommandBufferSubmitInfo, CompareOp, DependencyInfo, DescriptorImageInfo,
-    DescriptorType, DrawIndirectCommand, Extent3D, Fence, Filter, FormatFeatureFlags, HostImageCopyFlagsEXT,
-    ImageAspectFlags, ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange,
-    MemoryMapFlags, MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint,
-    PipelineStageFlags2, QUEUE_FAMILY_IGNORED, Result as VkResult, SamplerAddressMode, SamplerCreateFlags,
-    SamplerCreateInfo, SamplerMipmapMode, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags,
+    self, AccessFlags2, CommandBufferSubmitInfo, DependencyInfo, DescriptorImageInfo, DescriptorType,
+    DrawIndirectCommand, Extent3D, Fence, FormatFeatureFlags, HostImageCopyFlagsEXT, ImageAspectFlags,
+    ImageLayout, ImageMemoryBarrier2, ImageSubresourceLayers, ImageSubresourceRange, MemoryMapFlags,
+    MemoryPropertyFlags, MemoryToImageCopyEXT, Offset3D, PipelineBindPoint, PipelineStageFlags2,
+    QUEUE_FAMILY_IGNORED, Result as VkResult, SemaphoreSubmitInfo, SemaphoreWaitInfo, ShaderStageFlags,
     SubmitInfo2,
 };
 use gbm::Modifier;
@@ -80,8 +79,8 @@ mod sync;
 
 pub use self::capabilities::*;
 pub use self::indirect::*;
-pub use self::shaders::Error as PipelineError;
 use self::shaders::Pipelines;
+pub use self::shaders::{Error as PipelineError, SharedPipelines};
 pub use self::sync::*;
 
 pub use crate::backend::vulkan::memory::MemoryBudgetInfo;
@@ -98,6 +97,7 @@ pub struct QueuedSubmit {
     pub point: u64,
     pub descs: Vec<self::shaders::DescriptorSet>,
     pub images: Vec<Arc<ImageInner>>,
+    pub sampled_images: Vec<VulkanImage>,
 }
 
 pub(crate) struct DeferredDestruction {
@@ -114,12 +114,12 @@ impl fmt::Debug for DeferredDestruction {
 }
 
 pub struct PendingVulkanShmCopy {
-    pub device: ash::Device,
+    pub device: Device,
     pub staging_buffer: vk::Buffer,
     pub staging_memory: vk::DeviceMemory,
     pub buffer_size: vk::DeviceSize,
     pub is_coherent: bool,
-    pub timeline_sem: vk::Semaphore,
+    pub timeline: sync::VulkanTimeline,
     pub point: u64,
     pub width: u32,
     pub height: u32,
@@ -149,11 +149,12 @@ impl PendingVulkanShmCopy {
         dst_offset: i32,
         dst_stride: i32,
     ) -> Result<(), vk::Result> {
-        let sems = [self.timeline_sem];
+        let vk = self.device.vk();
+        let sems = [self.timeline.vk];
         let vals = [self.point];
         let wait_info = SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
         loop {
-            let res = unsafe { self.device.wait_semaphores(&wait_info, 100_000_000) };
+            let res = unsafe { vk.wait_semaphores(&wait_info, 100_000_000) };
             match res {
                 Ok(()) => break,
                 Err(vk::Result::TIMEOUT) => continue,
@@ -161,10 +162,8 @@ impl PendingVulkanShmCopy {
             }
         }
 
-        let src_ptr = unsafe {
-            self.device
-                .map_memory(self.staging_memory, 0, self.buffer_size, MemoryMapFlags::empty())?
-        };
+        let src_ptr =
+            unsafe { vk.map_memory(self.staging_memory, 0, self.buffer_size, MemoryMapFlags::empty())? };
 
         if !self.is_coherent {
             let mapped_range = vk::MappedMemoryRange::default()
@@ -172,7 +171,7 @@ impl PendingVulkanShmCopy {
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             unsafe {
-                let _ = self.device.invalidate_mapped_memory_ranges(&[mapped_range]);
+                let _ = vk.invalidate_mapped_memory_ranges(&[mapped_range]);
             }
         }
 
@@ -188,9 +187,9 @@ impl PendingVulkanShmCopy {
         }
 
         unsafe {
-            self.device.unmap_memory(self.staging_memory);
-            self.device.destroy_buffer(self.staging_buffer, None);
-            self.device.free_memory(self.staging_memory, None);
+            vk.unmap_memory(self.staging_memory);
+            vk.destroy_buffer(self.staging_buffer, None);
+            vk.free_memory(self.staging_memory, None);
         }
         self.staging_buffer = vk::Buffer::null();
         self.staging_memory = vk::DeviceMemory::null();
@@ -201,19 +200,20 @@ impl PendingVulkanShmCopy {
 
 impl Drop for PendingVulkanShmCopy {
     fn drop(&mut self) {
+        let vk = self.device.vk();
         if self.staging_buffer != vk::Buffer::null() {
             unsafe {
-                let sems = [self.timeline_sem];
+                let sems = [self.timeline.vk];
                 let vals = [self.point];
                 let wait_info = SemaphoreWaitInfo::default().semaphores(&sems).values(&vals);
-                let _ = self.device.wait_semaphores(&wait_info, 100_000_000);
-                self.device.destroy_buffer(self.staging_buffer, None);
+                let _ = vk.wait_semaphores(&wait_info, 100_000_000);
+                vk.destroy_buffer(self.staging_buffer, None);
                 self.staging_buffer = vk::Buffer::null();
             }
         }
         if self.staging_memory != vk::DeviceMemory::null() {
             unsafe {
-                self.device.free_memory(self.staging_memory, None);
+                vk.free_memory(self.staging_memory, None);
                 self.staging_memory = vk::DeviceMemory::null();
             }
         }
@@ -223,7 +223,7 @@ impl Drop for PendingVulkanShmCopy {
 #[derive(Debug)]
 pub struct VulkanRenderer {
     capabilities: Vec<Capability>,
-    dmabuf_cache: HashMap<WeakDmabuf, VulkanImage>,
+    dmabuf_cache: Arc<std::sync::Mutex<HashMap<WeakDmabuf, VulkanImage>>>,
 
     pipelines: Pipelines,
     cmd_pool: cmds::CommandPool,
@@ -263,7 +263,14 @@ pub struct VulkanRenderer {
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.vk().device_wait_idle();
+            if let Some(last_seq) = self.cmd_pool.last_pending_seq() {
+                while let Err(VkResult::TIMEOUT) = self.device.vk().wait_semaphores(
+                    &SemaphoreWaitInfo::default()
+                        .semaphores(&[self.timeline.vk])
+                        .values(&[last_seq]),
+                    u64::MAX,
+                ) {}
+            }
             for q in self.queued_submits.drain(..) {
                 self.device
                     .vk()
@@ -274,14 +281,12 @@ impl Drop for VulkanRenderer {
             for destruction in self.deferred_destructions.drain(..) {
                 (destruction.callback)(&self.device);
             }
-            self.dmabuf_cache.clear();
+            if Arc::strong_count(&self.dmabuf_cache) == 1 {
+                self.dmabuf_cache.lock().unwrap().clear();
+            }
             if let Some(mut lut) = self.lut3d.take() {
                 lut.destroy(&self.device);
             }
-            self.device.vk().destroy_sampler(self.texture_sampler, None);
-            self.device
-                .vk()
-                .destroy_sampler(self.texture_sampler_nearest, None);
             for (_, sem) in self.imported_timelines.drain() {
                 self.device.vk().destroy_semaphore(sem, None);
             }
@@ -331,8 +336,6 @@ pub enum Error {
     SubmitError(#[source] VkResult),
     #[error("Error intefacing with the underlying drm device")]
     DrmError(#[source] std::io::Error),
-    #[error("Underlying Vulkan Device was destroyed")]
-    DeadDevice,
     #[cfg(feature = "wayland_frontend")]
     #[error("Unsupported wl_shm pixel format: `{0:?}`")]
     UnsupportedWlPixelFormat(wayland_server::protocol::wl_shm::Format),
@@ -349,10 +352,11 @@ impl VulkanRenderer {
     pub const MIN_DEVICE_VERSION: Version = Version::VERSION_1_3;
     pub const MAX_INSTANCE_VERSION: Version = Version::VERSION_1_3;
 
-    //#[instrument(err, skip(phd), fields(physical_device = phd.name()))]
-    pub fn new(phd: &PhysicalDevice, drm: Option<DrmDeviceFd>) -> Result<VulkanRenderer, Error> {
+    /// Validate that a [`PhysicalDevice`] meets the version, feature, and optional DRM node
+    /// requirements of [`VulkanRenderer`] without creating a logical `VkDevice`.
+    pub fn check_physical_device(phd: &PhysicalDevice, drm: Option<&DrmDeviceFd>) -> Result<(), Error> {
         // Check matching drm descriptor, if provided
-        let node = if let Some(fd) = drm.as_ref() {
+        if let Some(fd) = drm {
             let node = DrmNode::from_file(fd).map_err(|_| Error::MismatchedDrmDevice)?;
             let dev_render_node = node.node_with_type(NodeType::Render).and_then(Result::ok);
             let dev_primary_node = node.node_with_type(NodeType::Primary).and_then(Result::ok);
@@ -369,10 +373,7 @@ impl VulkanRenderer {
             if !matches {
                 return Err(Error::MismatchedDrmDevice);
             }
-            Some(node)
-        } else {
-            phd.render_node().ok().flatten()
-        };
+        }
 
         // Check instance version
         if phd.api_version() < Self::MIN_DEVICE_VERSION
@@ -386,6 +387,15 @@ impl VulkanRenderer {
         if let Err(feat) = supported_features.has_required_features() {
             return Err(Error::MissingFeature(feat));
         }
+
+        Ok(())
+    }
+
+    //#[instrument(err, skip(phd), fields(physical_device = phd.name()))]
+    pub fn new(phd: &PhysicalDevice, drm: Option<DrmDeviceFd>) -> Result<VulkanRenderer, Error> {
+        Self::check_physical_device(phd, drm.as_ref())?;
+
+        let supported_features = Features::supported_features(phd);
         let mut required_features = Features::required_features();
 
         // Check optional extensions
@@ -423,8 +433,68 @@ impl VulkanRenderer {
             true,
         )?;
 
-        // Create pipelines
-        let pipelines = Pipelines::new(&device)?;
+        Self::with_device(
+            &device,
+            drm,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            None,
+        )
+    }
+
+    /// Create a [`VulkanRenderer`] sharing an existing [`Device`], `dmabuf_cache`, and optional [`SharedPipelines`].
+    pub fn with_device(
+        device: &Device,
+        drm: Option<DrmDeviceFd>,
+        dmabuf_cache: Arc<std::sync::Mutex<HashMap<WeakDmabuf, VulkanImage>>>,
+        shared_pipelines: Option<Arc<SharedPipelines>>,
+    ) -> Result<VulkanRenderer, Error> {
+        let phd = device.physical_device();
+
+        // Check matching drm descriptor, if provided
+        let node = if let Some(fd) = drm.as_ref() {
+            let node = DrmNode::from_file(fd).map_err(|_| Error::MismatchedDrmDevice)?;
+            let dev_render_node = node.node_with_type(NodeType::Render).and_then(Result::ok);
+            let dev_primary_node = node.node_with_type(NodeType::Primary).and_then(Result::ok);
+            let matches = phd
+                .render_node()
+                .ok()
+                .flatten()
+                .is_some_and(|n| n == node || Some(n) == dev_render_node)
+                || phd
+                    .primary_node()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|n| n == node || Some(n) == dev_primary_node);
+            if !matches {
+                return Err(Error::MismatchedDrmDevice);
+            }
+            Some(node)
+        } else {
+            phd.render_node().ok().flatten()
+        };
+
+        let mut capabilities = Vec::new();
+        capabilities.extend(Capability::supports_dmabuf_memory(phd));
+        capabilities.extend(Capability::supports_export_timeline(phd));
+        capabilities.extend(Capability::supports_host_image_copy(phd));
+        capabilities.extend(Capability::supports_queue_family_foreign(phd));
+        capabilities.extend(Capability::supports_push_descriptor(phd));
+        capabilities.extend(Capability::supports_memory_budget(phd));
+        capabilities.extend(Capability::supports_dynamic_rendering(phd));
+        capabilities.extend(Capability::supports_descriptor_indexing(phd));
+        capabilities.extend(Capability::supports_multi_draw_indirect(phd));
+        capabilities.extend(Capability::supports_shader_draw_parameters(phd));
+        capabilities.extend(Capability::supports_memory_priority(phd));
+        capabilities.extend(Capability::supports_global_priority(phd));
+
+        // Create or reuse shared pipelines
+        let shared_pipelines = match shared_pipelines {
+            Some(shared) => shared,
+            None => SharedPipelines::new(device)?,
+        };
+        let sampler = shared_pipelines.texture_sampler();
+        let sampler_nearest = shared_pipelines.texture_sampler_nearest();
+        let pipelines = Pipelines::from_shared(shared_pipelines);
 
         // Create command pool
         let cmd_pool = device.create_command_pool()?;
@@ -436,58 +506,6 @@ impl VulkanRenderer {
             } else {
                 None
             })?;
-
-        let sampler = unsafe {
-            device
-                .vk()
-                .create_sampler(
-                    &SamplerCreateInfo::default()
-                        .flags(SamplerCreateFlags::empty())
-                        .mag_filter(Filter::LINEAR)
-                        .min_filter(Filter::LINEAR)
-                        .mipmap_mode(SamplerMipmapMode::NEAREST)
-                        .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .mip_lod_bias(0.0)
-                        .anisotropy_enable(false)
-                        .max_anisotropy(0.0)
-                        .compare_enable(false)
-                        .compare_op(CompareOp::NEVER)
-                        .min_lod(0.0)
-                        .max_lod(0.0)
-                        .border_color(BorderColor::FLOAT_TRANSPARENT_BLACK)
-                        .unnormalized_coordinates(false),
-                    None,
-                )
-                .map_err(Error::SamplerError)?
-        };
-
-        let sampler_nearest = unsafe {
-            device
-                .vk()
-                .create_sampler(
-                    &SamplerCreateInfo::default()
-                        .flags(SamplerCreateFlags::empty())
-                        .mag_filter(Filter::NEAREST)
-                        .min_filter(Filter::NEAREST)
-                        .mipmap_mode(SamplerMipmapMode::NEAREST)
-                        .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
-                        .mip_lod_bias(0.0)
-                        .anisotropy_enable(false)
-                        .max_anisotropy(0.0)
-                        .compare_enable(false)
-                        .compare_op(CompareOp::NEVER)
-                        .min_lod(0.0)
-                        .max_lod(0.0)
-                        .border_color(BorderColor::FLOAT_TRANSPARENT_BLACK)
-                        .unnormalized_coordinates(false),
-                    None,
-                )
-                .map_err(Error::SamplerError)?
-        };
 
         let supports_optimal_host_copy = if capabilities.contains(&Capability::HostImageCopy) {
             let mut hic_props = vk::PhysicalDeviceHostImageCopyPropertiesEXT::default();
@@ -501,7 +519,7 @@ impl VulkanRenderer {
                 true
             } else {
                 VulkanImage::new_with_fourcc(
-                    &device,
+                    device,
                     1,
                     1,
                     Fourcc::Abgr8888,
@@ -526,7 +544,7 @@ impl VulkanRenderer {
         let supports_shader_draw_parameters = capabilities.contains(&Capability::ShaderDrawParameters);
 
         let indirect_buffer = if supports_multi_draw_indirect {
-            match DrawIndirectBuffer::new(&device, DrawIndirectBuffer::DEFAULT_CAPACITY) {
+            match DrawIndirectBuffer::new(device, DrawIndirectBuffer::DEFAULT_CAPACITY) {
                 Ok(buf) => {
                     tracing::debug!(
                         "Vulkan DrawIndirectBuffer initialized for multi-draw indirect dispatches"
@@ -546,7 +564,7 @@ impl VulkanRenderer {
         };
 
         let bindless_pool = if supports_descriptor_indexing {
-            match BindlessDescriptorPool::new(&device, BindlessDescriptorPool::DEFAULT_MAX_TEXTURES) {
+            match BindlessDescriptorPool::new(device, BindlessDescriptorPool::DEFAULT_MAX_TEXTURES) {
                 Ok(pool) => {
                     tracing::debug!("Vulkan BindlessDescriptorPool initialized for descriptor indexing");
                     Some(pool)
@@ -565,9 +583,9 @@ impl VulkanRenderer {
 
         Ok(VulkanRenderer {
             phd: phd.clone(),
-            device,
+            device: device.clone(),
             capabilities,
-            dmabuf_cache: HashMap::new(),
+            dmabuf_cache,
             pipelines,
             cmd_pool,
             texture_sampler: sampler,
@@ -593,6 +611,52 @@ impl VulkanRenderer {
             depth_image: None,
             deferred_destructions: VecDeque::new(),
         })
+    }
+
+    /// Query the supported DMA-BUF texture formats for a [`PhysicalDevice`] without creating a `VkDevice`.
+    pub fn supported_dmabuf_formats(phd: &PhysicalDevice) -> FormatSet {
+        phd.drm_formats().into_iter().map(|entry| entry.format).collect()
+    }
+
+    /// Query the supported render target formats for a [`PhysicalDevice`] without creating a `VkDevice`.
+    pub fn supported_render_formats(phd: &PhysicalDevice) -> Option<FormatSet> {
+        known_formats()
+            .iter()
+            .try_fold(IndexSet::new(), |mut set, fourcc| {
+                let format = get_vk_format(*fourcc).unwrap();
+                let props = phd.get_format_modifier_properties(format)?;
+                for prop in props {
+                    if prop
+                        .drm_format_modifier_tiling_features
+                        .contains(FormatFeatureFlags::COLOR_ATTACHMENT)
+                        || prop
+                            .drm_format_modifier_tiling_features
+                            .contains(FormatFeatureFlags::STORAGE_IMAGE)
+                    {
+                        set.insert(Format {
+                            code: *fourcc,
+                            modifier: Modifier::from(prop.drm_format_modifier),
+                        });
+                        if let Some(opaque) = get_opaque(*fourcc) {
+                            set.insert(Format {
+                                code: opaque,
+                                modifier: Modifier::from(prop.drm_format_modifier),
+                            });
+                        }
+                    }
+                }
+                Result::<_, UnsupportedProperty>::Ok(set)
+            })
+            .ok()
+            .map(FormatSet::from_formats)
+    }
+
+    pub fn dmabuf_cache(&self) -> &Arc<std::sync::Mutex<HashMap<WeakDmabuf, VulkanImage>>> {
+        &self.dmabuf_cache
+    }
+
+    pub fn shared_pipelines(&self) -> &Arc<SharedPipelines> {
+        self.pipelines.shared()
     }
 
     /// Whether this renderer supports descriptor indexing (bindless texture arrays).
@@ -653,37 +717,152 @@ impl VulkanRenderer {
             return Ok(());
         }
 
-        let queued = std::mem::take(&mut self.queued_submits);
-        let mut submit_infos = Vec::with_capacity(queued.len());
-        for q in &queued {
-            submit_infos.push(
-                SubmitInfo2::default()
-                    .command_buffer_infos(&q.cmd_buffer_infos)
-                    .signal_semaphore_infos(&q.signal_semaphore_infos)
-                    .wait_semaphore_infos(&q.wait_semaphore_infos),
-            );
-        }
+        let mut queued = std::mem::take(&mut self.queued_submits);
+        let device = self.device.clone();
 
-        let res = unsafe {
-            self.device
-                .vk()
-                .queue_submit2(*self.device.queue(), &submit_infos, Fence::null())
-        };
+        let submit_res = device.with_queue_lock(|_vk, queue| {
+            let mut acquire_bufs: Vec<Option<vk::CommandBuffer>> = Vec::with_capacity(queued.len());
+            for q in &mut queued {
+                match self.record_acquire_cmd_buffer(&q.sampled_images) {
+                    Ok(Some(abuf)) => {
+                        q.cmd_buffer_infos
+                            .insert(0, CommandBufferSubmitInfo::default().command_buffer(abuf));
+                        acquire_bufs.push(Some(abuf));
+                    }
+                    Ok(None) => {
+                        acquire_bufs.push(None);
+                    }
+                    Err(err) => {
+                        for abuf in acquire_bufs.into_iter().flatten() {
+                            unsafe {
+                                device.vk().free_command_buffers(self.cmd_pool.vk(), &[abuf]);
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
+            }
 
-        if let Err(err) = res {
-            if err == vk::Result::ERROR_DEVICE_LOST {
-                return Err(Error::DeadDevice);
-            } else {
+            let mut submit_infos = Vec::with_capacity(queued.len());
+            for q in &queued {
+                submit_infos.push(
+                    SubmitInfo2::default()
+                        .command_buffer_infos(&q.cmd_buffer_infos)
+                        .signal_semaphore_infos(&q.signal_semaphore_infos)
+                        .wait_semaphore_infos(&q.wait_semaphore_infos),
+                );
+            }
+
+            let res = unsafe { device.vk().queue_submit2(queue, &submit_infos, Fence::null()) };
+            if let Err(err) = res {
+                for abuf in acquire_bufs.into_iter().flatten() {
+                    unsafe {
+                        device.vk().free_command_buffers(self.cmd_pool.vk(), &[abuf]);
+                    }
+                }
                 return Err(Error::SubmitError(err));
             }
-        }
 
-        for q in queued {
+            Ok(acquire_bufs)
+        });
+
+        let acquire_bufs = match submit_res {
+            Ok(abufs) => abufs,
+            Err(err) => {
+                for q in queued {
+                    unsafe {
+                        self.device
+                            .vk()
+                            .free_command_buffers(self.cmd_pool.vk(), &[q.cmd_buffer]);
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        for (q, abuf) in queued.into_iter().zip(acquire_bufs) {
+            if let Some(abuf) = abuf {
+                self.cmd_pool
+                    .store_pending_buffer(abuf, q.point, Vec::new(), Vec::new());
+            }
             self.cmd_pool
                 .store_pending_buffer(q.cmd_buffer, q.point, q.descs, q.images);
         }
 
         Ok(())
+    }
+
+    fn record_acquire_cmd_buffer(
+        &mut self,
+        sampled_images: &[VulkanImage],
+    ) -> Result<Option<vk::CommandBuffer>, Error> {
+        if sampled_images.is_empty() {
+            return Ok(None);
+        }
+        let qfam = self.device.queue_family_idx();
+        let ext_queue = self.external_queue_family();
+        let mut barriers = Vec::new();
+        let mut transitioned: Vec<&VulkanImage> = Vec::new();
+
+        for texture in sampled_images {
+            let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
+            let tex_old_layout = texture.current_layout();
+            let needs_tex_barrier =
+                tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+            if needs_tex_barrier {
+                if transitioned.iter().any(|t| Arc::ptr_eq(&t.inner, &texture.inner)) {
+                    continue;
+                }
+                let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
+                    (ext_queue, qfam)
+                } else {
+                    (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
+                };
+                let (tex_src_stage, tex_src_access) =
+                    src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
+
+                barriers.push(
+                    ImageMemoryBarrier2::default()
+                        .image(*texture.vk())
+                        .old_layout(tex_old_layout)
+                        .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_queue_family_index(tex_src_queue)
+                        .dst_queue_family_index(tex_dst_queue)
+                        .src_stage_mask(tex_src_stage)
+                        .src_access_mask(tex_src_access)
+                        .dst_stage_mask(PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
+                        .subresource_range(
+                            ImageSubresourceRange::default()
+                                .aspect_mask(ImageAspectFlags::COLOR)
+                                .layer_count(1)
+                                .level_count(1),
+                        ),
+                );
+                transitioned.push(texture);
+            }
+        }
+
+        if barriers.is_empty() {
+            return Ok(None);
+        }
+
+        let buf = self.cmd_pool.create_and_begin_buffer()?;
+        unsafe {
+            self.device
+                .vk()
+                .cmd_pipeline_barrier2(buf, &DependencyInfo::default().image_memory_barriers(&barriers));
+            self.device
+                .vk()
+                .end_command_buffer(buf)
+                .map_err(Error::CommandBufferError)?;
+        }
+        for tex in transitioned {
+            tex.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            tex.set_needs_acquire(false);
+        }
+        Ok(Some(buf))
     }
 
     pub fn device(&self) -> &Device {
@@ -811,10 +990,11 @@ impl VulkanRenderer {
     }
 
     pub fn cleanup(&mut self) -> Result<(), Error> {
-        let val = match unsafe { self.device.vk().get_semaphore_counter_value(self.timeline.vk) } {
-            Ok(val) => val,
-            Err(vk::Result::ERROR_DEVICE_LOST) => return Err(Error::DeadDevice),
-            Err(err) => return Err(Error::SemaphoreCounterError(err)),
+        let val = unsafe {
+            self.device
+                .vk()
+                .get_semaphore_counter_value(self.timeline.vk)
+                .map_err(Error::SemaphoreCounterError)?
         };
         self.cmd_pool.clean_old_buffers(val);
         if self.cmd_pool.is_empty() {
@@ -997,6 +1177,30 @@ impl VulkanRenderer {
             }
         }
 
+        // Transition host-uploaded sampled textures (SHM, import_memory, NinePatch) immediately
+        // to SHADER_READ_ONLY_OPTIMAL on the host so multiple output threads can sample them
+        // concurrently without needing any GPU pipeline barrier or mutating current_layout.
+        if image.vk_usage().contains(ImageUsageFlags::SAMPLED)
+            && !image.dmabuf_exportable()
+            && !image.vk_usage().contains(ImageUsageFlags::COLOR_ATTACHMENT)
+        {
+            unsafe {
+                device_copy
+                    .transition_image_layout(&[vk::HostImageLayoutTransitionInfoEXT::default()
+                        .old_layout(ImageLayout::GENERAL)
+                        .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(*image.vk())
+                        .subresource_range(
+                            ImageSubresourceRange::default()
+                                .aspect_mask(ImageAspectFlags::COLOR)
+                                .layer_count(1)
+                                .level_count(1),
+                        )])
+                    .map_err(Error::HostImageTransitionError)?;
+            }
+            image.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+
         Ok(())
     }
 
@@ -1073,6 +1277,7 @@ impl Renderer for VulkanRenderer {
             cmd_buffer: None,
             descriptors: Vec::with_capacity(16),
             images: Vec::with_capacity(16),
+            sampled_images: Vec::with_capacity(16),
             has_draws: false,
             _marker: std::marker::PhantomData,
             #[cfg(feature = "wayland_frontend")]
@@ -1115,12 +1320,15 @@ impl Renderer for VulkanRenderer {
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         let _ = self.cleanup();
-        self.dmabuf_cache.retain(|weak, _| weak.upgrade().is_some());
+        self.dmabuf_cache
+            .lock()
+            .unwrap()
+            .retain(|weak, _| weak.upgrade().is_some());
         Ok(())
     }
 
     fn invalidate_caches(&mut self) -> Result<(), Self::Error> {
-        self.dmabuf_cache.clear();
+        self.dmabuf_cache.lock().unwrap().clear();
         let _ = self.cleanup();
         Ok(())
     }
@@ -1234,19 +1442,22 @@ impl ImportDma for VulkanRenderer {
             None
         };
         let required_usage = ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC;
-        if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
+        if let Some(image) = self.dmabuf_cache.lock().unwrap().get(&dmabuf.weak()).cloned() {
             if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
                 trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
                 image.set_current_layout(ImageLayout::GENERAL);
                 image.set_needs_acquire(true);
-                return Ok(image.clone());
+                return Ok(image);
             }
         }
 
         let image = VulkanImage::new_from_dmabuf_with_ycbcr(&self.device, dmabuf, required_usage, ycbcr_key)
             .map_err(Error::ImageError)?;
 
-        self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
+        self.dmabuf_cache
+            .lock()
+            .unwrap()
+            .insert(dmabuf.weak(), image.clone());
         Ok(image)
     }
 
@@ -1381,32 +1592,35 @@ impl ImportDmaWl for VulkanRenderer {
         };
 
         let required_usage = ImageUsageFlags::SAMPLED | ImageUsageFlags::TRANSFER_SRC;
-        if let Some(image) = self.dmabuf_cache.get(&dmabuf.weak()) {
+        if let Some(image) = self.dmabuf_cache.lock().unwrap().get(&dmabuf.weak()).cloned() {
             if image.vk_usage().contains(required_usage) && image.ycbcr() == ycbcr_key {
                 trace!("Re-using VulkanImage {:?} for {:?}", image.vk(), dmabuf);
                 image.set_current_layout(ImageLayout::GENERAL);
                 image.set_needs_acquire(true);
-                return Ok(image.clone());
+                return Ok(image);
             }
         }
 
         let image = VulkanImage::new_from_dmabuf_with_ycbcr(&self.device, dmabuf, required_usage, ycbcr_key)
             .map_err(Error::ImageError)?;
 
-        self.dmabuf_cache.insert(dmabuf.weak(), image.clone());
+        self.dmabuf_cache
+            .lock()
+            .unwrap()
+            .insert(dmabuf.weak(), image.clone());
         Ok(image)
     }
 }
 
 pub enum VulkanMapping {
-    Mapped(NonNull<u8>, usize, VulkanImage, WeakDevice),
+    Mapped(NonNull<u8>, usize, VulkanImage),
     Copied(Vec<u8>, VulkanImage),
 }
 
 impl fmt::Debug for VulkanMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Mapped(_, _, image, _) => f
+            Self::Mapped(_, _, image) => f
                 .debug_struct("VulkanMapping::Mapped")
                 .field("image", image)
                 .finish_non_exhaustive(),
@@ -1432,17 +1646,17 @@ impl TextureMapping for VulkanMapping {
 
 impl Texture for VulkanMapping {
     fn width(&self) -> u32 {
-        let (Self::Mapped(_, _, image, _) | Self::Copied(_, image)) = self;
+        let (Self::Mapped(_, _, image) | Self::Copied(_, image)) = self;
         image.width()
     }
 
     fn height(&self) -> u32 {
-        let (Self::Mapped(_, _, image, _) | Self::Copied(_, image)) = self;
+        let (Self::Mapped(_, _, image) | Self::Copied(_, image)) = self;
         image.height()
     }
 
     fn format(&self) -> Option<Fourcc> {
-        let (Self::Mapped(_, _, image, _) | Self::Copied(_, image)) = self;
+        let (Self::Mapped(_, _, image) | Self::Copied(_, image)) = self;
         get_drm_format(image.format())
     }
 }
@@ -1495,7 +1709,6 @@ impl VulkanRenderer {
                 unsafe { NonNull::new_unchecked(ptr as *mut _) },
                 layout.size as usize,
                 image.clone(),
-                self.device.downgrade(),
             ))
         } else {
             self.copy_image_via_staging_buffer(image, region, format)
@@ -1508,6 +1721,12 @@ impl VulkanRenderer {
         region: Rectangle<i32, BufferCoords>,
         format: Fourcc,
     ) -> Result<VulkanMapping, Error> {
+        if !self.queued_submits.is_empty() {
+            let was_batch = self.batch_submits;
+            self.flush_batch()?;
+            self.batch_submits = was_batch;
+        }
+
         let bpp = match format {
             Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => 4usize,
             Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8usize,
@@ -1753,18 +1972,10 @@ impl VulkanRenderer {
             .signal_semaphore_infos(&signal_semaphore_info)
             .wait_semaphore_infos(&wait_semaphore_info);
 
-        let submit_res = unsafe {
+        unsafe {
             self.device
-                .vk()
-                .queue_submit2(*self.device.queue(), &[submit_info], Fence::null())
-        };
-
-        if let Err(err) = submit_res {
-            if err == vk::Result::ERROR_DEVICE_LOST {
-                return Err(Error::DeadDevice);
-            } else {
-                return Err(Error::SubmitError(err));
-            }
+                .queue_submit2(&[submit_info], Fence::null())
+                .map_err(Error::SubmitError)?;
         }
 
         self.seq_no = next_seq_no;
@@ -1816,6 +2027,10 @@ impl VulkanRenderer {
         region: Rectangle<i32, BufferCoords>,
         format: Fourcc,
     ) -> Result<PendingVulkanShmCopy, Error> {
+        if !self.batch_submits && !self.queued_submits.is_empty() {
+            self.flush_batch()?;
+        }
+
         let bpp = match format {
             Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => 4usize,
             Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f => 8usize,
@@ -2042,6 +2257,7 @@ impl VulkanRenderer {
                 point: next_seq_no,
                 descs: Vec::new(),
                 images: vec![image.inner.clone()],
+                sampled_images: Vec::new(),
             });
         } else {
             let submit_info = SubmitInfo2::default()
@@ -2049,18 +2265,10 @@ impl VulkanRenderer {
                 .signal_semaphore_infos(&signal_semaphore_info)
                 .wait_semaphore_infos(&wait_semaphore_info);
 
-            let submit_res = unsafe {
+            unsafe {
                 self.device
-                    .vk()
-                    .queue_submit2(*self.device.queue(), &[submit_info], Fence::null())
-            };
-
-            if let Err(err) = submit_res {
-                if err == vk::Result::ERROR_DEVICE_LOST {
-                    return Err(Error::DeadDevice);
-                } else {
-                    return Err(Error::SubmitError(err));
-                }
+                    .queue_submit2(&[submit_info], Fence::null())
+                    .map_err(Error::SubmitError)?;
             }
 
             self.cmd_pool
@@ -2070,12 +2278,12 @@ impl VulkanRenderer {
         self.seq_no = next_seq_no;
 
         Ok(PendingVulkanShmCopy {
-            device: self.device.vk().clone(),
+            device: self.device.clone(),
             staging_buffer,
             staging_memory,
             buffer_size,
             is_coherent,
-            timeline_sem: self.timeline.vk,
+            timeline: self.timeline.clone(),
             point: next_seq_no,
             width: copy_width,
             height: copy_height,
@@ -2119,7 +2327,7 @@ impl ExportMem for VulkanRenderer {
         texture_mapping: &'a Self::TextureMapping,
     ) -> Result<&'a [u8], Self::Error> {
         match texture_mapping {
-            VulkanMapping::Mapped(ptr, len, _, _) => {
+            VulkanMapping::Mapped(ptr, len, _) => {
                 Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *len) })
             }
             VulkanMapping::Copied(data, _) => Ok(&**data),
@@ -2341,6 +2549,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     cmd_buffer: Option<ash::vk::CommandBuffer>,
     descriptors: Vec<shaders::DescriptorSet>,
     images: Vec<Arc<ImageInner>>,
+    sampled_images: Vec<VulkanImage>,
     has_draws: bool,
     #[cfg(feature = "wayland_frontend")]
     active_color_description: Option<ImageDescription>,
@@ -2483,6 +2692,17 @@ impl VulkanFrame<'_, '_> {
                 self.images.push(texture.inner.clone());
             }
 
+            if texture.dmabuf_exportable() && !self.is_blit {
+                if !self
+                    .sampled_images
+                    .iter()
+                    .any(|img| Arc::ptr_eq(&img.inner, &texture.inner))
+                {
+                    self.sampled_images.push(texture.clone());
+                }
+                continue;
+            }
+
             let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
             let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
                 (ext_queue, qfam)
@@ -2559,6 +2779,16 @@ impl VulkanFrame<'_, '_> {
         let buf = self.get_or_create_cmd_buffer()?;
         if self.rendering {
             return Ok(buf);
+        }
+
+        if self.renderer.queued_submits.iter().any(|q| {
+            q.sampled_images
+                .iter()
+                .any(|img| Arc::ptr_eq(&img.inner, &self.fb.0.inner))
+        }) {
+            let was_batch = self.renderer.batch_submits;
+            self.renderer.flush_batch()?;
+            self.renderer.batch_submits = was_batch;
         }
 
         let qfam = self.renderer.device.queue_family_idx();
@@ -2821,6 +3051,15 @@ impl VulkanFrame<'_, '_> {
         dst: Rectangle<i32, Physical>,
     ) -> Result<(), Error> {
         self.end_rendering();
+        if self.renderer.queued_submits.iter().any(|q| {
+            q.sampled_images.iter().any(|img| {
+                Arc::ptr_eq(&img.inner, &self.fb.0.inner) || Arc::ptr_eq(&img.inner, &texture.inner)
+            })
+        }) {
+            let was_batch = self.renderer.batch_submits;
+            self.renderer.flush_batch()?;
+            self.renderer.batch_submits = was_batch;
+        }
         let cmd_buffer = self.get_or_create_cmd_buffer()?;
 
         let qfam = self.renderer.device.queue_family_idx();
@@ -3260,54 +3499,66 @@ impl Frame for VulkanFrame<'_, '_> {
         if !self.images.iter().any(|img| Arc::ptr_eq(img, &texture.inner)) {
             self.images.push(texture.inner.clone());
         }
-        let qfam = self.renderer.device.queue_family_idx();
-        let ext_queue = self.renderer.external_queue_family();
 
-        let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
-        let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
-            (ext_queue, qfam)
+        if texture.dmabuf_exportable() && !self.is_blit {
+            if !self
+                .sampled_images
+                .iter()
+                .any(|img| Arc::ptr_eq(&img.inner, &texture.inner))
+            {
+                self.sampled_images.push(texture.clone());
+            }
         } else {
-            (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
-        };
+            let qfam = self.renderer.device.queue_family_idx();
+            let ext_queue = self.renderer.external_queue_family();
 
-        let tex_old_layout = texture.current_layout();
-        let needs_tex_barrier = tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            let tex_needs_acquire = texture.needs_acquire() && texture.dmabuf_exportable();
+            let (tex_src_queue, tex_dst_queue) = if tex_needs_acquire {
+                (ext_queue, qfam)
+            } else {
+                (QUEUE_FAMILY_IGNORED, QUEUE_FAMILY_IGNORED)
+            };
 
-        if needs_tex_barrier {
-            if self.rendering {
-                self.end_rendering();
+            let tex_old_layout = texture.current_layout();
+            let needs_tex_barrier =
+                tex_needs_acquire || tex_old_layout != ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+            if needs_tex_barrier {
+                if self.rendering {
+                    self.end_rendering();
+                }
+                let buf = self.get_or_create_cmd_buffer()?;
+
+                let (tex_src_stage, tex_src_access) =
+                    src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
+
+                let tex_barrier = ImageMemoryBarrier2::default()
+                    .image(*texture.vk())
+                    .old_layout(tex_old_layout)
+                    .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(tex_src_queue)
+                    .dst_queue_family_index(tex_dst_queue)
+                    .src_stage_mask(tex_src_stage)
+                    .src_access_mask(tex_src_access)
+                    .dst_stage_mask(PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
+                    .subresource_range(
+                        ImageSubresourceRange::default()
+                            .aspect_mask(ImageAspectFlags::COLOR)
+                            .layer_count(1)
+                            .level_count(1),
+                    );
+
+                unsafe {
+                    self.renderer.device.vk().cmd_pipeline_barrier2(
+                        buf,
+                        &DependencyInfo::default().image_memory_barriers(&[tex_barrier]),
+                    );
+                }
+
+                texture.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                texture.set_needs_acquire(false);
             }
-            let buf = self.get_or_create_cmd_buffer()?;
-
-            let (tex_src_stage, tex_src_access) =
-                src_stage_and_access_for_layout(tex_needs_acquire, tex_old_layout);
-
-            let tex_barrier = ImageMemoryBarrier2::default()
-                .image(*texture.vk())
-                .old_layout(tex_old_layout)
-                .new_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(tex_src_queue)
-                .dst_queue_family_index(tex_dst_queue)
-                .src_stage_mask(tex_src_stage)
-                .src_access_mask(tex_src_access)
-                .dst_stage_mask(PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(AccessFlags2::SHADER_SAMPLED_READ)
-                .subresource_range(
-                    ImageSubresourceRange::default()
-                        .aspect_mask(ImageAspectFlags::COLOR)
-                        .layer_count(1)
-                        .level_count(1),
-                );
-
-            unsafe {
-                self.renderer.device.vk().cmd_pipeline_barrier2(
-                    buf,
-                    &DependencyInfo::default().image_memory_barriers(&[tex_barrier]),
-                );
-            }
-
-            texture.set_current_layout(ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            texture.set_needs_acquire(false);
         }
 
         let buf = self.ensure_rendering()?;
@@ -3940,7 +4191,8 @@ impl Frame for VulkanFrame<'_, '_> {
                             .semaphore(vk_sem)
                             .value(point)
                             .stage_mask(
-                                PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                                PipelineStageFlags2::TOP_OF_PIPE
+                                    | PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
                                     | PipelineStageFlags2::FRAGMENT_SHADER
                                     | PipelineStageFlags2::ALL_TRANSFER,
                             ),
@@ -3968,6 +4220,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let point = next_seq_no;
         let descs = std::mem::take(&mut self.descriptors);
         let mut images = std::mem::take(&mut self.images);
+        let sampled_images = std::mem::take(&mut self.sampled_images);
         if !images.iter().any(|img| Arc::ptr_eq(img, &self.fb.0.inner)) {
             images.push(self.fb.0.inner.clone());
         }
@@ -3988,31 +4241,53 @@ impl Frame for VulkanFrame<'_, '_> {
                 point,
                 descs,
                 images,
+                sampled_images,
             });
             trace!(point, "VulkanFrame::finish command buffer queued in batch");
         } else {
-            let submit_info = SubmitInfo2::default()
-                .command_buffer_infos(&cmd_buffer_info)
-                .signal_semaphore_infos(&signal_semaphore_info)
-                .wait_semaphore_infos(&wait_semaphore_info);
+            let device = self.renderer.device.clone();
+            let submit_res = device.with_queue_lock(|_vk, queue| {
+                let acquire_buf = self.renderer.record_acquire_cmd_buffer(&sampled_images)?;
+                let mut cmd_infos = Vec::with_capacity(2);
+                if let Some(abuf) = acquire_buf {
+                    cmd_infos.push(CommandBufferSubmitInfo::default().command_buffer(abuf));
+                }
+                cmd_infos.extend_from_slice(&cmd_buffer_info);
 
-            let submit_res = unsafe {
-                self.renderer.device.vk().queue_submit2(
-                    *self.renderer.device.queue(),
-                    &[submit_info],
-                    Fence::null(),
-                )
+                let submit_info = SubmitInfo2::default()
+                    .command_buffer_infos(&cmd_infos)
+                    .signal_semaphore_infos(&signal_semaphore_info)
+                    .wait_semaphore_infos(&wait_semaphore_info);
+
+                let res = unsafe { device.vk().queue_submit2(queue, &[submit_info], Fence::null()) };
+                match res {
+                    Ok(()) => Ok(acquire_buf),
+                    Err(err) => {
+                        if let Some(abuf) = acquire_buf {
+                            unsafe {
+                                device
+                                    .vk()
+                                    .free_command_buffers(self.renderer.cmd_pool.vk(), &[abuf]);
+                            }
+                        }
+                        Err(Error::SubmitError(err))
+                    }
+                }
+            });
+
+            let acquire_buf = match submit_res {
+                Ok(abuf) => abuf,
+                Err(err) => {
+                    self.cmd_buffer = Some(buf);
+                    return Err(err);
+                }
             };
 
-            if let Err(err) = submit_res {
-                self.cmd_buffer = Some(buf);
-                if err == vk::Result::ERROR_DEVICE_LOST {
-                    return Err(Error::DeadDevice);
-                } else {
-                    return Err(Error::SubmitError(err));
-                }
+            if let Some(abuf) = acquire_buf {
+                self.renderer
+                    .cmd_pool
+                    .store_pending_buffer(abuf, point, Vec::new(), Vec::new());
             }
-
             self.renderer
                 .cmd_pool
                 .store_pending_buffer(buf, point, descs, images);
@@ -4040,7 +4315,6 @@ impl Drop for VulkanFrame<'_, '_> {
     fn drop(&mut self) {
         if let Some(buf) = self.cmd_buffer.take() {
             unsafe {
-                let _ = self.renderer.device.vk().device_wait_idle();
                 self.renderer
                     .device
                     .vk()
@@ -4087,6 +4361,7 @@ impl Blit for VulkanRenderer {
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
             images: Vec::with_capacity(4),
+            sampled_images: Vec::new(),
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
@@ -4157,6 +4432,7 @@ impl Blit for VulkanRenderer {
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
             images: Vec::with_capacity(4),
+            sampled_images: Vec::new(),
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
@@ -4222,6 +4498,7 @@ impl Blit for VulkanRenderer {
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
             images: Vec::with_capacity(4),
+            sampled_images: Vec::new(),
             has_draws: false,
             #[cfg(feature = "wayland_frontend")]
             active_color_description: None,
@@ -4386,36 +4663,7 @@ impl Bind<VulkanImage> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        known_formats()
-            .iter()
-            .try_fold(IndexSet::new(), |mut set, fourcc| {
-                let format = get_vk_format(*fourcc).unwrap();
-                let props = self.phd.get_format_modifier_properties(format)?;
-                // TODO: else use get_format_properties and map to LINEAR and INVALID
-                for prop in props {
-                    if prop
-                        .drm_format_modifier_tiling_features
-                        .contains(FormatFeatureFlags::COLOR_ATTACHMENT)
-                        || prop
-                            .drm_format_modifier_tiling_features
-                            .contains(FormatFeatureFlags::STORAGE_IMAGE)
-                    {
-                        set.insert(Format {
-                            code: *fourcc,
-                            modifier: Modifier::from(prop.drm_format_modifier),
-                        });
-                        if let Some(opaque) = get_opaque(*fourcc) {
-                            set.insert(Format {
-                                code: opaque,
-                                modifier: Modifier::from(prop.drm_format_modifier),
-                            });
-                        }
-                    }
-                }
-                Result::<_, UnsupportedProperty>::Ok(set)
-            })
-            .ok()
-            .map(FormatSet::from_formats)
+        Self::supported_render_formats(&self.phd)
     }
 }
 
@@ -4474,8 +4722,9 @@ impl Bind<Dmabuf> for VulkanRenderer {
             modifier = ?target.format().modifier,
             "VulkanRenderer::bind dmabuf"
         );
-        let image = match self.dmabuf_cache.get(&target.weak()) {
-            Some(image) if image.vk_usage().contains(ImageUsageFlags::TRANSFER_DST) => image.clone(),
+        let cached = self.dmabuf_cache.lock().unwrap().get(&target.weak()).cloned();
+        let image = match cached {
+            Some(image) if image.vk_usage().contains(ImageUsageFlags::TRANSFER_DST) => image,
             _ => {
                 let image = VulkanImage::new_from_dmabuf(
                     &self.device,
@@ -4489,7 +4738,10 @@ impl Bind<Dmabuf> for VulkanRenderer {
                     tracing::error!("VulkanRenderer::bind dmabuf failed: {:?}", err);
                     Error::ImageError(err)
                 })?;
-                self.dmabuf_cache.insert(target.weak(), image.clone());
+                self.dmabuf_cache
+                    .lock()
+                    .unwrap()
+                    .insert(target.weak(), image.clone());
                 image
             }
         };
@@ -4497,37 +4749,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        // TODO: Can external_memory_dma_buf also provide formats?
-        known_formats()
-            .iter()
-            .try_fold(IndexSet::new(), |mut set, fourcc| {
-                let format = get_vk_format(*fourcc).unwrap();
-                let props = self.phd.get_format_modifier_properties(format)?;
-                // TODO: else use get_format_properties and map to LINEAR and INVALID
-                for prop in props {
-                    if prop
-                        .drm_format_modifier_tiling_features
-                        .contains(FormatFeatureFlags::COLOR_ATTACHMENT)
-                        || prop
-                            .drm_format_modifier_tiling_features
-                            .contains(FormatFeatureFlags::STORAGE_IMAGE)
-                    {
-                        set.insert(Format {
-                            code: *fourcc,
-                            modifier: Modifier::from(prop.drm_format_modifier),
-                        });
-                        if let Some(opaque) = get_opaque(*fourcc) {
-                            set.insert(Format {
-                                code: opaque,
-                                modifier: Modifier::from(prop.drm_format_modifier),
-                            });
-                        }
-                    }
-                }
-                Result::<_, UnsupportedProperty>::Ok(set)
-            })
-            .ok()
-            .map(FormatSet::from_formats)
+        Self::supported_render_formats(&self.phd)
     }
 }
 
@@ -4821,7 +5043,7 @@ mod test {
 
             // Wait idle and cleanup
             unsafe {
-                let _ = renderer.device.vk().device_wait_idle();
+                let _ = renderer.device.wait_idle();
             }
             renderer.cleanup().expect("cleanup failed");
             assert_eq!(
@@ -4870,9 +5092,7 @@ mod test {
 
     #[test]
     fn test_dmabuf_and_internal_image_layout_and_queue_ownership() {
-        use crate::backend::allocator::{
-            Allocator, Fourcc, Modifier, dmabuf::AsDmabuf, vulkan::VulkanAllocator,
-        };
+        use crate::backend::allocator::{Allocator, Fourcc, Modifier, vulkan::VulkanAllocator};
 
         let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
             return;
@@ -5002,9 +5222,205 @@ mod test {
             }
 
             unsafe {
-                let _ = renderer.device.vk().device_wait_idle();
+                let _ = renderer.device.wait_idle();
             }
             renderer.cleanup().expect("cleanup failed");
+        }
+    }
+
+    #[test]
+    fn test_shared_device_and_weak_image_cleanup() {
+        use crate::backend::{
+            allocator::{Allocator, vulkan::VulkanAllocator},
+            renderer::Offscreen,
+        };
+
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+        let Ok(devices) = PhysicalDevice::enumerate(&instance) else {
+            return;
+        };
+
+        for phd in devices {
+            let static_dmabuf_formats = VulkanRenderer::supported_dmabuf_formats(&phd);
+            let static_render_formats = VulkanRenderer::supported_render_formats(&phd);
+
+            let Ok(mut renderer_a) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+            assert_eq!(renderer_a.dmabuf_formats(), static_dmabuf_formats);
+            assert_eq!(
+                Bind::<Dmabuf>::supported_formats(&renderer_a),
+                static_render_formats
+            );
+
+            let device = renderer_a.device().clone();
+            let weak_device = device.downgrade();
+            let shared_cache = renderer_a.dmabuf_cache().clone();
+            let shared_pipelines = renderer_a.shared_pipelines().clone();
+
+            let mut renderer_b = VulkanRenderer::with_device(
+                &device,
+                None,
+                shared_cache.clone(),
+                Some(shared_pipelines.clone()),
+            )
+            .expect("Failed to create shared VulkanRenderer::with_device");
+
+            // Both renderers share the exact same VkDevice, ContextId, SharedPipelines, and samplers
+            assert_eq!(renderer_a.context_id(), renderer_b.context_id());
+            assert_eq!(
+                renderer_a.device().vk().handle(),
+                renderer_b.device().vk().handle()
+            );
+            assert!(Arc::ptr_eq(
+                renderer_a.shared_pipelines(),
+                renderer_b.shared_pipelines()
+            ));
+            assert_eq!(renderer_a.texture_sampler, renderer_b.texture_sampler);
+            assert_eq!(
+                renderer_a.texture_sampler_nearest,
+                renderer_b.texture_sampler_nearest
+            );
+
+            // Texture allocated on renderer_a via host upload is immediately transitioned to SHADER_READ_ONLY_OPTIMAL
+            // and can be safely rendered on renderer_b
+            let shared_tex = renderer_a
+                .import_memory(&[255u8; 32 * 32 * 4], Fourcc::Abgr8888, (32, 32).into(), false)
+                .expect("Failed to import memory on renderer_a");
+            assert_eq!(shared_tex.current_layout(), ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+            let mut target_a: VulkanImage = renderer_a
+                .create_buffer(Fourcc::Abgr8888, (32, 32).into())
+                .expect("Failed to create buffer on renderer_a");
+            let mut target_b: VulkanImage = renderer_b
+                .create_buffer(Fourcc::Abgr8888, (32, 32).into())
+                .expect("Failed to create buffer on renderer_b");
+            let rect = Rectangle::new(Point::new(0, 0), Size::new(32, 32));
+            let src_f64 = Rectangle::new(Point::new(0.0, 0.0), Size::new(32.0, 32.0));
+            {
+                let mut fb_b = renderer_b.bind(&mut target_b).unwrap();
+                let mut frame = renderer_b
+                    .render(&mut fb_b, (32, 32).into(), Transform::Normal)
+                    .unwrap();
+                frame
+                    .render_texture_from_to(&shared_tex, src_f64, rect, &[rect], &[], Transform::Normal, 1.0)
+                    .unwrap();
+                let _sync = frame.finish().unwrap();
+            }
+
+            // Test out-of-order batch submission across two renderers sharing a DMA-BUF texture:
+            // renderer_a records first, renderer_b records second, renderer_b flushes first, renderer_a flushes second.
+            let mut allocator = VulkanAllocator::from_renderer(
+                &renderer_a,
+                ImageUsageFlags::COLOR_ATTACHMENT
+                    | ImageUsageFlags::TRANSFER_SRC
+                    | ImageUsageFlags::TRANSFER_DST
+                    | ImageUsageFlags::SAMPLED,
+            );
+            if let Ok(exportable) =
+                allocator.create_buffer(32, 32, Fourcc::Abgr8888, &[Modifier::Linear, Modifier::Invalid])
+            {
+                if let Ok(dmabuf) = exportable.export() {
+                    let shared_dmabuf_tex = renderer_a.import_dmabuf(&dmabuf, None).unwrap();
+                    assert_eq!(shared_dmabuf_tex.current_layout(), ImageLayout::GENERAL);
+                    assert!(shared_dmabuf_tex.needs_acquire());
+
+                    renderer_a.begin_batch();
+                    renderer_b.begin_batch();
+
+                    let sync_a = {
+                        let mut fb_a = renderer_a.bind(&mut target_a).unwrap();
+                        let mut frame_a = renderer_a
+                            .render(&mut fb_a, (32, 32).into(), Transform::Normal)
+                            .unwrap();
+                        frame_a
+                            .render_texture_from_to(
+                                &shared_dmabuf_tex,
+                                src_f64,
+                                rect,
+                                &[rect],
+                                &[],
+                                Transform::Normal,
+                                1.0,
+                            )
+                            .unwrap();
+                        frame_a.finish().unwrap()
+                    };
+
+                    // Before flush_batch, layout transition has not yet been submitted to the queue
+                    assert_eq!(shared_dmabuf_tex.current_layout(), ImageLayout::GENERAL);
+                    assert!(shared_dmabuf_tex.needs_acquire());
+
+                    let sync_b = {
+                        let mut fb_b = renderer_b.bind(&mut target_b).unwrap();
+                        let mut frame_b = renderer_b
+                            .render(&mut fb_b, (32, 32).into(), Transform::Normal)
+                            .unwrap();
+                        frame_b
+                            .render_texture_from_to(
+                                &shared_dmabuf_tex,
+                                src_f64,
+                                rect,
+                                &[rect],
+                                &[],
+                                Transform::Normal,
+                                1.0,
+                            )
+                            .unwrap();
+                        frame_b.finish().unwrap()
+                    };
+
+                    // Flush renderer_b FIRST (even though renderer_a recorded first)
+                    renderer_b.flush_batch().unwrap();
+                    assert_eq!(
+                        shared_dmabuf_tex.current_layout(),
+                        ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    );
+                    assert!(!shared_dmabuf_tex.needs_acquire());
+
+                    // Flush renderer_a SECOND (must not emit duplicate foreign-queue acquire barrier)
+                    renderer_a.flush_batch().unwrap();
+                    let _ = sync_b.wait();
+                    let _ = sync_a.wait();
+
+                    // Both renderers compiled/reused the exact same vk::Pipeline handles via SharedPipelines
+                    let fmt = target_a.format();
+                    let p_a = renderer_a
+                        .pipelines
+                        .get_or_create_format_pipelines(fmt, false)
+                        .unwrap();
+                    let p_b = renderer_b
+                        .pipelines
+                        .get_or_create_format_pipelines(fmt, false)
+                        .unwrap();
+                    assert_eq!(p_a.tex_pipeline, p_b.tex_pipeline);
+                    assert_eq!(p_a.clear_pipeline, p_b.clear_pipeline);
+                }
+            }
+
+            // Per VUID-vkDestroyDevice-device-05137, child VulkanImage handles keep VkDevice alive
+            // until all child objects and caches are dropped.
+            drop(allocator);
+            drop(target_a);
+            drop(renderer_a);
+            drop(renderer_b);
+            drop(shared_pipelines);
+            drop(device);
+            assert!(
+                weak_device.upgrade().is_some(),
+                "Live VulkanImage handles must keep VkDevice alive until destroyed (VUID-vkDestroyDevice-device-05137)"
+            );
+
+            // Deterministically evict caches and drop remaining images; VkDevice must be destroyed immediately
+            shared_cache.lock().unwrap().clear();
+            drop(shared_tex);
+            drop(target_b);
+            assert!(
+                weak_device.upgrade().is_none(),
+                "VkDevice must be destroyed immediately once all renderers, caches, and images are dropped"
+            );
         }
     }
 }

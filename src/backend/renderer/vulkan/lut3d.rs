@@ -447,20 +447,26 @@ impl Lut3dTexture {
                 .end_command_buffer(cmd_buf)
                 .map_err(Error::CommandBufferError)?;
 
+            let fence = device
+                .vk()
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(Error::SubmitError)?;
             let submit_cmd = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd_buf)];
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&submit_cmd)];
-            device
-                .vk()
-                .queue_submit2(*device.queue(), &submit, vk::Fence::null())
-                .map_err(Error::SubmitError)?;
-            device
-                .vk()
-                .queue_wait_idle(*device.queue())
-                .map_err(Error::SubmitError)?;
-
+            let submit_res = device.queue_submit2(&submit, fence);
+            if let Err(err) = submit_res {
+                device.vk().destroy_fence(fence, None);
+                device.vk().destroy_command_pool(cmd_pool, None);
+                device.vk().destroy_buffer(staging_buf, None);
+                device.vk().free_memory(staging_memory, None);
+                return Err(Error::SubmitError(err));
+            }
+            let wait_res = device.vk().wait_for_fences(&[fence], true, u64::MAX);
+            device.vk().destroy_fence(fence, None);
             device.vk().destroy_command_pool(cmd_pool, None);
             device.vk().destroy_buffer(staging_buf, None);
             device.vk().free_memory(staging_memory, None);
+            wait_res.map_err(Error::SubmitError)?;
         }
 
         Ok(Lut3dTexture {

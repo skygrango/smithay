@@ -5,7 +5,7 @@ use ash::vk::{
 
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::backend::vulkan::{Device, device::WeakDevice};
+use crate::backend::vulkan::Device;
 
 #[derive(Debug)]
 struct PoolInner {
@@ -15,7 +15,6 @@ struct PoolInner {
 
 #[derive(Debug)]
 pub struct DescriptorSet {
-    device: WeakDevice,
     pool: Weak<PoolInner>,
     vk: VkDescriptorSet,
 }
@@ -38,18 +37,16 @@ impl Drop for DescriptorSet {
 
 #[derive(Debug)]
 struct Pool {
-    device: WeakDevice,
     inner: Arc<PoolInner>,
     allocated: usize,
     capacity: usize,
+    device: Device,
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                device.vk().destroy_descriptor_pool(self.inner.pool, None);
-            }
+        unsafe {
+            self.device.vk().destroy_descriptor_pool(self.inner.pool, None);
         }
     }
 }
@@ -58,12 +55,11 @@ const START_DESCRIPTOR_COUNT: u32 = 256;
 
 #[derive(Debug)]
 pub struct DescriptorAllocator {
-    device: WeakDevice,
-
     layout: DescriptorSetLayout,
     sizes: &'static [vk::DescriptorPoolSize],
 
     pools: Vec<Pool>,
+    device: Device,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +79,7 @@ impl DescriptorAllocator {
         sizes: &'static [vk::DescriptorPoolSize],
     ) -> Self {
         DescriptorAllocator {
-            device: device.downgrade(),
+            device: device.clone(),
             layout,
             sizes,
             pools: Vec::new(),
@@ -91,16 +87,11 @@ impl DescriptorAllocator {
     }
 
     pub fn alloc_descriptor_set(&mut self) -> Result<DescriptorSet, Error> {
-        let Some(device) = self.device.upgrade() else {
-            return Err(Error::LostDevice);
-        };
-
         // 1. Check if any pool has an already allocated and freed descriptor set
         for pool in self.pools.iter_mut() {
             if let Ok(mut free) = pool.inner.free_sets.lock() {
                 if let Some(vk) = free.pop() {
                     return Ok(DescriptorSet {
-                        device: self.device.clone(),
                         pool: Arc::downgrade(&pool.inner),
                         vk,
                     });
@@ -115,12 +106,11 @@ impl DescriptorAllocator {
         for pool in self.pools.iter_mut() {
             if pool.allocated < pool.capacity {
                 alloc_info = alloc_info.descriptor_pool(pool.inner.pool);
-                match unsafe { device.vk().allocate_descriptor_sets(&alloc_info) } {
+                match unsafe { self.device.vk().allocate_descriptor_sets(&alloc_info) } {
                     Err(VkError::ERROR_FRAGMENTED_POOL) | Err(VkError::ERROR_OUT_OF_POOL_MEMORY) => continue,
                     Ok(set) => {
                         pool.allocated += 1;
                         return Ok(DescriptorSet {
-                            device: self.device.clone(),
                             pool: Arc::downgrade(&pool.inner),
                             vk: set[0],
                         });
@@ -145,7 +135,7 @@ impl DescriptorAllocator {
             .flags(DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(size);
         let pool = unsafe {
-            device
+            self.device
                 .vk()
                 .create_descriptor_pool(&create_info, None)
                 .map_err(Error::DescriptorPool)?
@@ -164,26 +154,15 @@ impl DescriptorAllocator {
         let pool = self.pools.last_mut().unwrap();
         alloc_info = alloc_info.descriptor_pool(pool.inner.pool);
         let set = unsafe {
-            device
+            self.device
                 .vk()
                 .allocate_descriptor_sets(&alloc_info)
                 .map_err(Error::AllocError)?
         };
         pool.allocated += 1;
         Ok(DescriptorSet {
-            device: self.device.clone(),
             pool: Arc::downgrade(&pool.inner),
             vk: set[0],
         })
-    }
-}
-
-impl Drop for DescriptorAllocator {
-    fn drop(&mut self) {
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                device.vk().destroy_descriptor_set_layout(self.layout, None);
-            }
-        }
     }
 }

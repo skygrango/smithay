@@ -1,11 +1,17 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-use ash::vk::{self, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo, ShaderStageFlags};
+use ash::vk::{
+    self, BorderColor, CompareOp, Filter, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+    SamplerAddressMode, SamplerCreateFlags, SamplerCreateInfo, SamplerMipmapMode, ShaderStageFlags,
+};
 use include_bytes_aligned::include_bytes_aligned;
 
 use crate::backend::{
     renderer::vulkan::shaders::descriptor::DescriptorAllocator,
-    vulkan::{Device, device::WeakDevice, ycbcr::YcbcrKey},
+    vulkan::{Device, ycbcr::YcbcrKey},
 };
 
 mod clear;
@@ -87,18 +93,16 @@ pub struct YcbcrEntry {
 }
 
 #[derive(Debug)]
-pub struct Pipelines {
-    device: WeakDevice,
+pub struct SharedPipelines {
     cache: vk::PipelineCache,
     cache_path: Option<std::path::PathBuf>,
 
     clear_layout: PipelineLayout,
+    tex_descriptor_set_layout: vk::DescriptorSetLayout,
     tex_layout: PipelineLayout,
+    hdr_tex_descriptor_set_layout: vk::DescriptorSetLayout,
     hdr_tex_layout: PipelineLayout,
     outline_layout: PipelineLayout,
-
-    tex_desc_pool: DescriptorAllocator,
-    hdr_tex_desc_pool: DescriptorAllocator,
 
     quad_vert: vk::ShaderModule,
     clear_frag: vk::ShaderModule,
@@ -106,8 +110,20 @@ pub struct Pipelines {
     hdr_tex_frag: vk::ShaderModule,
     outline_frag: vk::ShaderModule,
 
-    format_pipelines: HashMap<(vk::Format, bool), FormatPipelines>,
+    texture_sampler: vk::Sampler,
+    texture_sampler_nearest: vk::Sampler,
+
+    format_pipelines: Mutex<HashMap<(vk::Format, bool), FormatPipelines>>,
+    device: Device,
+}
+
+#[derive(Debug)]
+pub struct Pipelines {
+    tex_desc_pool: DescriptorAllocator,
+    hdr_tex_desc_pool: DescriptorAllocator,
+    local_format_pipelines: HashMap<(vk::Format, bool), FormatPipelines>,
     ycbcr_entries: HashMap<YcbcrKey, YcbcrEntry>,
+    shared: Arc<SharedPipelines>,
 }
 
 fn get_pipeline_cache_path(device: &Device) -> Option<std::path::PathBuf> {
@@ -148,10 +164,12 @@ pub enum Error {
     PipelineLayout(#[source] vk::Result),
     #[error("Failed to create pipelines")]
     Pipeline(#[source] vk::Result),
+    #[error("Failed to create sampler")]
+    Sampler(#[source] vk::Result),
 }
 
-impl Pipelines {
-    pub fn new(device: &Device) -> Result<Self, Error> {
+impl SharedPipelines {
+    pub fn new(device: &Device) -> Result<Arc<Self>, Error> {
         let cache_path = get_pipeline_cache_path(device);
         let initial_data = cache_path.as_ref().and_then(|p| match std::fs::read(p) {
             Ok(data) if !data.is_empty() => Some(data),
@@ -246,13 +264,13 @@ impl Pipelines {
         let create_info = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(layout_flags)
             .bindings(TEX_BINDINGS.as_slice());
-        let tex_descriptor_set = unsafe {
+        let tex_descriptor_set_layout = unsafe {
             device
                 .vk()
                 .create_descriptor_set_layout(&create_info, None)
                 .map_err(Error::DescriptorSetLayout)?
         };
-        let tex_layouts = [tex_descriptor_set];
+        let tex_layouts = [tex_descriptor_set_layout];
 
         let constants = [vk::PushConstantRange::default()
             .stage_flags(ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT)
@@ -267,19 +285,18 @@ impl Pipelines {
                 .create_pipeline_layout(&create_info, None)
                 .map_err(Error::PipelineLayout)?
         };
-        let tex_desc_pool = DescriptorAllocator::new(device, tex_descriptor_set, &*TEX_SIZES);
 
         // HDR Texture pipeline layout (1 descriptor set: sampler2D)
         let create_info = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(layout_flags)
             .bindings(HDR_TEX_BINDINGS.as_slice());
-        let hdr_tex_descriptor_set = unsafe {
+        let hdr_tex_descriptor_set_layout = unsafe {
             device
                 .vk()
                 .create_descriptor_set_layout(&create_info, None)
                 .map_err(Error::DescriptorSetLayout)?
         };
-        let hdr_tex_layouts = [hdr_tex_descriptor_set];
+        let hdr_tex_layouts = [hdr_tex_descriptor_set_layout];
 
         let constants = [vk::PushConstantRange::default()
             .stage_flags(ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT)
@@ -294,45 +311,129 @@ impl Pipelines {
                 .create_pipeline_layout(&create_info, None)
                 .map_err(Error::PipelineLayout)?
         };
-        let hdr_tex_desc_pool = DescriptorAllocator::new(device, hdr_tex_descriptor_set, &*HDR_TEX_SIZES);
 
-        Ok(Pipelines {
-            device: device.downgrade(),
+        let texture_sampler = unsafe {
+            device
+                .vk()
+                .create_sampler(
+                    &SamplerCreateInfo::default()
+                        .flags(SamplerCreateFlags::empty())
+                        .mag_filter(Filter::LINEAR)
+                        .min_filter(Filter::LINEAR)
+                        .mipmap_mode(SamplerMipmapMode::NEAREST)
+                        .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .mip_lod_bias(0.0)
+                        .anisotropy_enable(false)
+                        .max_anisotropy(0.0)
+                        .compare_enable(false)
+                        .compare_op(CompareOp::NEVER)
+                        .min_lod(0.0)
+                        .max_lod(0.0)
+                        .border_color(BorderColor::FLOAT_TRANSPARENT_BLACK)
+                        .unnormalized_coordinates(false),
+                    None,
+                )
+                .map_err(Error::Sampler)?
+        };
+
+        let texture_sampler_nearest = unsafe {
+            device
+                .vk()
+                .create_sampler(
+                    &SamplerCreateInfo::default()
+                        .flags(SamplerCreateFlags::empty())
+                        .mag_filter(Filter::NEAREST)
+                        .min_filter(Filter::NEAREST)
+                        .mipmap_mode(SamplerMipmapMode::NEAREST)
+                        .address_mode_u(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_v(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_w(SamplerAddressMode::CLAMP_TO_BORDER)
+                        .mip_lod_bias(0.0)
+                        .anisotropy_enable(false)
+                        .max_anisotropy(0.0)
+                        .compare_enable(false)
+                        .compare_op(CompareOp::NEVER)
+                        .min_lod(0.0)
+                        .max_lod(0.0)
+                        .border_color(BorderColor::FLOAT_TRANSPARENT_BLACK)
+                        .unnormalized_coordinates(false),
+                    None,
+                )
+                .map_err(Error::Sampler)?
+        };
+
+        Ok(Arc::new(SharedPipelines {
             cache,
             cache_path,
-
             clear_layout,
+            tex_descriptor_set_layout,
             tex_layout,
+            hdr_tex_descriptor_set_layout,
             hdr_tex_layout,
             outline_layout,
-
-            tex_desc_pool,
-            hdr_tex_desc_pool,
-
             quad_vert,
             clear_frag,
             tex_frag,
             hdr_tex_frag,
             outline_frag,
-
-            format_pipelines: HashMap::new(),
-            ycbcr_entries: HashMap::new(),
-        })
+            texture_sampler,
+            texture_sampler_nearest,
+            format_pipelines: Mutex::new(HashMap::new()),
+            device: device.clone(),
+        }))
     }
 
-    pub fn get_or_create_format_pipelines(
-        &mut self,
+    pub fn texture_sampler(&self) -> vk::Sampler {
+        self.texture_sampler
+    }
+
+    pub fn texture_sampler_nearest(&self) -> vk::Sampler {
+        self.texture_sampler_nearest
+    }
+
+    pub fn save_cache(&self) {
+        let Some(ref path) = self.cache_path else {
+            return;
+        };
+
+        let data = unsafe {
+            match self.device.vk().get_pipeline_cache_data(self.cache) {
+                Ok(data) => data,
+                Err(err) => {
+                    tracing::debug!("Failed to get Vulkan pipeline cache data: {:?}", err);
+                    return;
+                }
+            }
+        };
+
+        if data.is_empty() {
+            return;
+        }
+
+        let temp_path = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&temp_path, &data) {
+            tracing::debug!(
+                "Failed to write Vulkan pipeline cache to {:?}: {:?}",
+                temp_path,
+                err
+            );
+            return;
+        }
+
+        let _ = std::fs::rename(&temp_path, path);
+    }
+
+    fn get_or_create_format_pipelines(
+        &self,
         format: vk::Format,
         has_depth: bool,
     ) -> Result<FormatPipelines, Error> {
-        if let Some(&p) = self.format_pipelines.get(&(format, has_depth)) {
+        let mut guard = self.format_pipelines.lock().unwrap();
+        if let Some(&p) = guard.get(&(format, has_depth)) {
             return Ok(p);
         }
-
-        let device = self
-            .device
-            .upgrade()
-            .ok_or(Error::Pipeline(vk::Result::ERROR_DEVICE_LOST))?;
 
         let vertex_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::VERTEX)
@@ -539,12 +640,12 @@ impl Pipelines {
             .collect::<Vec<_>>();
 
         let pipelines = unsafe {
-            device
+            self.device
                 .vk()
                 .create_graphics_pipelines(self.cache, &create_infos, None)
                 .map_err(|(pipelines, res)| {
                     for pipeline in pipelines {
-                        device.vk().destroy_pipeline(pipeline, None);
+                        self.device.vk().destroy_pipeline(pipeline, None);
                     }
                     res
                 })
@@ -570,61 +671,110 @@ impl Pipelines {
             outline_blend_pipeline: pipelines[15],
         };
 
-        self.format_pipelines
-            .insert((format, has_depth), format_pipelines);
+        guard.insert((format, has_depth), format_pipelines);
+        drop(guard);
         self.save_cache();
         Ok(format_pipelines)
     }
+}
 
-    pub fn save_cache(&self) {
-        let Some(ref path) = self.cache_path else {
-            return;
-        };
-        let Some(device) = self.device.upgrade() else {
-            return;
-        };
-
-        let data = unsafe {
-            match device.vk().get_pipeline_cache_data(self.cache) {
-                Ok(data) => data,
-                Err(err) => {
-                    tracing::debug!("Failed to get Vulkan pipeline cache data: {:?}", err);
-                    return;
-                }
+impl Drop for SharedPipelines {
+    fn drop(&mut self) {
+        self.save_cache();
+        let vk = self.device.vk();
+        unsafe {
+            for (_, p) in self.format_pipelines.get_mut().unwrap().drain() {
+                vk.destroy_pipeline(p.clear_pipeline, None);
+                vk.destroy_pipeline(p.clear_blend_pipeline, None);
+                vk.destroy_pipeline(p.tex_pipeline, None);
+                vk.destroy_pipeline(p.tex_blend_pipeline, None);
+                vk.destroy_pipeline(p.hdr_tex_pipeline, None);
+                vk.destroy_pipeline(p.hdr_tex_blend_pipeline, None);
+                vk.destroy_pipeline(p.hdr_passthrough_pipeline, None);
+                vk.destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
+                vk.destroy_pipeline(p.hdr_sdr_pipeline, None);
+                vk.destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
+                vk.destroy_pipeline(p.hdr_pq_pipeline, None);
+                vk.destroy_pipeline(p.hdr_pq_blend_pipeline, None);
+                vk.destroy_pipeline(p.hdr_lut3d_pipeline, None);
+                vk.destroy_pipeline(p.hdr_lut3d_blend_pipeline, None);
+                vk.destroy_pipeline(p.outline_pipeline, None);
+                vk.destroy_pipeline(p.outline_blend_pipeline, None);
             }
-        };
 
-        if data.is_empty() {
-            return;
+            vk.destroy_sampler(self.texture_sampler, None);
+            vk.destroy_sampler(self.texture_sampler_nearest, None);
+
+            vk.destroy_shader_module(self.quad_vert, None);
+            vk.destroy_shader_module(self.clear_frag, None);
+            vk.destroy_shader_module(self.tex_frag, None);
+            vk.destroy_shader_module(self.hdr_tex_frag, None);
+            vk.destroy_shader_module(self.outline_frag, None);
+
+            vk.destroy_pipeline_layout(self.clear_layout, None);
+            vk.destroy_pipeline_layout(self.tex_layout, None);
+            vk.destroy_pipeline_layout(self.hdr_tex_layout, None);
+            vk.destroy_pipeline_layout(self.outline_layout, None);
+
+            vk.destroy_descriptor_set_layout(self.tex_descriptor_set_layout, None);
+            vk.destroy_descriptor_set_layout(self.hdr_tex_descriptor_set_layout, None);
+
+            vk.destroy_pipeline_cache(self.cache, None);
+        }
+    }
+}
+
+impl Pipelines {
+    pub fn from_shared(shared: Arc<SharedPipelines>) -> Self {
+        let tex_desc_pool =
+            DescriptorAllocator::new(&shared.device, shared.tex_descriptor_set_layout, &*TEX_SIZES);
+        let hdr_tex_desc_pool = DescriptorAllocator::new(
+            &shared.device,
+            shared.hdr_tex_descriptor_set_layout,
+            &*HDR_TEX_SIZES,
+        );
+
+        Pipelines {
+            tex_desc_pool,
+            hdr_tex_desc_pool,
+            local_format_pipelines: HashMap::new(),
+            ycbcr_entries: HashMap::new(),
+            shared,
+        }
+    }
+
+    pub fn shared(&self) -> &Arc<SharedPipelines> {
+        &self.shared
+    }
+
+    pub fn get_or_create_format_pipelines(
+        &mut self,
+        format: vk::Format,
+        has_depth: bool,
+    ) -> Result<FormatPipelines, Error> {
+        if let Some(&p) = self.local_format_pipelines.get(&(format, has_depth)) {
+            return Ok(p);
         }
 
-        let temp_path = path.with_extension("tmp");
-        if let Err(err) = std::fs::write(&temp_path, &data) {
-            tracing::debug!(
-                "Failed to write Vulkan pipeline cache to {:?}: {:?}",
-                temp_path,
-                err
-            );
-            return;
-        }
-
-        let _ = std::fs::rename(&temp_path, path);
+        let p = self.shared.get_or_create_format_pipelines(format, has_depth)?;
+        self.local_format_pipelines.insert((format, has_depth), p);
+        Ok(p)
     }
 
     pub fn clear_pipeline_layout(&self) -> &PipelineLayout {
-        &self.clear_layout
+        &self.shared.clear_layout
     }
 
     pub fn tex_pipeline_layout(&self) -> &PipelineLayout {
-        &self.tex_layout
+        &self.shared.tex_layout
     }
 
     pub fn hdr_tex_pipeline_layout(&self) -> &PipelineLayout {
-        &self.hdr_tex_layout
+        &self.shared.hdr_tex_layout
     }
 
     pub fn outline_pipeline_layout(&self) -> &PipelineLayout {
-        &self.outline_layout
+        &self.shared.outline_layout
     }
 
     pub fn alloc_descriptor_set(&mut self, shader: BuiltinShader) -> Result<DescriptorSet, Error> {
@@ -641,10 +791,7 @@ impl Pipelines {
         sampler: vk::Sampler,
     ) -> Result<&mut YcbcrEntry, Error> {
         if !self.ycbcr_entries.contains_key(&key) {
-            let device = self
-                .device
-                .upgrade()
-                .ok_or(Error::Pipeline(vk::Result::ERROR_DEVICE_LOST))?;
+            let device = &self.shared.device;
 
             let layout_flags = if device.vk_khr_push_descriptor().is_some() {
                 vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
@@ -683,7 +830,7 @@ impl Pipelines {
                     .create_pipeline_layout(&create_info, None)
                     .map_err(Error::PipelineLayout)?
             };
-            let tex_desc_pool = DescriptorAllocator::new(&device, tex_descriptor_set_layout, &*TEX_SIZES);
+            let tex_desc_pool = DescriptorAllocator::new(device, tex_descriptor_set_layout, &*TEX_SIZES);
 
             // HDR Texture pipeline layout (binding 0: immutable sampler, binding 1: standard sampler3D)
             let hdr_bindings = [
@@ -723,7 +870,7 @@ impl Pipelines {
                     .map_err(Error::PipelineLayout)?
             };
             let hdr_tex_desc_pool =
-                DescriptorAllocator::new(&device, hdr_tex_descriptor_set_layout, &*HDR_TEX_SIZES);
+                DescriptorAllocator::new(device, hdr_tex_descriptor_set_layout, &*HDR_TEX_SIZES);
 
             self.ycbcr_entries.insert(
                 key,
@@ -757,20 +904,17 @@ impl Pipelines {
             (entry.tex_layout, entry.hdr_tex_layout)
         };
 
-        let device = self
-            .device
-            .upgrade()
-            .ok_or(Error::Pipeline(vk::Result::ERROR_DEVICE_LOST))?;
+        let device = &self.shared.device;
 
         let vertex_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::VERTEX)
             .name(c"main")
-            .module(self.quad_vert);
+            .module(self.shared.quad_vert);
 
         let tex_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.tex_frag);
+            .module(self.shared.tex_frag);
 
         let spec_entry = [vk::SpecializationMapEntry::default()
             .constant_id(0)
@@ -784,7 +928,7 @@ impl Pipelines {
         let hdr_tex_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.hdr_tex_frag)
+            .module(self.shared.hdr_tex_frag)
             .specialization_info(&spec_generic);
 
         let spec_passthrough_data = SPEC_MODE_PASSTHROUGH.to_ne_bytes();
@@ -794,7 +938,7 @@ impl Pipelines {
         let hdr_passthrough_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.hdr_tex_frag)
+            .module(self.shared.hdr_tex_frag)
             .specialization_info(&spec_passthrough);
 
         let spec_sdr_data = SPEC_MODE_SDR.to_ne_bytes();
@@ -804,7 +948,7 @@ impl Pipelines {
         let hdr_sdr_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.hdr_tex_frag)
+            .module(self.shared.hdr_tex_frag)
             .specialization_info(&spec_sdr);
 
         let spec_pq_data = SPEC_MODE_PQ.to_ne_bytes();
@@ -814,7 +958,7 @@ impl Pipelines {
         let hdr_pq_stage = PipelineShaderStageCreateInfo::default()
             .stage(ShaderStageFlags::FRAGMENT)
             .name(c"main")
-            .module(self.hdr_tex_frag)
+            .module(self.shared.hdr_tex_frag)
             .specialization_info(&spec_pq);
 
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
@@ -943,7 +1087,7 @@ impl Pipelines {
         let pipelines = unsafe {
             device
                 .vk()
-                .create_graphics_pipelines(self.cache, &create_infos, None)
+                .create_graphics_pipelines(self.shared.cache, &create_infos, None)
                 .map_err(|(pipelines, res)| {
                     for pipeline in pipelines {
                         device.vk().destroy_pipeline(pipeline, None);
@@ -970,7 +1114,7 @@ impl Pipelines {
         entry
             .format_pipelines
             .insert((format, has_depth), format_pipelines);
-        self.save_cache();
+        self.shared.save_cache();
         Ok(format_pipelines)
     }
 
@@ -1000,58 +1144,27 @@ impl Pipelines {
 
 impl Drop for Pipelines {
     fn drop(&mut self) {
-        self.save_cache();
-        if let Some(device) = self.device.upgrade() {
-            unsafe {
-                for (_, mut entry) in self.ycbcr_entries.drain() {
-                    for (_, p) in entry.format_pipelines.drain() {
-                        device.vk().destroy_pipeline(p.tex_pipeline, None);
-                        device.vk().destroy_pipeline(p.tex_blend_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_tex_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_tex_blend_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_passthrough_pipeline, None);
-                        device
-                            .vk()
-                            .destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_sdr_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_pq_pipeline, None);
-                        device.vk().destroy_pipeline(p.hdr_pq_blend_pipeline, None);
-                    }
-                    device.vk().destroy_pipeline_layout(entry.tex_layout, None);
-                    device.vk().destroy_pipeline_layout(entry.hdr_tex_layout, None);
+        let vk = self.shared.device.vk();
+        unsafe {
+            for (_, mut entry) in self.ycbcr_entries.drain() {
+                for (_, p) in entry.format_pipelines.drain() {
+                    vk.destroy_pipeline(p.tex_pipeline, None);
+                    vk.destroy_pipeline(p.tex_blend_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_tex_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_tex_blend_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_passthrough_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_sdr_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_pq_pipeline, None);
+                    vk.destroy_pipeline(p.hdr_pq_blend_pipeline, None);
                 }
-                for (_, p) in self.format_pipelines.drain() {
-                    device.vk().destroy_pipeline(p.clear_pipeline, None);
-                    device.vk().destroy_pipeline(p.clear_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.tex_pipeline, None);
-                    device.vk().destroy_pipeline(p.tex_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_tex_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_tex_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_passthrough_pipeline, None);
-                    device
-                        .vk()
-                        .destroy_pipeline(p.hdr_passthrough_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_sdr_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_sdr_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_pq_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_pq_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_lut3d_pipeline, None);
-                    device.vk().destroy_pipeline(p.hdr_lut3d_blend_pipeline, None);
-                    device.vk().destroy_pipeline(p.outline_pipeline, None);
-                    device.vk().destroy_pipeline(p.outline_blend_pipeline, None);
-                }
-                device.vk().destroy_shader_module(self.quad_vert, None);
-                device.vk().destroy_shader_module(self.clear_frag, None);
-                device.vk().destroy_shader_module(self.tex_frag, None);
-                device.vk().destroy_shader_module(self.hdr_tex_frag, None);
-                device.vk().destroy_shader_module(self.outline_frag, None);
-
-                device.vk().destroy_pipeline_layout(self.clear_layout, None);
-                device.vk().destroy_pipeline_layout(self.tex_layout, None);
-                device.vk().destroy_pipeline_layout(self.hdr_tex_layout, None);
-                device.vk().destroy_pipeline_layout(self.outline_layout, None);
-                device.vk().destroy_pipeline_cache(self.cache, None);
+                drop(entry.tex_desc_pool);
+                drop(entry.hdr_tex_desc_pool);
+                vk.destroy_pipeline_layout(entry.tex_layout, None);
+                vk.destroy_pipeline_layout(entry.hdr_tex_layout, None);
+                vk.destroy_descriptor_set_layout(entry.tex_descriptor_set_layout, None);
+                vk.destroy_descriptor_set_layout(entry.hdr_tex_descriptor_set_layout, None);
             }
         }
     }

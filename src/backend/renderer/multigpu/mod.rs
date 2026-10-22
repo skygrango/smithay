@@ -234,10 +234,19 @@ impl<A: GraphicsApi> GpuManager<A> {
         })
     }
 
+    fn prune_dmabuf_cache(&mut self) {
+        let devices = &self.devices;
+        self.dmabuf_cache.retain(|(src, dst), _| {
+            devices.iter().any(|d| d.node().dev_id() == src.dev_id())
+                && devices.iter().any(|d| d.node().dev_id() == dst.dev_id())
+        });
+    }
+
     /// Get all devices enumerated by the API.
     pub fn devices(&mut self) -> Result<impl Iterator<Item = &A::Device>, A::Error> {
         if self.api.needs_enumeration() {
             self.api.enumerate(&mut self.devices)?;
+            self.prune_dmabuf_cache();
         }
         Ok(self.devices.iter())
     }
@@ -246,6 +255,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     pub fn devices_mut(&mut self) -> Result<impl Iterator<Item = &mut A::Device>, A::Error> {
         if self.api.needs_enumeration() {
             self.api.enumerate(&mut self.devices)?;
+            self.prune_dmabuf_cache();
         }
         Ok(self.devices.iter_mut())
     }
@@ -295,6 +305,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             self.api
                 .enumerate(&mut self.devices)
                 .map_err(Error::RenderApiError)?;
+            self.prune_dmabuf_cache();
         }
 
         if !self.devices.iter().any(|dev| dev.node() == device) {
@@ -342,6 +353,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             self.api
                 .enumerate(&mut self.devices)
                 .map_err(Error::RenderApiError)?;
+            self.prune_dmabuf_cache();
         }
 
         if !self.devices.iter().any(|device| device.node() == render_device) {
@@ -413,6 +425,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                 .api
                 .enumerate(&mut render_api.devices)
                 .map_err(Error::RenderApiError)?;
+            render_api.prune_dmabuf_cache();
         }
 
         if !target_api
@@ -425,6 +438,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                 .api
                 .enumerate(&mut target_api.devices)
                 .map_err(Error::TargetApiError)?;
+            target_api.prune_dmabuf_cache();
         }
 
         if !render_api
@@ -1787,6 +1801,7 @@ enum GpuSingleTexture {
         texture: Box<dyn Any + 'static>,
         dmabuf: Dmabuf,
         sync: Option<SyncPoint>,
+        needs_reimport: bool,
     },
     Mem {
         external_shadow: Option<(Dmabuf, Box<dyn Any + 'static>)>,
@@ -1900,7 +1915,7 @@ impl MultiTexture {
             .get_mut(&render_id.erased())
             .and_then(|texture| match texture {
                 GpuSingleTexture::Direct(_) => None,
-                GpuSingleTexture::Dma { sync, .. } => sync.take(),
+                GpuSingleTexture::Dma { sync, .. } => sync.clone(),
                 GpuSingleTexture::Mem { .. } => None,
             })
     }
@@ -1914,8 +1929,17 @@ impl MultiTexture {
     {
         let mut tex = self.0.lock().unwrap();
         let target_id = renderer.context_id().erased();
-        if let Some(GpuSingleTexture::Dma { texture, dmabuf, .. }) = tex.textures.get_mut(&target_id) {
-            *texture = Box::new(renderer.import_dmabuf(dmabuf, None)?) as Box<_>;
+        if let Some(GpuSingleTexture::Dma {
+            texture,
+            dmabuf,
+            needs_reimport,
+            ..
+        }) = tex.textures.get_mut(&target_id)
+        {
+            if *needs_reimport {
+                *texture = Box::new(renderer.import_dmabuf(dmabuf, None)?) as Box<_>;
+                *needs_reimport = false;
+            }
         } else {
             let dmabuf_opt = tex.textures.values().find_map(|t| match t {
                 GpuSingleTexture::Dma { dmabuf, .. } => Some(dmabuf.clone()),
@@ -1930,6 +1954,7 @@ impl MultiTexture {
                         texture: Box::new(new_tex) as Box<_>,
                         dmabuf,
                         sync: None,
+                        needs_reimport: false,
                     },
                 );
             }
@@ -2958,6 +2983,7 @@ where
             texture,
             dmabuf,
             sync,
+            ..
         }) => {
             let mut slot = Some((dmabuf, texture, sync));
             let res = dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None);
@@ -2965,6 +2991,7 @@ where
                 texture,
                 dmabuf,
                 sync,
+                needs_reimport: true,
             });
             res
         }
@@ -2976,6 +3003,7 @@ where
                         texture: texture as Box<dyn Any + 'static>,
                         dmabuf,
                         sync,
+                        needs_reimport: true,
                     });
                     Ok(())
                 }
