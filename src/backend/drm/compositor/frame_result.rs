@@ -289,6 +289,16 @@ where
             return Ok(SyncPoint::signaled());
         }
 
+        let inv_transform = if transform.flipped() {
+            transform
+        } else {
+            transform.invert()
+        };
+        let desktop_damage = damage
+            .iter()
+            .map(|d| inv_transform.transform_rect_in(*d, &size))
+            .collect::<Vec<_>>();
+
         let mut opaque_regions: Vec<Rectangle<i32, Physical>> = Vec::new();
 
         let mut elements_to_render: Vec<&'a E> =
@@ -297,7 +307,11 @@ where
         if let Some(cursor_element) = self.cursor_element.as_ref() {
             if !filter_ids.contains(cursor_element.id()) {
                 elements_to_render.push(*cursor_element);
-                opaque_regions.extend(cursor_element.opaque_regions(scale));
+                let loc = cursor_element.location(scale);
+                opaque_regions.extend(cursor_element.opaque_regions(scale).into_iter().map(|mut r| {
+                    r.loc += loc;
+                    r
+                }));
             }
         }
 
@@ -307,7 +321,11 @@ where
             .filter(|e| !filter_ids.contains(e.id()))
         {
             elements_to_render.push(element);
-            opaque_regions.extend(element.opaque_regions(scale));
+            let loc = element.location(scale);
+            opaque_regions.extend(element.opaque_regions(scale).into_iter().map(|mut r| {
+                r.loc += loc;
+                r
+            }));
         }
 
         let primary_dmabuf = match &self.primary_element {
@@ -317,22 +335,32 @@ where
                     _ => unreachable!(),
                 };
                 let size = dmabuf.size();
-                let geometry = Rectangle::from_size(size.to_logical(1, Transform::Normal).to_physical(1));
-                opaque_regions.push(geometry);
+                let phys_size = size.to_logical(1, Transform::Normal).to_physical(1);
+                let geometry = Rectangle::from_size(phys_size);
+                opaque_regions.push(Rectangle::from_size(transform.transform_size(phys_size)));
                 Some((sync.clone(), dmabuf, geometry, geometry))
             }
             PrimaryPlaneElement::Element(e) => {
-                let dmabuf: Option<Dmabuf> =
+                let dmabuf: Option<Dmabuf> = if transform == Transform::Normal
+                    && e.transform() == Transform::Normal
+                {
                     e.underlying_storage(renderer).and_then(|storage| match storage {
                         #[cfg(feature = "wayland_frontend")]
                         UnderlyingStorage::Wayland(b) => crate::wayland::dmabuf::get_dmabuf(b).ok().cloned(),
                         _ => None,
-                    });
+                    })
+                } else {
+                    None
+                };
                 if let Some(dmabuf) = dmabuf {
                     let geometry = e.geometry(scale);
+                    let loc = e.location(scale);
                     let opaque = e.opaque_regions(scale);
                     if !opaque.is_empty() {
-                        opaque_regions.extend(opaque);
+                        opaque_regions.extend(opaque.into_iter().map(|mut r| {
+                            r.loc += loc;
+                            r
+                        }));
                     } else if e.alpha() >= 1.0 {
                         opaque_regions.push(geometry);
                     }
@@ -349,14 +377,18 @@ where
                     Some((SyncPoint::default(), dmabuf, geometry, src_rect))
                 } else {
                     elements_to_render.push(*e);
-                    opaque_regions.extend(e.opaque_regions(scale));
+                    let loc = e.location(scale);
+                    opaque_regions.extend(e.opaque_regions(scale).into_iter().map(|mut r| {
+                        r.loc += loc;
+                        r
+                    }));
                     None
                 }
             }
         };
 
         let clear_damage =
-            Rectangle::subtract_rects_many_in_place(damage.clone(), opaque_regions.iter().copied());
+            Rectangle::subtract_rects_many_in_place(desktop_damage.clone(), opaque_regions.iter().copied());
 
         let mut sync: Option<SyncPoint> = None;
         if !clear_damage.is_empty() {
@@ -458,7 +490,7 @@ where
             for element in elements_to_render.iter().rev() {
                 let src = element.src();
                 let dst = element.geometry(scale);
-                let element_damage = damage
+                let element_damage = desktop_damage
                     .iter()
                     .filter_map(|d| {
                         d.intersection(dst).map(|mut d| {

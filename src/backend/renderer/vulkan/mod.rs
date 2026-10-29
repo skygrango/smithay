@@ -1069,7 +1069,8 @@ impl Renderer for VulkanRenderer {
             renderer: self,
             fb: framebuffer,
             transform: dst_transform,
-            size: output_size,
+            output_size,
+            size: dst_transform.transform_size(output_size),
             cmd_buffer: None,
             descriptors: Vec::with_capacity(16),
             images: Vec::with_capacity(16),
@@ -2337,6 +2338,7 @@ pub struct VulkanFrame<'frame, 'buffer> {
     _marker: std::marker::PhantomData<&'buffer ()>,
 
     transform: Transform,
+    output_size: Size<i32, Physical>,
     size: Size<i32, Physical>,
     cmd_buffer: Option<ash::vk::CommandBuffer>,
     descriptors: Vec<shaders::DescriptorSet>,
@@ -2605,8 +2607,8 @@ impl VulkanFrame<'_, '_> {
 
         let fb_width = self.fb.0.width();
         let fb_height = self.fb.0.height();
-        let render_width = (self.size.w as u32).min(fb_width);
-        let render_height = (self.size.h as u32).min(fb_height);
+        let render_width = (self.output_size.w as u32).min(fb_width);
+        let render_height = (self.output_size.h as u32).min(fb_height);
 
         let mut load_op = if fb_old_layout == ImageLayout::UNDEFINED {
             vk::AttachmentLoadOp::DONT_CARE
@@ -2991,7 +2993,11 @@ impl VulkanFrame<'_, '_> {
     }
 }
 
-pub fn transform_corner_radius(radii: [f32; 4], transform: Transform) -> [f32; 4] {
+/// Permutes corner radii `[tl, tr, br, bl]` to match how [`Transform::transform_rect_in`]
+/// maps the four corners of a rectangle into the transformed destination space.
+#[inline]
+#[must_use]
+pub const fn transform_corner_radius(radii: [f32; 4], transform: Transform) -> [f32; 4] {
     let [tl, tr, br, bl] = radii;
     match transform {
         Transform::Normal => [tl, tr, br, bl],
@@ -2999,9 +3005,43 @@ pub fn transform_corner_radius(radii: [f32; 4], transform: Transform) -> [f32; 4
         Transform::_180 => [br, bl, tl, tr],
         Transform::_270 => [tr, br, bl, tl],
         Transform::Flipped => [tr, tl, bl, br],
-        Transform::Flipped90 => [tl, bl, br, tr],
+        Transform::Flipped90 => [br, tr, tl, bl],
         Transform::Flipped180 => [bl, br, tr, tl],
-        Transform::Flipped270 => [br, tr, tl, bl],
+        Transform::Flipped270 => [tl, bl, br, tr],
+    }
+}
+
+/// Composes the inverse of the framebuffer destination transform (`dst_transform`)
+/// with the inverse of the surface buffer transform (`src_transform`), returning
+/// the [`Transform`] variant to apply to normalized quad coordinates `v_pos` in `[0, 1]^2`
+/// before scaling/translating into raw texture UV coordinates.
+#[inline]
+#[must_use]
+pub fn combine_uv_transforms(dst_transform: Transform, src_transform: Transform) -> Transform {
+    let fb_to_elem = if dst_transform.flipped() {
+        dst_transform
+    } else {
+        dst_transform.invert()
+    };
+    let elem_to_src = src_transform.invert();
+
+    let flipped = fb_to_elem.flipped() ^ elem_to_src.flipped();
+    let degrees = if elem_to_src.flipped() {
+        (elem_to_src.degrees() + 360 - fb_to_elem.degrees()) % 360
+    } else {
+        (elem_to_src.degrees() + fb_to_elem.degrees()) % 360
+    };
+
+    match (flipped, degrees) {
+        (false, 0) => Transform::Normal,
+        (false, 90) => Transform::_90,
+        (false, 180) => Transform::_180,
+        (false, 270) => Transform::_270,
+        (true, 0) => Transform::Flipped,
+        (true, 90) => Transform::Flipped90,
+        (true, 180) => Transform::Flipped180,
+        (true, 270) => Transform::Flipped270,
+        _ => unreachable!(),
     }
 }
 
@@ -3191,7 +3231,7 @@ impl Frame for VulkanFrame<'_, '_> {
                 transformed_outline.size.h as f32,
             ),
         );
-        let screen_size = [self.size.w as f32, self.size.h as f32];
+        let screen_size = [self.output_size.w as f32, self.output_size.h as f32];
         let depth_val = if self.depth_enabled {
             self.current_depth
         } else {
@@ -3338,7 +3378,9 @@ impl Frame for VulkanFrame<'_, '_> {
         let view = texture
             .vk_view()
             .ok_or(Error::ImageError(ImageError::MissingOrInvalidUsage))?;
-        let is_downscaling = (dst.size.w as f64) < src.size.w || (dst.size.h as f64) < src.size.h;
+        let transformed_src_size = src_transform.transform_size(src.size);
+        let is_downscaling = (untransformed_dst.size.w as f64) < transformed_src_size.w
+            || (untransformed_dst.size.h as f64) < transformed_src_size.h;
         let sampler = if let Some((_, ycbcr_sampler)) = ycbcr_info {
             ycbcr_sampler
         } else {
@@ -3417,9 +3459,10 @@ impl Frame for VulkanFrame<'_, '_> {
             Point::new(dst.loc.x as f32, dst.loc.y as f32),
             Size::new(dst.size.w as f32, dst.size.h as f32),
         );
-        let screen_size = [self.size.w as f32, self.size.h as f32];
+        let screen_size = [self.output_size.w as f32, self.output_size.h as f32];
 
-        let src_transform_val = match src_transform {
+        let combined_transform = combine_uv_transforms(self.transform, src_transform);
+        let src_transform_val = match combined_transform {
             Transform::Normal => 0,
             Transform::_90 => 1,
             Transform::_180 => 2,
@@ -4083,6 +4126,7 @@ impl Blit for VulkanRenderer {
             fb: to,
             _marker: std::marker::PhantomData,
             transform: Transform::Normal,
+            output_size: size,
             size,
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
@@ -4153,6 +4197,7 @@ impl Blit for VulkanRenderer {
             fb: to,
             _marker: std::marker::PhantomData,
             transform: Transform::Normal,
+            output_size: size,
             size,
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
@@ -4218,6 +4263,7 @@ impl Blit for VulkanRenderer {
             fb: to,
             _marker: std::marker::PhantomData,
             transform: Transform::Normal,
+            output_size: size,
             size,
             cmd_buffer: None,
             descriptors: Vec::with_capacity(4),
@@ -4332,7 +4378,7 @@ impl VulkanFrame<'_, '_> {
             Point::new(_dst.loc.x as f32, _dst.loc.y as f32),
             Size::new(_dst.size.w as f32, _dst.size.h as f32),
         );
-        let screen_size = [self.size.w as f32, self.size.h as f32];
+        let screen_size = [self.output_size.w as f32, self.output_size.h as f32];
 
         let depth_val = if self.depth_enabled {
             self.current_depth
@@ -5000,6 +5046,331 @@ mod test {
                     }
                 }
             }
+
+            unsafe {
+                let _ = renderer.device.vk().device_wait_idle();
+            }
+            renderer.cleanup().expect("cleanup failed");
+        }
+    }
+
+    fn shader_apply_transform(uv: [f32; 2], transform: Transform) -> [f32; 2] {
+        let [u, v] = uv;
+        match transform {
+            Transform::Normal => [u, v],
+            Transform::_90 => [1.0 - v, u],
+            Transform::_180 => [1.0 - u, 1.0 - v],
+            Transform::_270 => [v, 1.0 - u],
+            Transform::Flipped => [1.0 - u, v],
+            Transform::Flipped90 => [1.0 - v, 1.0 - u],
+            Transform::Flipped180 => [u, 1.0 - v],
+            Transform::Flipped270 => [v, u],
+        }
+    }
+
+    #[test]
+    fn test_combine_uv_transforms_all_64_combinations() {
+        let all_transforms = [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ];
+
+        // Verify against GLES reference corner expectations when dst_transform == Normal
+        let expected_normal_dst = [
+            (
+                Transform::Normal,
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            ),
+            (Transform::_90, [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+            (Transform::_180, [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]]),
+            (Transform::_270, [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]),
+            (
+                Transform::Flipped,
+                [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            ),
+            (
+                Transform::Flipped90,
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            ),
+            (
+                Transform::Flipped180,
+                [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            ),
+            (
+                Transform::Flipped270,
+                [[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [0.0, 1.0]],
+            ),
+        ];
+
+        let corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        for (src_t, expected_corners) in expected_normal_dst {
+            let combined = combine_uv_transforms(Transform::Normal, src_t);
+            for (c, exp) in corners.iter().zip(expected_corners.iter()) {
+                let got = shader_apply_transform(*c, combined);
+                assert!(
+                    (got[0] - exp[0]).abs() < 1e-6 && (got[1] - exp[1]).abs() < 1e-6,
+                    "src_transform={src_t:?} corner={c:?}: got {got:?}, expected {exp:?}"
+                );
+            }
+        }
+
+        // For all 64 (dst_transform, src_transform) pairs, an element point `pos_elem`
+        // placed at `v_pos = shader_apply_transform(pos_elem, dst_transform)` in framebuffer space
+        // must sample the exact same texture UV as on a Normal display.
+        let sample_points = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.25, 0.7]];
+        for &dst_t in &all_transforms {
+            for &src_t in &all_transforms {
+                let combined = combine_uv_transforms(dst_t, src_t);
+                let normal_combined = combine_uv_transforms(Transform::Normal, src_t);
+                for &pos_elem in &sample_points {
+                    let v_pos = shader_apply_transform(pos_elem, dst_t);
+                    let got_src_pos = shader_apply_transform(v_pos, combined);
+                    let expected_src_pos = shader_apply_transform(pos_elem, normal_combined);
+                    assert!(
+                        (got_src_pos[0] - expected_src_pos[0]).abs() < 1e-6
+                            && (got_src_pos[1] - expected_src_pos[1]).abs() < 1e-6,
+                        "mismatch for dst_t={dst_t:?}, src_t={src_t:?}, pos_elem={pos_elem:?}: got {got_src_pos:?}, expected {expected_src_pos:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_transform_corner_radius_matches_transform_rect_in() {
+        let all_transforms = [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ];
+        let area: Size<i32, Physical> = Size::from((100, 200));
+        // Small 10x10 boxes at TL, TR, BR, BL of `area`
+        let corner_boxes = [
+            (Rectangle::new((0, 0).into(), (10, 10).into()), 1.0f32),
+            (Rectangle::new((90, 0).into(), (10, 10).into()), 2.0f32),
+            (Rectangle::new((90, 190).into(), (10, 10).into()), 3.0f32),
+            (Rectangle::new((0, 190).into(), (10, 10).into()), 4.0f32),
+        ];
+
+        for &t in &all_transforms {
+            let transformed_area = t.transform_size(area);
+            let permuted = transform_corner_radius([1.0, 2.0, 3.0, 4.0], t);
+
+            for (rect, radius_id) in corner_boxes {
+                let tr = t.transform_rect_in(rect, &area);
+                let idx = match (tr.loc.x == 0, tr.loc.y == 0) {
+                    (true, true) => 0, // TL
+                    (false, true) => {
+                        assert_eq!(tr.loc.x, transformed_area.w - 10);
+                        1 // TR
+                    }
+                    (false, false) => {
+                        assert_eq!(tr.loc.x, transformed_area.w - 10);
+                        assert_eq!(tr.loc.y, transformed_area.h - 10);
+                        2 // BR
+                    }
+                    (true, false) => {
+                        assert_eq!(tr.loc.y, transformed_area.h - 10);
+                        3 // BL
+                    }
+                };
+                assert_eq!(
+                    permuted[idx], radius_id,
+                    "transform_corner_radius mismatch for {t:?} at destination corner index {idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rotated_output_damage_scissors_not_clipped() {
+        // Hardware framebuffer is 1920x1080, rotated 90 deg (dst_transform = _270),
+        // so pre-transform logical/physical coordinate space is 1080x1920.
+        let output_size: Size<i32, Physical> = Size::from((1920, 1080));
+        let dst_transform = Transform::_270;
+        let pre_transform_size = dst_transform.transform_size(output_size);
+        assert_eq!(pre_transform_size, Size::from((1080, 1920)));
+
+        // A panel at the bottom of the 1080x1920 portrait screen (y = 1800..1920)
+        let dst: Rectangle<i32, Physical> = Rectangle::new((0, 1800).into(), (1080, 120).into());
+        let damage: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), (1080, 120).into());
+
+        let scissors = calculate_damage_scissors(
+            &[damage],
+            dst,
+            dst_transform,
+            &pre_transform_size,
+            output_size.w as u32,
+            output_size.h as u32,
+        );
+        assert_eq!(scissors.len(), 1);
+        assert_eq!(scissors[0].offset.x, 1800);
+        assert_eq!(scissors[0].offset.y, 0);
+        assert_eq!(scissors[0].extent.width, 120);
+        assert_eq!(scissors[0].extent.height, 1080);
+    }
+
+    #[test]
+    fn test_rotated_frame_gpu_rendering_and_readback() {
+        let Ok(instance) = Instance::new(Version::VERSION_1_3, None) else {
+            return;
+        };
+        let Ok(phds) = PhysicalDevice::enumerate(&instance) else {
+            return;
+        };
+
+        for phd in phds {
+            let Ok(mut renderer) = VulkanRenderer::new(&phd, None) else {
+                continue;
+            };
+            renderer
+                .upscale_filter(TextureFilter::Nearest)
+                .expect("upscale_filter failed");
+            renderer
+                .downscale_filter(TextureFilter::Nearest)
+                .expect("downscale_filter failed");
+
+            // 2x2 texture in Abgr8888 (RGBA bytes in memory):
+            // TL (0,0) = Red   [255, 0, 0, 255]
+            // TR (1,0) = Green [0, 255, 0, 255]
+            // BL (0,1) = Blue  [0, 0, 255, 255]
+            // BR (1,1) = White [255, 255, 255, 255]
+            let tex_data: [u8; 16] = [
+                255, 0, 0, 255, // (0,0) Red
+                0, 255, 0, 255, // (1,0) Green
+                0, 0, 255, 255, // (0,1) Blue
+                255, 255, 255, 255, // (1,1) White
+            ];
+            let tex = renderer
+                .import_memory(&tex_data, Fourcc::Abgr8888, (2, 2).into(), false)
+                .expect("import_memory failed");
+
+            // Hardware framebuffer is 4x2 (output_size = 4x2).
+            // With dst_transform = Transform::_270, pre-transform desktop size is 2x4.
+            let mut target = VulkanImage::new(
+                &renderer.device,
+                4,
+                2,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+                false,
+            )
+            .expect("Failed to create 4x2 target image");
+
+            let output_size: Size<i32, Physical> = (4, 2).into();
+            let dst_transform = Transform::_270;
+            let pre_transform_rect = Rectangle::new((0, 0).into(), (2, 4).into());
+            let src_rect = Rectangle::new((0.0, 0.0).into(), (2.0, 2.0).into());
+
+            {
+                let mut fb = renderer.bind(&mut target).unwrap();
+                let mut frame = renderer.render(&mut fb, output_size, dst_transform).unwrap();
+                assert_eq!(frame.output_size(), Size::from((2, 4)));
+
+                frame
+                    .clear(Color32F::BLACK, &[pre_transform_rect])
+                    .expect("clear failed");
+                frame
+                    .render_texture_from_to(
+                        &tex,
+                        src_rect,
+                        pre_transform_rect,
+                        &[pre_transform_rect],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                    )
+                    .expect("render_texture_from_to failed");
+                let sync = frame.finish().expect("finish failed");
+                sync.wait().expect("sync wait failed");
+            }
+
+            let fb = renderer.bind(&mut target).unwrap();
+            let mapping = renderer
+                .copy_framebuffer(&fb, Rectangle::from_size((4, 2).into()), Fourcc::Abgr8888)
+                .expect("copy_framebuffer failed");
+            let bytes = renderer.map_texture(&mapping).expect("map_texture failed");
+            let pixel = |x: usize, y: usize| -> [u8; 4] {
+                let idx = (y * 4 + x) * 4;
+                [bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]]
+            };
+
+            // Under Transform::_270 on a 2x4 pre-transform space into a 4x2 framebuffer:
+            // - Pre-transform TR (1,0) [Green] -> Framebuffer TL (0,0)
+            // - Pre-transform BR (1,3) [White] -> Framebuffer TR (3,0)
+            // - Pre-transform TL (0,0) [Red]   -> Framebuffer BL (0,1)
+            // - Pre-transform BL (0,3) [Blue]  -> Framebuffer BR (3,1)
+            assert_eq!(pixel(0, 0), [0, 255, 0, 255], "FB (0,0) should be Green (TR)");
+            assert_eq!(pixel(3, 0), [255, 255, 255, 255], "FB (3,0) should be White (BR)");
+            assert_eq!(pixel(0, 1), [255, 0, 0, 255], "FB (0,1) should be Red (TL)");
+            assert_eq!(pixel(3, 1), [0, 0, 255, 255], "FB (3,1) should be Blue (BL)");
+
+            // Also test rendering a cropped sub-rectangle (bottom row: y=1..2, x=0..2, containing
+            // Blue at (0,1) and White at (1,1)) with dst_transform = Transform::_270.
+            // This verifies that applyTransform is applied to v_pos in [0,1]^2 BEFORE scaling/offsetting by srcRect.
+            let cropped_src = Rectangle::new((0.0, 1.0).into(), (2.0, 1.0).into());
+            {
+                let mut fb = renderer.bind(&mut target).unwrap();
+                let mut frame = renderer.render(&mut fb, output_size, dst_transform).unwrap();
+                frame
+                    .clear(Color32F::BLACK, &[pre_transform_rect])
+                    .expect("clear failed");
+                frame
+                    .render_texture_from_to(
+                        &tex,
+                        cropped_src,
+                        pre_transform_rect,
+                        &[pre_transform_rect],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                    )
+                    .expect("render_texture_from_to cropped failed");
+                let sync = frame.finish().expect("finish failed");
+                sync.wait().expect("sync wait failed");
+            }
+
+            let fb = renderer.bind(&mut target).unwrap();
+            let mapping = renderer
+                .copy_framebuffer(&fb, Rectangle::from_size((4, 2).into()), Fourcc::Abgr8888)
+                .expect("copy_framebuffer cropped failed");
+            let bytes = renderer
+                .map_texture(&mapping)
+                .expect("map_texture cropped failed");
+            let pixel = |x: usize, y: usize| -> [u8; 4] {
+                let idx = (y * 4 + x) * 4;
+                [bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]]
+            };
+
+            // Cropped sub-rectangle has left half Blue (0,1) and right half White (1,1).
+            // Under Transform::_270:
+            // - Pre-transform right side (White) maps to top row of framebuffer (y = 0)
+            // - Pre-transform left side (Blue) maps to bottom row of framebuffer (y = 1)
+            assert_eq!(
+                pixel(0, 0),
+                [255, 255, 255, 255],
+                "Cropped FB (0,0) should be White"
+            );
+            assert_eq!(
+                pixel(3, 0),
+                [255, 255, 255, 255],
+                "Cropped FB (3,0) should be White"
+            );
+            assert_eq!(pixel(0, 1), [0, 0, 255, 255], "Cropped FB (0,1) should be Blue");
+            assert_eq!(pixel(3, 1), [0, 0, 255, 255], "Cropped FB (3,1) should be Blue");
 
             unsafe {
                 let _ = renderer.device.vk().device_wait_idle();

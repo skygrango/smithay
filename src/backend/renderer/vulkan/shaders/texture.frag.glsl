@@ -89,8 +89,8 @@ void main() {
     }
 
     uvec2 texSize = textureSize(tex, 0);
-    vec2 srcUV = ((v_pos * params.srcRect.zw) + params.srcRect.xy) / vec2(texSize);
-    vec2 uv = applyTransform(srcUV, params.srcTransform);
+    vec2 pos = applyTransform(v_pos, params.srcTransform);
+    vec2 uv = ((pos * params.srcRect.zw) + params.srcRect.xy) / vec2(texSize);
     vec4 raw = texture(tex, uv);
     if (params.hasAlpha == 0) {
         raw.a = 1.0;
